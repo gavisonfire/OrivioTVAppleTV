@@ -44,10 +44,6 @@ final class DVSampleEngine {
     /// Hosts the AVSampleBufferDisplayLayer; hand this to PlayerVideoView.
     let videoView = DVSampleLayerView()
 
-    /// Transport target for the PiP window. Owned here because AVKit does not
-    /// keep the playback delegate alive; the adapter holds the engine weakly.
-    lazy var pictureInPictureDelegate = DVPictureInPictureDelegate(engine: self)
-
     /// Fired on main ~2×/s with the current position (absolute source secs).
     var onTime: ((Double) -> Void)?
     /// The demuxer reached EOF and both renderers drained — see
@@ -118,14 +114,30 @@ final class DVSampleEngine {
     }
     var currentAudioIndex: Int32 { desiredAudioIndex }
 
-    /// Switch audio live: the demux loop starts forwarding the new stream at
-    /// its next packet; the renderer is flushed so the old track doesn't
-    /// finish its buffered tail first.
+    /// Mute/unmute the audio renderer (the Picture in Picture window's
+    /// control). Decoding continues; only the output is silenced.
+    func setMuted(_ muted: Bool) {
+        audioRenderer.isMuted = muted
+    }
+
+    /// Switch audio live, then RE-DEMUX FROM THE PLAYHEAD.
+    ///
+    /// Flushing the renderer and letting the demux loop forward the new stream
+    /// from wherever its read head happens to be is not enough: that head runs
+    /// a full buffer (~10s) ahead of the picture, so the first samples of the
+    /// new track carry presentation times ten seconds in the future. The
+    /// synchronizer is timed off the audio renderer, so it sat waiting for
+    /// them — the picture froze on the current frame until playback caught up,
+    /// and seeking back ten seconds "fixed" it because that is exactly what a
+    /// seek does. The subtitle path already solves this by replaying its
+    /// buffered backlog; audio packets are far too big to hold that way, so it
+    /// takes the seek instead — sub-second, and it lands on the frame you were
+    /// watching (the loop trims the keyframe lead-in).
     func selectAudio(index: Int32) {
         guard audioFormats[index] != nil || decodeAudioIndices.contains(index) else { return }
+        guard index != desiredAudioIndex else { return }
         desiredAudioIndex = index
-        queueLock.lock(); audioQueue.removeAll(); queueLock.broadcast(); queueLock.unlock()
-        audioRenderer.flush()
+        seek(to: position)
     }
 
     var position: Double {
@@ -805,9 +817,11 @@ final class DVSampleEngine {
                     for j in 0 ..< Int(par.pointee.nb_coded_side_data) {
                         let sd = sideDatas[j]
                         if sd.type == AV_PKT_DATA_DOVI_CONF, let data = sd.data {
+                            // Load INSIDE the rebinding — the pointer must not
+                            // escape the closure (undefined once it returns).
                             let record = data.withMemoryRebound(
                                 to: AVDOVIDecoderConfigurationRecord.self, capacity: 1
-                            ) { $0 }.pointee
+                            ) { $0.pointee }
                             dvProfile = Int(record.dv_profile)
                             dvLevel = Int(record.dv_level)
                             dvCompatibilityID = Int(record.dv_bl_signal_compatibility_id)
@@ -868,7 +882,14 @@ final class DVSampleEngine {
                 let disposition = stream.pointee.disposition
                 var score = channels * 10
                 if (disposition & AV_DISPOSITION_DEFAULT) != 0 { score += 5 }
-                if !preferredAudioLanguage.isEmpty, lang.hasPrefix(preferredAudioLanguage) { score += 200 }
+                // Alias-aware and label-aware (see AudioLanguageMatch): a file
+                // tagged "ger" satisfies a "de" preference, and a file that
+                // tags nothing but titles the track "English" still counts.
+                if !preferredAudioLanguage.isEmpty,
+                   AudioLanguageMatch.matches(code: lang, label: label,
+                                              preferred: preferredAudioLanguage) {
+                    score += 200
+                }
                 // The user's remembered pick for THIS title wins outright.
                 if let want = preferredAudioLabel, !want.isEmpty,
                    audioTracks.last?.label == want { score += 100_000 }
@@ -1002,6 +1023,12 @@ final class DVSampleEngine {
             // frame was queued.
             trimBefore = startAt - 0.05
         }
+        // Allocated BEFORE the success report below: every `return "…"` in
+        // this function is a start failure, and one that came after the hop
+        // had reported success fired the completion twice (true, then false).
+        guard let packet = av_packet_alloc() else { return "packet alloc failed" }
+        var pkt: UnsafeMutablePointer<AVPacket>? = packet
+        defer { av_packet_free(&pkt) }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             // `stop()` can land between avformat_find_stream_info and this hop.
@@ -1021,7 +1048,12 @@ final class DVSampleEngine {
             let link = CADisplayLink(target: self, selector: #selector(self.displayLinkTick(_:)))
             link.add(to: .main, forMode: .common)
             self.displayLink = link
-            self.timeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            // Built unscheduled and added in `.common`, like the display link
+            // above: `scheduledTimer` goes into `.default` only, which the main
+            // run loop LEAVES while the touch surface pans a scroll view — and
+            // this block is the engine's whole watchdog (underrun hold/resume,
+            // display-layer recovery, the position publish).
+            let clockTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 self.onTime?(self.position)
                 // Jitter probe: if the synchronizer's clock ratio wanders off
@@ -1071,7 +1103,7 @@ final class DVSampleEngine {
                         let resumeAt = self.position
                         self.displayLayer.flush()
                         self.seek(to: resumeAt)
-                        self.installFeeders()
+                        self.installFeeders(rearm: true)
                     } else if !self.reportedLayerFailure {
                         self.reportedLayerFailure = true
                         let detail = self.displayLayer.error.map(String.init(describing:)) ?? "unknown"
@@ -1165,15 +1197,14 @@ final class DVSampleEngine {
                     NSLog("[DVSample] audio renderer failed: %@", detail)
                 }
             }
+            RunLoop.main.add(clockTimer, forMode: .common)
+            self.timeTimer = clockTimer
         }
 
         // ---- Read loop ----
         let vTB = vStream.pointee.time_base
         // Audio timebase resolved per-packet (the active track can change).
         let aTB = AVRational(num: 1, den: 1000)
-        guard let packet = av_packet_alloc() else { return "packet alloc failed" }
-        var pkt: UnsafeMutablePointer<AVPacket>? = packet
-        defer { av_packet_free(&pkt) }
         var myGeneration = seekGeneration
         // Consecutive AVERROR(EAGAIN) reads; reset by any successful read.
         var eagainRetries = 0
@@ -1847,11 +1878,29 @@ final class DVSampleEngine {
     // and the layer receives finished, ordered pixel buffers it merely
     // flips — burst decoding can never reach the glass again.
     private let vtDecodeAhead = true
+    /// Latched when VideoToolbox refuses to create a session. Until this
+    /// existed the "falling back to compressed feed" log was a lie: the video
+    /// feeder still popped every AU into `vtDecodeOne`, which dropped it —
+    /// black picture, audio playing, no error, and a fresh session-create
+    /// attempt plus a log line per access unit. With the latch set, both
+    /// feeders route the compressed samples straight to the display layer,
+    /// which decodes them itself (the pre-decode-ahead pipeline).
+    @Atomic private var vtUnavailable = false
+    private var decodeAheadActive: Bool { vtDecodeAhead && !vtUnavailable }
+    /// GUARDED BY `decodedLock`, like the heap. Main releases it (`seek` →
+    /// `vtFlush`, `stop` → `vtTearDown`) while `feedQueue` reads/creates it —
+    /// an unsynchronised strong CF slot shared by two threads is an over-
+    /// release crash waiting for an exit-during-playback. Never hold the lock
+    /// across `VTDecompressionSessionDecodeFrame` (its callback takes it).
     private var vtSession: VTDecompressionSession?
     private struct DecodedFrame {
         let pts: CMTime
         let duration: CMTime
         let image: CVImageBuffer
+        /// The seek generation the frame was decoded under: a frame from the
+        /// pre-seek position that lands after `seek()` emptied the heap must
+        /// not reach the flushed layer.
+        let generation: Int
     }
     private var decodedHeap: [DecodedFrame] = []   // sorted by pts, small (≤12)
     private let decodedLock = NSLock()
@@ -1859,11 +1908,18 @@ final class DVSampleEngine {
     /// are decoded and waiting (covers reorder depth 8) — except at EOF.
     private let reorderHoldback = 8
     private let decodedCap = 12
+    /// Guarded by `decodedLock` (see `vtSession`).
     private var displayFormatCache: CMFormatDescription?
 
     private func ensureVTSession() -> VTDecompressionSession? {
-        if let vtSession { return vtSession }
-        guard let format = videoFormat else { return nil }
+        decodedLock.lock()
+        if let existing = vtSession { decodedLock.unlock(); return existing }
+        // A late feed block on a STOPPED engine must never resurrect a
+        // session nothing will invalidate — that was a leaked hardware HEVC
+        // decoder (and its pixel-buffer pool) per exit-during-playback.
+        let stopped = cancelled
+        decodedLock.unlock()
+        guard !stopped, let format = videoFormat else { return nil }
         var session: VTDecompressionSession?
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
@@ -1875,32 +1931,57 @@ final class DVSampleEngine {
         )
         guard status == noErr, let session else {
             NSLog("[DVSample] VT session create failed (%d) — falling back to compressed feed", status)
+            vtUnavailable = true
             return nil
         }
+        decodedLock.lock()
+        if cancelled || vtSession != nil {
+            // Lost the race with stop() or another creator: discard ours.
+            let winner = vtSession
+            decodedLock.unlock()
+            VTDecompressionSessionInvalidate(session)
+            return winner
+        }
         vtSession = session
+        decodedLock.unlock()
         NSLog("[DVSample] VT decode-ahead session created")
         return session
     }
 
+    /// Drop every decoded-ahead frame. The wait for in-flight frames happens
+    /// on `feedQueue` — the only thread that talks to the session — rather
+    /// than blocking main inside VideoToolbox on every scrub step; the
+    /// generation stamp on each frame keeps anything that lands late out of
+    /// the flushed layer.
     private func vtFlush() {
-        if let vtSession {
-            VTDecompressionSessionWaitForAsynchronousFrames(vtSession)
-        }
         decodedLock.lock()
         decodedHeap.removeAll(keepingCapacity: true)
+        let session = vtSession
         decodedLock.unlock()
+        guard let session else { return }
+        feedQueue.async { [weak self] in
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            guard let self else { return }
+            self.decodedLock.lock()
+            self.decodedHeap.removeAll(keepingCapacity: true)
+            self.decodedLock.unlock()
+        }
     }
 
     private func vtTearDown() {
-        if let vtSession {
-            VTDecompressionSessionWaitForAsynchronousFrames(vtSession)
-            VTDecompressionSessionInvalidate(vtSession)
-        }
-        vtSession = nil
         decodedLock.lock()
+        let session = vtSession
+        vtSession = nil
         decodedHeap.removeAll()
-        decodedLock.unlock()
         displayFormatCache = nil
+        decodedLock.unlock()
+        guard let session else { return }
+        // Invalidate on `feedQueue` (serial): any decode already inside the
+        // session finishes first, and main never blocks in VideoToolbox.
+        feedQueue.async {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            VTDecompressionSessionInvalidate(session)
+        }
     }
 
     private static func isDoNotDisplay(_ sample: CMSampleBuffer) -> Bool {
@@ -1916,12 +1997,16 @@ final class DVSampleEngine {
     private func vtDecodeOne(_ sample: CMSampleBuffer) {
         guard let session = ensureVTSession() else { return }
         let suppress = Self.isDoNotDisplay(sample)
+        let generation = seekGeneration
         let status = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
         ) { [weak self] st, _, image, pts, duration in
             guard let self, st == noErr, let image, !suppress else { return }
+            // Decoded under a superseded generation: the seek that bumped it
+            // already emptied the heap and flushed the layer.
+            guard generation == self.seekGeneration else { return }
             self.decodedLock.lock()
-            let frame = DecodedFrame(pts: pts, duration: duration, image: image)
+            let frame = DecodedFrame(pts: pts, duration: duration, image: image, generation: generation)
             let idx = self.decodedHeap.firstIndex { CMTimeCompare($0.pts, pts) > 0 } ?? self.decodedHeap.count
             self.decodedHeap.insert(frame, at: idx)
             self.decodedLock.unlock()
@@ -1934,15 +2019,20 @@ final class DVSampleEngine {
 
     /// Wrap a decoded image buffer as a display-order sample for the layer.
     private func makeDisplaySample(_ frame: DecodedFrame) -> CMSampleBuffer? {
-        if displayFormatCache == nil ||
-            !CMVideoFormatDescriptionMatchesImageBuffer(displayFormatCache!, imageBuffer: frame.image) {
+        decodedLock.lock()
+        var cached = displayFormatCache
+        decodedLock.unlock()
+        if cached == nil || !CMVideoFormatDescriptionMatchesImageBuffer(cached!, imageBuffer: frame.image) {
             var fmt: CMFormatDescription?
             CMVideoFormatDescriptionCreateForImageBuffer(
                 allocator: kCFAllocatorDefault, imageBuffer: frame.image, formatDescriptionOut: &fmt
             )
+            cached = fmt
+            decodedLock.lock()
             displayFormatCache = fmt
+            decodedLock.unlock()
         }
-        guard let fmt = displayFormatCache else { return nil }
+        guard let fmt = cached else { return nil }
         var timing = CMSampleTimingInfo(
             duration: frame.duration, presentationTimeStamp: frame.pts, decodeTimeStamp: .invalid
         )
@@ -1977,8 +2067,11 @@ final class DVSampleEngine {
             queueLock.lock()
             let compressedEmpty = videoQueue.isEmpty
             let ended = demuxEOF && compressedEmpty && audioQueue.isEmpty && depth == 0
-            queueLock.unlock()
+            // Inside the lock: `demuxEOF` is written under `queueLock`, and an
+            // unlocked read here decided whether the reorder holdback was
+            // bypassed.
             let draining = demuxEOF && compressedEmpty
+            queueLock.unlock()
             guard depth > 0, draining || depth > reorderHoldback else {
                 decodedLock.unlock()
                 if ended { signalEndOnce() }
@@ -1986,6 +2079,9 @@ final class DVSampleEngine {
             }
             let frame = decodedHeap.removeFirst()
             decodedLock.unlock()
+            // A frame decoded before the last seek that slipped into the heap
+            // after it was emptied: never hand it to the flushed layer.
+            guard frame.generation == seekGeneration else { continue }
             if let display = makeDisplaySample(frame) {
                 displayLayer.enqueue(display)
                 noteHandedToRenderer(pts: frame.pts, duration: frame.duration)
@@ -2009,14 +2105,30 @@ final class DVSampleEngine {
     /// layer recovery, and the post-EOF re-arm) correctly paired by
     /// construction; stopping a renderer that has no block installed is a
     /// no-op.
-    private func installFeeders() {
-        displayLayer.stopRequestingMediaData()
-        audioRenderer.stopRequestingMediaData()
-        displayLayer.requestMediaDataWhenReady(on: feedQueue) { [weak self] in
-            self?.feed(video: true)
-        }
-        audioRenderer.requestMediaDataWhenReady(on: feedQueue) { [weak self] in
-            self?.feed(video: false)
+    ///
+    /// Runs ON `feedQueue`: stopping and re-requesting from main could
+    /// straddle a feed block already executing there. `rearm` clears the
+    /// end-signalled latch for the display-layer recovery path — re-installed
+    /// feeders would otherwise be stopped again by the next `ended` test.
+    private func installFeeders(rearm: Bool = false) {
+        feedQueue.async { [weak self] in
+            guard let self, !self.cancelled else { return }
+            if rearm { self.didSignalEnd = false }
+            self.displayLayer.stopRequestingMediaData()
+            self.audioRenderer.stopRequestingMediaData()
+            self.displayLayer.requestMediaDataWhenReady(on: self.feedQueue) { [weak self] in
+                self?.feed(video: true)
+            }
+            self.audioRenderer.requestMediaDataWhenReady(on: self.feedQueue) { [weak self] in
+                self?.feed(video: false)
+            }
+            // `stop()` may have landed between the check above and the
+            // requests: it stopped nothing, so undo them here rather than
+            // leave a stopped engine's renderers polling an empty queue.
+            if self.cancelled {
+                self.displayLayer.stopRequestingMediaData()
+                self.audioRenderer.stopRequestingMediaData()
+            }
         }
     }
 
@@ -2031,7 +2143,7 @@ final class DVSampleEngine {
     @Atomic private var pullGapWorstMs = 0      // worst gap this window
 
     private func feed(video: Bool) {
-        if video, vtDecodeAhead {
+        if video, decodeAheadActive {
             let now = CFAbsoluteTimeGetCurrent()
             if lastVideoPullAt > 0, synchronizer.rate > 0 {
                 let gapMs = Int((now - lastVideoPullAt) * 1000)
@@ -2064,6 +2176,18 @@ final class DVSampleEngine {
         while !cancelled,
               video ? displayLayer.isReadyForMoreMediaData
                     : audioRenderer.isReadyForMoreMediaData {
+            // The decode-ahead heap counts as undelivered video. The audio
+            // feeder's end test ignored it, so whichever feeder observed the
+            // empty compressed queues first could declare the end while up to
+            // twelve decoded frames were still waiting — `signalEndOnce`
+            // stops the display layer's requests and they never reached the
+            // glass: the last half-second of every film was cut.
+            var heapDepth = 0
+            if decodeAheadActive {
+                decodedLock.lock()
+                heapDepth = decodedHeap.count
+                decodedLock.unlock()
+            }
             queueLock.lock()
             let sample: CMSampleBuffer?
             if video {
@@ -2071,7 +2195,7 @@ final class DVSampleEngine {
             } else {
                 sample = audioQueue.isEmpty ? nil : audioQueue.removeFirst()
             }
-            let ended = demuxEOF && videoQueue.isEmpty && audioQueue.isEmpty
+            let ended = demuxEOF && videoQueue.isEmpty && audioQueue.isEmpty && heapDepth == 0
             queueLock.broadcast()
             queueLock.unlock()
             guard let sample else {
@@ -2150,6 +2274,11 @@ final class DVSampleEngine {
             extensions: extensions as CFDictionary,
             formatDescriptionOut: &format
         )
+        PlayerViewModel.colorTrail(
+            "direct engine format = dvh1 (Dolby Vision) \(width)x\(height)"
+                + " dvvC=\(dvvC.count)B hvcC=\(hvcC.count)B status=\(status)"
+                + " — colour comes from the bitstream, no CV tags attached"
+        )
         return status == noErr ? format : nil
     }
 
@@ -2182,6 +2311,11 @@ final class DVSampleEngine {
             width: width, height: height,
             extensions: extensions as CFDictionary,
             formatDescriptionOut: &format
+        )
+        PlayerViewModel.colorTrail(
+            "direct engine format = hvc1 (plain HEVC) \(width)x\(height)"
+                + " hvcC=\(hvcC.count)B status=\(status)"
+                + " — colour comes from the bitstream VUI/SEI, no CV tags attached"
         )
         return status == noErr ? format : nil
     }
@@ -2346,63 +2480,4 @@ final class DVSampleLayerView: UIView {
         backgroundColor = .black
     }
     required init?(coder: NSCoder) { fatalError("unavailable") }
-}
-
-// MARK: - Picture in Picture
-
-/// Lets AVKit drive the DV engine from the PiP window.
-///
-/// A separate NSObject rather than a conformance on the engine itself:
-/// `AVPictureInPictureSampleBufferPlaybackDelegate` inherits NSObjectProtocol,
-/// and making `DVSampleEngine` an NSObject subclass to satisfy that would
-/// change how the most delicate object in the player is constructed for a
-/// purely structural reason. The engine already owns the two things a
-/// sample-buffer PiP source needs — an AVSampleBufferDisplayLayer and a render
-/// synchronizer — so all that was missing is somewhere to send transport
-/// commands. KSPlayer supplies the equivalent for its own FFmpeg engine.
-///
-/// Holds the engine WEAKLY: the engine owns this adapter, so a strong link
-/// back would be a cycle that outlives every playback session.
-final class DVPictureInPictureDelegate: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate {
-    private weak var engine: DVSampleEngine?
-
-    init(engine: DVSampleEngine) {
-        self.engine = engine
-        super.init()
-    }
-
-    func pictureInPictureController(_: AVPictureInPictureController, setPlaying playing: Bool) {
-        playing ? engine?.play() : engine?.pause()
-    }
-
-    func pictureInPictureControllerIsPlaybackPaused(_: AVPictureInPictureController) -> Bool {
-        !(engine?.isPlaying ?? false)
-    }
-
-    func pictureInPictureControllerTimeRangeForPlayback(_: AVPictureInPictureController) -> CMTimeRange {
-        // A zero-length range makes AVKit present the window as live rather
-        // than drawing a scrubber that can't move — the honest presentation
-        // until a duration is actually known.
-        guard let duration = engine?.duration, duration > 0 else {
-            return CMTimeRange(start: .zero, duration: .zero)
-        }
-        return CMTimeRange(start: .zero,
-                           duration: CMTime(seconds: duration, preferredTimescale: 600))
-    }
-
-    func pictureInPictureController(_: AVPictureInPictureController,
-                                    didTransitionToRenderSize _: CMVideoDimensions) {}
-
-    func pictureInPictureController(_: AVPictureInPictureController,
-                                    skipByInterval interval: CMTime) async {
-        guard let engine else { return }
-        let target = engine.position + CMTimeGetSeconds(interval)
-        let duration = engine.duration
-        engine.seek(to: max(0, duration > 0 ? min(target, duration) : target))
-    }
-
-    /// The audio must keep playing while the window is up — that is the point.
-    func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(
-        _: AVPictureInPictureController
-    ) -> Bool { false }
 }
