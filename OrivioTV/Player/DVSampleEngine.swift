@@ -1309,6 +1309,23 @@ final class DVSampleEngine {
             }
             eagainRetries = 0
             defer { av_packet_unref(packet) }
+            // STALE-READ GUARD. `seek()` flushes the queues and moves the
+            // synchronizer's clock on the MAIN thread, but this thread can be
+            // parked inside `av_read_frame` for as long as a network read
+            // takes — so the packet in hand was read from the OLD position and
+            // is only noticed to be stale at the top of the next iteration.
+            //
+            // Enqueuing it anyway put pre-seek samples into freshly emptied
+            // queues, ahead of the post-seek ones that follow. On a BACKWARD
+            // seek their timestamps are in the clock's future, so they survive
+            // the `trimBefore` filter, and the renderers then receive
+            // non-monotonic PTS: the picture lands back where playback was
+            // rather than where the viewer aimed, and the clock — already
+            // moved to the target — races the frames to catch up, which is the
+            // "it jumps back and then fast-forwards" report.
+            //
+            // Dropping it costs one packet and the loop top repositions.
+            guard seekGeneration == myGeneration else { continue }
             let index = packet.pointee.stream_index
             let activeAudio = desiredAudioIndex
             let activeSub = activeSubtitleIndex
