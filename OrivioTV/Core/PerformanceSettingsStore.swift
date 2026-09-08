@@ -7,8 +7,8 @@ import UIKit
 /// Collection packs ship focus artwork per folder — often 3–4 MB GIFs of
 /// 120–240 frames. Decoding those is the single most expensive thing a tile can
 /// do, so this is a real performance dial, not a cosmetic one. It defaults to
-/// OFF on the 2 GB Apple TV HD and the 3 GB 4K gen 1, which is where the cost
-/// actually hurts.
+/// ON everywhere — the artwork is the point of these packs — and the dial in
+/// Settings → Performance turns it down to stills or off when a box struggles.
 enum CollectionGifQuality: String, Codable, CaseIterable, Identifiable {
     /// Animated, highest frame rate and resolution this device allows.
     case full
@@ -39,11 +39,11 @@ enum CollectionGifQuality: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    /// Default for this hardware. Deliberately OFF on both constrained tiers:
-    /// the 3 GB 4K gen 1 froze with GIFs enabled.
-    static var deviceDefault: CollectionGifQuality {
-        (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower) ? .off : .full
-    }
+    /// ON for every tier. This USED to be off on the A8/A10X boxes (a 4K gen 1
+    /// froze with GIFs enabled, pre-optimization), but the silent downgrade
+    /// read as "the GIFs don't work" — the artwork plays by default now and
+    /// the Settings dial stays for turning it down.
+    static var deviceDefault: CollectionGifQuality { .full }
 }
 
 
@@ -91,8 +91,8 @@ final class PerformanceSettingsStore: ObservableObject {
         /// bitrate, buffer depth. Answers "why is this stuttering" on the
         /// couch, without a Mac attached.
         var showPlayerDiagnostics = false
-        /// Motion allowed on collection folder tiles when focused. Defaults per
-        /// hardware tier (off on the 2 GB HD and the 3 GB 4K gen 1).
+        /// Motion allowed on collection folder tiles when focused. On by
+        /// default on every tier; the Settings dial turns it down or off.
         var collectionGifQuality: CollectionGifQuality = .deviceDefault
 
         init() {}
@@ -248,6 +248,20 @@ final class PerformanceSettingsStore: ObservableObject {
         } else if let data = UserDefaults.standard.data(forKey: Self.key),
            let decoded = try? JSONDecoder().decode(Settings.self, from: data) {
             settings = decoded
+            // One-shot: focus artwork used to default OFF on the A8/A10X
+            // tiers, and any save since then persisted that off. Now that the
+            // default is ON everywhere, flip a persisted off to full ONCE —
+            // after this, an off in the store is the viewer's own choice and
+            // stays put. (A deliberate pre-existing off can't be told apart
+            // from the old tier default; the one-time flip is the price of
+            // the new default actually reaching existing installs.)
+            let migrationKey = "orivio.performance.gifDefaultOn.v1"
+            if !UserDefaults.standard.bool(forKey: migrationKey) {
+                UserDefaults.standard.set(true, forKey: migrationKey)
+                if settings.collectionGifQuality == .off {
+                    settings.collectionGifQuality = .full
+                }
+            }
         } else {
             settings = Self.tierDefaults()
         }

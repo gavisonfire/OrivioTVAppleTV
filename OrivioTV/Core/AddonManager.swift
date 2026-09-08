@@ -15,8 +15,76 @@ final class AddonManager: ObservableObject {
     var onSyncRequested: (() async throws -> Void)?
     private var suppressChange = false
 
+    /// The LEGACY device-wide list. Never deleted (except on account switch):
+    /// it is what the PRIMARY profile inherits when add-ons are separate, and
+    /// the live list in shared mode. Other profiles start from the defaults —
+    /// Trakt-switch semantics; `ensureDefaults` means never truly empty.
     private static let storageKey = "orivio.addons.v1"
     static let cinemetaURL = "https://v3-cinemeta.strem.io/manifest.json"
+
+    // MARK: Per-profile scope
+
+    /// Add-ons are PER PROFILE, like the library/progress/layout stores — a
+    /// configured add-on's manifest URL carries personal state (a debrid
+    /// token, a Letterboxd account baked into an Xperience config), and one
+    /// household's profiles legitimately install different ones. The account
+    /// backend has always stored them per profile (Android writes scoped
+    /// rows); this store and the tvOS sync used to flatten everything into
+    /// one device-wide list, which is why two profiles showed identical
+    /// add-ons and home layouts.
+    ///
+    /// Read at init from ProfileStore's key (same trick TraktStore uses) so
+    /// the scope is right from launch even when signed out.
+    private(set) var profileID: Int
+
+    private static let activeProfileKey = "orivio.profiles.active"
+
+    /// Feature name for the separate-vs-shared switch (see
+    /// `ProfileScopedDefaults.isSeparate`). Shared mode = every profile uses
+    /// one device-wide list, the pre-split behaviour.
+    static let feature = "addons"
+
+    /// Whether add-ons are kept separately per profile (the default) or as
+    /// one shared list, Trakt-switch style.
+    var perProfileEnabled: Bool { ProfileScopedDefaults.isSeparate(Self.feature) }
+
+    /// Flip separate ↔ shared and reload the visible list for the new mode.
+    /// Silent (no push armed): the LIST didn't change, only which copy is live.
+    func setPerProfile(_ on: Bool) {
+        guard on != perProfileEnabled else { return }
+        ProfileScopedDefaults.setSeparate(Self.feature, on)
+        suppressChange = true
+        defer { suppressChange = false }
+        addons = []
+        load()
+        ensureDefaults()
+    }
+
+    /// Point the store at a profile: swap the previous profile's add-on list
+    /// out for this one's. The primary profile inherits the legacy device-wide
+    /// list; any other profile with no list of its own starts from the
+    /// defaults (its account rows pull in on the next sync).
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        suppressChange = true
+        defer { suppressChange = false }
+        addons = []
+        load()
+        ensureDefaults()
+    }
+
+    /// Forget a deleted profile's add-ons so a recycled profile id starts
+    /// from the seed instead of inheriting them.
+    func forgetProfile(_ id: Int) {
+        UserDefaults.standard.removeObject(forKey: Self.storageKey + ".p\(id)")
+        UserDefaults.standard.removeObject(forKey: Self.forgottenDefaultsKey + ".p\(id)")
+        if id == profileID {
+            addons = []
+            load()
+            ensureDefaults()
+        }
+    }
 
     struct RemoteAddonState {
         let manifestURL: String
@@ -194,6 +262,7 @@ final class AddonManager: ObservableObject {
     private static let lastRefreshKey = "orivio.addons.lastRefresh.v1"
 
     init() {
+        profileID = UserDefaults.standard.object(forKey: Self.activeProfileKey) as? Int ?? 1
         load()
         ensureDefaults()
         // Manifests barely ever change — skip the launch refresh when the last
@@ -222,8 +291,11 @@ final class AddonManager: ObservableObject {
     }
 
     func metaAddon(for type: String, id: String) -> InstalledAddon? {
-        addons.first { $0.manifest.providesMeta && $0.handles(id: id) }
-            ?? addons.first { $0.manifest.providesMeta }
+        // Honour `enabled`, as every other capability lookup does: a disabled
+        // meta addon stopped serving catalogs and streams but still answered
+        // episode lists, Continue Watching enrichment and next-episode lookups.
+        let enabled = addons.filter { $0.enabled && $0.manifest.providesMeta }
+        return enabled.first { $0.handles(id: id) } ?? enabled.first
     }
 
     func install(manifestURL rawURL: String) async throws {
@@ -249,10 +321,17 @@ final class AddonManager: ObservableObject {
     ///
     /// Deliberately silent: the caller is retiring the previous account's state
     /// and must not arm a push of the result.
+    ///
+    /// EVERY profile's list plus the legacy device-wide seed, not just the
+    /// active scope: any surviving slot (or the seed a fresh profile would
+    /// copy) still carries the previous user's tokenized manifest URLs, and
+    /// the next profile switch would load them straight into the new account.
     func clearAll() {
-        guard !addons.isEmpty else { return }
         addons.removeAll()
-        save()
+        UserDefaults.standard.removeObject(forKey: Self.storageKey)
+        for id in 1...ProfileStore.maxProfiles {
+            UserDefaults.standard.removeObject(forKey: Self.storageKey + ".p\(id)")
+        }
     }
 
     func remove(_ addon: InstalledAddon) {
@@ -376,7 +455,7 @@ final class AddonManager: ObservableObject {
 
             let started = Date()
             do {
-                _ = try await StremioAPI.manifest(url: addon.manifestURL)
+                _ = try await StremioAPI.manifest(url: addon.manifestURL, bypassCache: true)
                 let elapsed = Int(Date().timeIntervalSince(started) * 1000)
                 return HealthResult(
                     id: addon.id, name: addon.manifest.name, manifestURL: addon.manifestURL,
@@ -493,14 +572,20 @@ final class AddonManager: ObservableObject {
     }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: Self.storageKey),
+        // Separate mode: this profile's own list; only the PRIMARY profile
+        // falls back to the legacy device-wide list (Trakt-switch semantics —
+        // other profiles start fresh with the defaults). Shared mode: the
+        // legacy list IS the list.
+        guard let data = ProfileScopedDefaults.data(Self.storageKey, feature: Self.feature, profileID),
               let decoded = try? JSONDecoder().decode([InstalledAddon].self, from: data) else { return }
         addons = decoded
     }
 
     private func save() {
         guard let data = try? JSONEncoder().encode(addons) else { return }
-        UserDefaults.standard.set(data, forKey: Self.storageKey)
+        UserDefaults.standard.set(
+            data, forKey: ProfileScopedDefaults.writeKey(Self.storageKey, feature: Self.feature, profileID)
+        )
     }
 
     /// Add-ons every install gets, with or without an account.
@@ -518,9 +603,26 @@ final class AddonManager: ObservableObject {
     /// broken.
     private static let forgottenDefaultsKey = "orivio.addons.forgottenDefaults.v1"
 
+    /// Scoped like the list itself (mode-aware). The legacy device-wide set
+    /// belongs to the PRIMARY profile (a default IT removed must not
+    /// reappear); other profiles start with the defaults present.
     private var forgottenDefaults: Set<String> {
-        get { Set(UserDefaults.standard.stringArray(forKey: Self.forgottenDefaultsKey) ?? []) }
-        set { UserDefaults.standard.set(Array(newValue), forKey: Self.forgottenDefaultsKey) }
+        get {
+            if perProfileEnabled {
+                if let scoped = UserDefaults.standard.stringArray(
+                    forKey: ProfileScopedDefaults.key(Self.forgottenDefaultsKey, profileID)) {
+                    return Set(scoped)
+                }
+                guard profileID == 1 else { return [] }
+            }
+            return Set(UserDefaults.standard.stringArray(forKey: Self.forgottenDefaultsKey) ?? [])
+        }
+        set {
+            UserDefaults.standard.set(
+                Array(newValue),
+                forKey: ProfileScopedDefaults.writeKey(Self.forgottenDefaultsKey, feature: Self.feature, profileID)
+            )
+        }
     }
 
     /// Put back any default the viewer hasn't explicitly removed.

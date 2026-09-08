@@ -5,6 +5,9 @@ struct PlayerScreen: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var debrid: DebridStore
     @EnvironmentObject private var watched: WatchedStore
+    /// Observed (not the view model's load-time snapshot) so caption style
+    /// edits made in the Subtitles panel restyle the captions on screen live.
+    @EnvironmentObject private var playerSettingsStore: PlayerSettingsStore
     @StateObject private var viewModel: PlayerViewModel
     @FocusState private var catcherFocused: Bool
     /// Focus on the "Skip Intro" pill. Kept in sync both ways with
@@ -70,22 +73,28 @@ struct PlayerScreen: View {
             // video, not just when zooming — that was choppiness we imposed
             // that stock players (Stremio) don't. Zoom/stretch opt INTO the
             // transform only when actually selected.
-            if viewModel.aspectMode == .fit {
-                PlayerVideoView(viewModel: viewModel, refreshID: viewModel.videoRefreshID)
-                    .ignoresSafeArea()
-            } else {
-                GeometryReader { geo in
-                    let scale = viewModel.aspectMode.scale(
-                        video: viewModel.videoNaturalSize, container: geo.size
-                    )
-                    PlayerVideoView(viewModel: viewModel, refreshID: viewModel.videoRefreshID)
-                        .scaleEffect(x: scale.width, y: scale.height)
-                        .animation(.easeInOut(duration: 0.25), value: viewModel.aspectMode)
-                }
+            // ONE host, always. Zoom / aspect / shift are a transform on it
+            // that is the identity in the plain case. Switching between a
+            // raw host and a transformed one remounted the engine's view,
+            // and going Crop → Normal left the picture black on the device.
+            let screen = UIScreen.main.bounds.size
+            let scale = viewModel.aspectMode.transform(
+                video: viewModel.videoNaturalSize, container: screen,
+                forcedAspect: viewModel.aspectRatioOverride
+            )
+            let shift = viewModel.aspectMode.shiftOffset(
+                video: viewModel.videoNaturalSize, container: screen,
+                forcedAspect: viewModel.aspectRatioOverride,
+                shift: viewModel.verticalShift
+            )
+            PlayerVideoView(viewModel: viewModel, refreshID: viewModel.videoRefreshID,
+                            scale: scale, shiftY: shift)
                 .ignoresSafeArea()
-            }
 
-            SubtitleOverlayView(model: viewModel.subtitleModel, settings: viewModel.settings)
+            // Live store settings, NOT viewModel.settings: that copy is a
+            // load-time snapshot, and the Subtitles panel's size/font control
+            // writes to the store — captions must restyle as you step them.
+            SubtitleOverlayView(model: viewModel.subtitleModel, settings: playerSettingsStore.settings)
                 .ignoresSafeArea()
 
             // Diagnostics HUD (Settings → Performance → Developer). Above the
@@ -103,7 +112,9 @@ struct PlayerScreen: View {
             RemoteTouchCatcher(
                 isActive: {
                     viewModel.overlay == .none
+                        || viewModel.overlay == .controls
                         || viewModel.overlay == .pauseInfo
+                        || viewModel.overlay == .info
                         || viewModel.isScrubbing
                 },
                 onBegan: { viewModel.remoteTouchBegan() },
@@ -123,7 +134,10 @@ struct PlayerScreen: View {
             // On-screen input diagnostics (Settings → Playback → toggle).
             if viewModel.settings.showInputDebug {
                 VStack {
-                    Text("input: \(viewModel.inputDebug)")
+                    // Named like the diagnostics HUD, and for the same reason:
+                    // a bare yellow line at the top of the video reads as
+                    // garbage when the toggle is forgotten.
+                    Text("DEV input (Settings → Performance): \(viewModel.inputDebug)")
                         .font(.system(size: 22, weight: .bold).monospaced())
                         .foregroundStyle(.yellow)
                         .padding(10)
@@ -139,7 +153,7 @@ struct PlayerScreen: View {
             // turning remote presses into player actions. Without it those
             // states would be focus dead-zones and remote commands (including
             // Menu) would stop arriving.
-            if viewModel.overlay == .none || viewModel.overlay == .pauseInfo || viewModel.overlay == .info {
+            if viewModel.overlay == .none {
                 remoteCatcher
             }
 
@@ -177,57 +191,38 @@ struct PlayerScreen: View {
             }
 
 
+            bottomScrim
+
             scrubHUD
 
-            if viewModel.overlay == .controls {
+            // The transport. Paused (.pauseInfo) is the same screen — Infuse
+            // keeps the bar up while paused — and the audio / subtitle
+            // popovers are this screen with a panel over one glyph.
+            if controlsVisible {
                 FusionPlayerControlsOverlay(viewModel: viewModel).transition(.opacity)
-                if viewModel.settings.osdClockEnabled {
-                    OSDClock()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                        .padding(.top, OrivioSpacing.xl)
-                        .padding(.trailing, OrivioSpacing.huge)
-                        .transition(.opacity)
-                }
             }
 
-            if viewModel.overlay == .pauseInfo, viewModel.settings.pauseOverlayEnabled {
-                PauseOverlayView(viewModel: viewModel)
+            // Sources / episodes / engine / speed reached from elsewhere
+            // (error overlay, episode long-press) use the same full-screen
+            // picker the info sheet does.
+            pickerOverlays
+
+            if viewModel.overlay == .info {
+                // The close is an explicit slide-up on a still-mounted sheet
+                // (`sheetClosing`), then the removal: pulling a focused
+                // sheet straight out of the hierarchy let the focus system
+                // commit the change before the removal transition ran, so
+                // the close never animated.
+                Color.black.opacity(viewModel.sheetClosing ? 0 : 0.55)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
                     .transition(.opacity)
-            }
-
-            // Side panel: just a clean slide in from the right (move-only
-            // transition, see SidePanel). No separate dim layer — that was
-            // snapping in as a block before the panel slid into it.
-            sidePanels
-
-            // The sheet is ALWAYS MOUNTED and simply parked above the top of
-            // the screen, sliding down on a plain `.offset`. It is never
-            // inserted or removed, so there is no transition at all.
-            //
-            // That is the point. A transition needs an animation transaction to
-            // drive it, and this subtree sits inside the player ZStack's own
-            // `.animation(value: viewModel.overlay)` as well as this one — two
-            // transactions, two different durations, both firing on the same
-            // state change. SwiftUI ran the transition twice, which is why two
-            // copies of the sheet were on screen a few points apart and the
-            // title looked ghosted. Neither shortening the travel nor measuring
-            // it could fix that, because the duplication was never about the
-            // distance. With the view permanently mounted there is nothing to
-            // insert, nothing to remove, and only one animatable value.
-            //
-            // Cost: the panel's artwork loads once when playback starts rather
-            // than on first pull-down. It is the same poster and cast row the
-            // Detail page already cached, and it buys a slide that cannot
-            // desync.
-            if viewModel.hasStartedPlayback {
-                VStack(spacing: 0) {
-                    InfoPullDownPanel(viewModel: viewModel)
-                        .offset(y: viewModel.overlay == .info ? 0 : -900)
-                        .animation(.easeOut(duration: 0.3),
-                                   value: viewModel.overlay == .info)
-                    Spacer(minLength: 0)
-                }
-                .allowsHitTesting(viewModel.overlay == .info)
+                InfuseInfoPanel(viewModel: viewModel)
+                    .offset(y: viewModel.sheetClosing ? -1000 : 0)
+                    .opacity(viewModel.sheetClosing ? 0 : 1)
+                    .disabled(viewModel.sheetClosing)
+                    .animation(PlayerViewModel.sheetMotion, value: viewModel.sheetClosing)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
 
             if viewModel.overlay == .upNext {
@@ -255,17 +250,11 @@ struct PlayerScreen: View {
             }
 
             if let toast = viewModel.toast {
-                VStack {
-                    Text(toast)
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, OrivioSpacing.xl)
-                        .padding(.vertical, OrivioSpacing.sm)
-                        .playerChrome(in: Capsule())
-                        .padding(.top, OrivioSpacing.xxl)
-                    Spacer()
-                }
-                .transition(.opacity)
+                InfuseToast(text: toast)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(.top, 48)
+                    .padding(.trailing, 56)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
             if viewModel.isSwitchingSource {
@@ -292,8 +281,9 @@ struct PlayerScreen: View {
         // slower, softer one — `controlsDismiss` (0.26) had never reached the
         // screen. Dismissal is where a ten-foot UI most needs to be gentle: the
         // viewer is looking at the picture underneath, not at the thing leaving.
-        .animation(viewModel.overlay == .none ? FusionMotion.controlsDismiss
-                                              : FusionMotion.controlsAppear,
+        .animation(viewModel.sheetMoving ? PlayerViewModel.sheetMotion
+                   : viewModel.overlay == .none ? FusionMotion.controlsDismiss
+                   : FusionMotion.controlsAppear,
                    value: viewModel.overlay)
         .animation(FusionMotion.controlsAppear, value: viewModel.isResyncing)
         // Held over the last frame while the display-mode handshake settles.
@@ -334,7 +324,7 @@ struct PlayerScreen: View {
             // control that's now gone. Reclaim it for the invisible catcher so
             // the very next click REOPENS the menu instead of landing on the
             // stale play button (which read as "trying to hide the menu").
-            if newValue == .none || newValue == .pauseInfo || newValue == .info {
+            if newValue == .none {
                 // ...unless the Skip Intro pill is the thing that should hold
                 // it, in which case stealing focus back would un-highlight it.
                 guard !viewModel.skipIntroFocused else { return }
@@ -346,8 +336,7 @@ struct PlayerScreen: View {
         .onChange(of: viewModel.skipIntroFocused) { _, focused in
             if focused {
                 skipIntroFocused = true
-            } else if viewModel.overlay == .none || viewModel.overlay == .pauseInfo
-                        || viewModel.overlay == .info {
+            } else if viewModel.overlay == .none {
                 // The pill let go — the invisible catcher has to take focus
                 // back or the remote goes dead over bare video.
                 DispatchQueue.main.async { catcherFocused = true }
@@ -452,6 +441,17 @@ struct PlayerScreen: View {
             }
             return
         }
+        // Dev-only: `-playerInfoDemo` pulls the info sheet down once playback
+        // is running (the gesture that opens it can't be sent to the sim).
+        if ProcessInfo.processInfo.arguments.contains("-playerInfoDemo") {
+            while !viewModel.hasStartedPlayback, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            viewModel.hideControls()
+            viewModel.showInfoPanel()
+            return
+        }
         guard ProcessInfo.processInfo.arguments.contains("-playerDemoTour") else { return }
         try? await Task.sleep(nanoseconds: 8_000_000_000)
         viewModel.togglePlayPause()             // → pause overlay
@@ -508,11 +508,10 @@ struct PlayerScreen: View {
             } else if viewModel.peekVisible {
                 // Peek is up → a click drops into scrub so you can edit the time.
                 viewModel.beginScrub()
-            } else if viewModel.overlay == .info {
-                viewModel.dismissInfoPanel()
-            } else if viewModel.overlay == .pauseInfo {
-                viewModel.togglePlayPause()
             } else {
+                // Infuse: a click on the bare picture is play / pause. The
+                // transport comes up with it and hides again on its own.
+                viewModel.togglePlayPause()
                 viewModel.showControls()
             }
         } label: {
@@ -523,17 +522,6 @@ struct PlayerScreen: View {
         .onAppear { catcherFocused = true }
         .onMoveCommand { direction in
             viewModel.noteInput("move \(direction)")
-            if viewModel.overlay == .info {
-                // Swipe up tucks the pull-down away; left/right switch between
-                // the Details and File Info tabs. Nothing seeks under the panel.
-                switch direction {
-                case .up: viewModel.dismissInfoPanel()
-                case .left: viewModel.infoTab = 0
-                case .right: viewModel.infoTab = 1
-                default: break
-                }
-                return
-            }
             // A trackpad SWIPE emits a move command too, but a swipe is already
             // handled by the pan recognizer (which sets moveSuppressed). So
             // ONLY a real directional CLICK gets past here.
@@ -574,7 +562,7 @@ struct PlayerScreen: View {
     @ViewBuilder
     private var skipIntroPill: some View {
         if viewModel.skipIntroActive, !viewModel.isScrubbing,
-           viewModel.overlay == .none || viewModel.overlay == .controls {
+           viewModel.overlay == .none || controlsVisible {
             VStack {
                 Spacer()
                 HStack {
@@ -607,14 +595,22 @@ struct PlayerScreen: View {
                     }
                 }
                 .padding(.trailing, OrivioSpacing.huge)
-                .padding(.bottom, viewModel.overlay == .controls ? 320 : OrivioSpacing.huge)
+                .padding(.bottom, controlsVisible ? 260 : OrivioSpacing.huge)
             }
             .transition(.opacity)
         }
     }
 
+    /// The transport is on screen: controls, paused, or a track popover.
+    private var controlsVisible: Bool {
+        switch viewModel.overlay {
+        case .controls, .pauseInfo, .audio, .subtitles: return true
+        default: return false
+        }
+    }
+
     private var bottomBlockVisible: Bool {
-        if viewModel.overlay == .controls { return true }
+        if controlsVisible { return true }
         if viewModel.isScrubbing { return true }
         if viewModel.peekVisible, viewModel.overlay == .none { return true }
         if viewModel.pendingSeekDelta != 0, viewModel.overlay != .controls { return true }
@@ -630,10 +626,10 @@ struct PlayerScreen: View {
             VStack(spacing: 0) {
                 Spacer()
                 LinearGradient(
-                    colors: [.clear, .black.opacity(0.40), .black.opacity(0.88)],
+                    colors: [.clear, .black.opacity(0.28), .black.opacity(0.7)],
                     startPoint: .top, endPoint: .bottom
                 )
-                .frame(height: 640)
+                .frame(height: 460)
             }
             .ignoresSafeArea()
             .allowsHitTesting(false)
@@ -643,19 +639,10 @@ struct PlayerScreen: View {
 
     @ViewBuilder
     private var bufferingIndicator: some View {
-        VStack(spacing: OrivioSpacing.lg) {
-            ProgressView()
-                .tint(theme.palette.secondary)
-                .scaleEffect(1.6)
-            if let via = viewModel.viaLine {
-                Text(via)
-                    .font(.system(size: 21))
-                    .foregroundStyle(.white.opacity(0.75))
-                    .lineLimit(1)
-            }
-        }
-        .padding(OrivioSpacing.xl)
-        .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: OrivioRadius.lg, style: .continuous))
+        ProgressView()
+            .tint(.white)
+            .scaleEffect(1.8)
+            .shadow(color: .black.opacity(0.5), radius: 8)
     }
 
     @ViewBuilder
@@ -669,50 +656,100 @@ struct PlayerScreen: View {
     }
 
     @ViewBuilder
-    private var sidePanels: some View {
+    private var pickerOverlays: some View {
         switch viewModel.overlay {
-        case .episodes:
-            SidePanel(title: "Episodes", onExitCommand: sidePanelExit) {
-                EpisodesPanelContent(viewModel: viewModel)
-            }
         case .sources:
-            SidePanel(title: "Sources", onExitCommand: sidePanelExit) {
-                SourcesPanelContent(viewModel: viewModel)
-            }
-        case .audio:
-            SidePanel(title: "Audio", onExitCommand: sidePanelExit) {
-                TrackPanelContent(
-                    options: viewModel.audioOptions,
-                    selectedID: viewModel.selectedAudioID
-                ) { viewModel.selectAudio($0); viewModel.overlay = .controls }
-            }
-        case .subtitles:
-            SidePanel(title: "Subtitles", onExitCommand: sidePanelExit) {
-                VStack(spacing: OrivioSpacing.sm) {
-                    SubtitleDelayControl(viewModel: viewModel)
-                    TrackPanelContent(
-                        options: viewModel.subtitleOptions,
-                        selectedID: viewModel.selectedSubtitleID
-                    ) { viewModel.selectSubtitle($0); viewModel.overlay = .controls }
-                }
-            }
+            InfusePickerScreen(viewModel: viewModel,
+                               spec: InfusePickerSpec(title: "Sources", content: .sources)) {}
+                .transition(.opacity)
+        case .episodes:
+            InfusePickerScreen(viewModel: viewModel,
+                               spec: InfusePickerSpec(title: "Episodes", content: .episodes)) {}
+                .transition(.opacity)
         case .speed:
-            SidePanel(title: "Playback Speed", onExitCommand: sidePanelExit) {
-                SpeedPanelContent(viewModel: viewModel)
+            InfusePickerScreen(viewModel: viewModel, spec: InfusePickerSpec(
+                title: "Playback Speed",
+                content: .items([0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map { (speed: Float) in
+                    InfusePickerItem(id: "\(speed)",
+                                     title: speed == 1 ? "Normal" : String(format: "%gx", speed),
+                                     selected: viewModel.playbackSpeed == speed) {
+                        viewModel.setSpeed(speed)
+                    }
+                })
+            )) {
+                viewModel.overlay = .controls
             }
+            .transition(.opacity)
         case .engine:
-            SidePanel(title: "Player Engine", onExitCommand: sidePanelExit) {
-                EnginePanelContent(viewModel: viewModel)
-            }
+            InfusePickerScreen(viewModel: viewModel, spec: InfusePickerSpec(
+                title: "Engine",
+                content: .items(PlayerEngine.allCases.filter { $0 != .external }.map { engine in
+                    InfusePickerItem(id: engine.rawValue, title: engine.label,
+                                     selected: viewModel.effectiveEngine == engine) {
+                        viewModel.switchEngine(engine)
+                    }
+                })
+            )) {}
+            .transition(.opacity)
         default:
             EmptyView()
         }
     }
+}
 
-    /// Shared Back/Menu handler for every side panel: always returns to the
-    /// main controls, never falls through to exiting the player.
-    private func sidePanelExit() {
-        _ = viewModel.handleExit()
+/// Infuse's confirmation pill: top-right, dark, rounded, a line of text.
+private struct InfuseToast: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 24, weight: .semibold))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .padding(.horizontal, 30)
+            .padding(.vertical, 16)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color(hex: 0x1B1B1D).opacity(0.94))
+            )
+            .shadow(color: .black.opacity(0.4), radius: 16, y: 6)
+    }
+}
+
+private extension AspectMode {
+    /// Host transform for the picture: the forced aspect ratio first
+    /// (stretching the mismatched axis), then this mode's crop / stretch on
+    /// the resulting shape.
+    func transform(video: CGSize, container: CGSize, forcedAspect: Double?) -> CGSize {
+        guard video.width > 0, video.height > 0,
+              container.width > 0, container.height > 0 else {
+            return CGSize(width: 1, height: 1)
+        }
+        let real = video.width / video.height
+        let shown = forcedAspect.map { CGFloat($0) } ?? real
+        let fittedReal = Self.fitted(aspect: real, in: container)
+        let fittedShown = Self.fitted(aspect: shown, in: container)
+        let mode = scale(video: fittedShown, container: container)
+        return CGSize(width: fittedShown.width / fittedReal.width * mode.width,
+                      height: fittedShown.height / fittedReal.height * mode.height)
+    }
+
+    /// Vertical offset that parks a letterboxed picture against the top or
+    /// bottom edge of the screen.
+    func shiftOffset(video: CGSize, container: CGSize, forcedAspect: Double?,
+                     shift: PlayerViewModel.VerticalShift) -> CGFloat {
+        guard shift != .none, video.width > 0, video.height > 0 else { return 0 }
+        let real = video.width / video.height
+        let t = transform(video: video, container: container, forcedAspect: forcedAspect)
+        let shownHeight = Self.fitted(aspect: real, in: container).height * t.height
+        let slack = max(container.height - shownHeight, 0) / 2
+        return shift == .up ? -slack : slack
+    }
+
+    private static func fitted(aspect: CGFloat, in container: CGSize) -> CGSize {
+        container.width / container.height > aspect
+            ? CGSize(width: container.height * aspect, height: container.height)
+            : CGSize(width: container.width, height: container.width / aspect)
     }
 }
 
@@ -720,27 +757,6 @@ struct PlayerScreen: View {
 /// backdrop under a dark vertical gradient, with the movie/show logo (or its
 /// name) gently pulsing in the center and a status line beneath. Replaces the
 /// bare spinner so loading a stream feels like the APK.
-/// A live wall clock for the player OSD (Android's osdClock). Ticks each
-/// minute while the controls overlay is visible.
-struct OSDClock: View {
-    @State private var now = Date()
-    private let timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
-
-    private static let formatter: DateFormatter = {
-        let f = DateFormatter()
-        f.timeStyle = .short
-        return f
-    }()
-
-    var body: some View {
-        Text(Self.formatter.string(from: now))
-            .font(.system(size: 30, weight: .semibold).monospacedDigit())
-            .foregroundStyle(.white.opacity(0.85))
-            .shadow(color: .black.opacity(0.6), radius: 6, y: 2)
-            .onReceive(timer) { now = $0 }
-    }
-}
-
 struct PlayerLoadingOverlay: View {
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject var viewModel: PlayerViewModel
@@ -767,7 +783,8 @@ struct PlayerLoadingOverlay: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster)
+            RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster,
+                        maxPixels: PerformanceProfile.backdropPixelCap)
                 .ignoresSafeArea()
 
             // Match the APK scrim: light at the top, deepening to near-black at
@@ -838,7 +855,7 @@ struct PlayerLoadingOverlay: View {
     @ViewBuilder
     private var logoOrTitle: some View {
         if hasLogo {
-            RemoteImage(url: viewModel.meta.logo, contentMode: .fit)
+            RemoteImage(url: viewModel.meta.logo, contentMode: .fit, maxDimension: 480)
                 .frame(width: 480, height: 270)
         } else {
             Text(viewModel.displayTitle)
@@ -895,7 +912,7 @@ struct UpNextOverlay: View {
             .allowsHitTesting(false)
 
             HStack(alignment: .bottom, spacing: OrivioSpacing.xl) {
-                RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster)
+                RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster, maxDimension: 300)
                     .frame(width: 300, height: 169)
                     .clipShape(RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous))
 
@@ -1045,287 +1062,6 @@ struct PostPlayOverlay: View {
             .padding(OrivioSpacing.huge)
         }
         .onAppear { closeFocused = true }
-    }
-}
-
-/// Infuse-style pull-down: swipe down over the video for a top sheet with two
-/// tabs — **Details** (poster, plot, cast: the movie/episode itself) and
-/// **File Info** (live technical data). Swipe left/right to switch tabs;
-/// swipe up, click, or Back tucks it away — playback never stops underneath.
-struct InfoPullDownPanel: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @ObservedObject var viewModel: PlayerViewModel
-    /// File Info is assembled from the live player — track lists, the decision
-    /// log, performance counters. Built straight into `body` it was rebuilt on
-    /// every pass, including each frame of the tab cross-fade. Snapshot it when
-    /// the tab opens instead; the panel is transient and the numbers are a
-    /// point-in-time read anyway.
-    @State private var infoSections: [PlayerViewModel.MediaInfoSection] = []
-
-    /// Bottom-rounded sheet shape: the top edge bleeds off-screen.
-    private var sheetShape: UnevenRoundedRectangle {
-        UnevenRoundedRectangle(bottomLeadingRadius: 30, bottomTrailingRadius: 30, style: .continuous)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: OrivioSpacing.md) {
-            tabBar
-
-            Rectangle()
-                .fill(.white.opacity(0.08))
-                .frame(height: 1)
-
-            Group {
-                if viewModel.infoTab == 0 {
-                    detailsTab
-                } else {
-                    fileInfoTab
-                }
-            }
-            .animation(FusionMotion.controlsAppear, value: viewModel.infoTab)
-        }
-        .task(id: viewModel.infoTab) {
-            guard viewModel.infoTab == 1 else { return }
-            infoSections = viewModel.mediaInfoSections()
-        }
-        .padding(.horizontal, OrivioSpacing.huge)
-        .padding(.top, OrivioSpacing.xl)
-        .padding(.bottom, OrivioSpacing.lg)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            // System-player look: dark sheet, hairline edge, soft drop shadow
-            // onto the video. The whole sheet — background and content — is one
-            // unit that moves together.
-            //
-            // NO material here, on any device. `.ultraThinMaterial` is a LIVE
-            // blur of the moving video behind a full-width sheet: the
-            // compositor re-samples and re-blurs it every single frame of the
-            // slide, which is what made the pull-down stutter on its way in.
-            // The A8 already opted out, and its comment said why — under a 55%
-            // black wash the blur is barely visible. That is just as true on
-            // the 4K boxes, so the blur was paying a per-frame cost for an
-            // effect nobody can see.
-            sheetShape
-                .fill(Color(hex: 0x0C0E12).opacity(0.92))
-                .overlay(sheetShape.strokeBorder(.white.opacity(0.08), lineWidth: 1))
-                // Flatten before the shadow, so it is cast once for the whole
-                // sheet instead of per layer underneath it.
-                .compositingGroup()
-                .shadow(color: .black.opacity(0.5),
-                        radius: PerformanceProfile.isLowPower ? 0 : 16, y: 10)
-        )
-        // Bleed past the top/side safe area as part of the sheet itself, so
-        // the slide-in offsets the entire sheet uniformly.
-        .ignoresSafeArea(edges: [.top, .horizontal])
-    }
-
-    private var tabBar: some View {
-        HStack(spacing: OrivioSpacing.sm) {
-            tabPill("Details", index: 0)
-            tabPill("File Info", index: 1)
-            Spacer()
-            HStack(spacing: OrivioSpacing.md) {
-                shortcutHint(icon: "arrow.left.arrow.right", text: "Switch")
-                shortcutHint(icon: "chevron.up", text: "Close")
-            }
-        }
-    }
-
-    private func shortcutHint(icon: String, text: String) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(.system(size: 18, weight: .semibold))
-            Text(text)
-                .font(.system(size: 21, weight: .medium))
-        }
-        .foregroundStyle(.white.opacity(0.4))
-    }
-
-    private func tabPill(_ label: String, index: Int) -> some View {
-        let selected = viewModel.infoTab == index
-        return Text(label)
-            .font(.system(size: 20, weight: .semibold))
-            .foregroundStyle(selected ? .black : .white.opacity(0.65))
-            .padding(.horizontal, OrivioSpacing.lg)
-            .padding(.vertical, 7)
-            .background(
-                Capsule(style: .continuous)
-                    .fill(selected ? Color.white : Color.white.opacity(0.1))
-            )
-            .animation(.easeOut(duration: 0.15), value: selected)
-    }
-
-    /// Tab 1 — the title itself. Uses `displayMeta` (the enriched fetch) and
-    /// mirrors the home hero banner's meta line — Type • Genre • Runtime •
-    /// Year • IMDb — plus the plot, full genre list, and cast.
-    private var detailsTab: some View {
-        let meta = viewModel.displayMeta
-        // When an EPISODE is playing, this tab describes that episode (its still,
-        // overview and air date) rather than the show at large.
-        let episode = viewModel.currentVideo
-        let episodeStill = episode?.thumbnail.flatMap { $0.isEmpty ? nil : $0 }
-        let bodyText = (episode?.overview.flatMap { $0.isEmpty ? nil : $0 }) ?? meta.description
-
-        return HStack(alignment: .top, spacing: OrivioSpacing.xl) {
-            Group {
-                if let episodeStill {
-                    // Episode still is landscape.
-                    RemoteImage(url: episodeStill)
-                        .frame(width: 300, height: 169)
-                } else {
-                    RemoteImage(url: meta.poster)
-                        .frame(width: 190, height: 285)
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
-                    .strokeBorder(.white.opacity(0.12), lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.6), radius: 16, y: 8)
-
-            VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
-                Text(meta.name)
-                    .font(.system(size: 40, weight: .bold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-
-                if let episodeLine = viewModel.episodeLine {
-                    Text(episodeLine)
-                        .font(.system(size: 25, weight: .semibold))
-                        .foregroundStyle(theme.palette.secondary)
-                        .lineLimit(1)
-                }
-
-                // For an episode: air date. For a movie: the show/film meta line.
-                if let episode {
-                    if let aired = episode.airedText {
-                        MetaDotText("Aired \(aired)")
-                    }
-                } else {
-                    HStack(spacing: OrivioSpacing.sm) {
-                        MetaDotText(meta.typeLabel)
-                        if let genre = meta.genres?.first {
-                            MetaDot(); MetaDotText(genre)
-                        }
-                        if let runtime = meta.runtimeFormatted {
-                            MetaDot(); MetaDotText(runtime)
-                        }
-                        if let year = meta.year {
-                            MetaDot(); MetaDotText(year)
-                        }
-                        if let rating = meta.imdbRating {
-                            MetaDot(); ImdbBadge(rating: rating)
-                        }
-                    }
-
-                    if let genres = meta.genres, genres.count > 1 {
-                        Text(genres.prefix(5).joined(separator: " · "))
-                            .font(.system(size: 20, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.6))
-                            .lineLimit(1)
-                    }
-                }
-
-                if let bodyText {
-                    Text(bodyText)
-                        .font(.system(size: 21))
-                        .foregroundStyle(.white.opacity(0.8))
-                        .lineLimit(4)
-                        .padding(.top, 2)
-                }
-
-                // Same circular-headshot cast chips as the Detail page; the
-                // plain name list is only the fallback while TMDB has nothing.
-                if !viewModel.tmdbCast.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: OrivioSpacing.md) {
-                            ForEach(viewModel.tmdbCast.prefix(10)) { member in
-                                InfoCastChip(member: member)
-                            }
-                        }
-                    }
-                    .padding(.top, OrivioSpacing.xs)
-                } else if let cast = meta.cast, !cast.isEmpty {
-                    (Text("Cast: ").foregroundStyle(.white.opacity(0.5))
-                        + Text(cast.prefix(8).joined(separator: ", ")).foregroundStyle(.white.opacity(0.8)))
-                        .font(.system(size: 19, weight: .medium))
-                        .lineLimit(2)
-                        .padding(.top, 2)
-                }
-            }
-            Spacer(minLength: 0)
-        }
-    }
-
-    /// Tab 2 — live technical sections in a row of compact cards.
-    private var fileInfoTab: some View {
-        HStack(alignment: .top, spacing: OrivioSpacing.md) {
-            ForEach(infoSections) { section in
-                VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
-                    Text(section.title.uppercased())
-                        .font(.system(size: 20, weight: .bold))
-                        .kerning(1.2)
-                        .foregroundStyle(.white.opacity(0.45))
-                    ForEach(section.rows) { row in
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(row.label)
-                                .font(.system(size: 20, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.45))
-                            Text(row.value)
-                                .font(.system(size: 24, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.95))
-                                // Playback Path rows carry full sentences — a
-                                // remux failure REASON most of all. Truncating
-                                // the one line that explains a fallback defeats
-                                // the panel's purpose; wrap instead.
-                                .lineLimit(4)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(OrivioSpacing.md)
-                .background(
-                    RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
-                        .fill(Color.white.opacity(0.06))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
-                        .strokeBorder(.white.opacity(0.07), lineWidth: 1)
-                )
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .fixedSize(horizontal: false, vertical: true)
-    }
-}
-
-/// Compact, non-interactive version of the Detail page's cast chip for the
-/// pull-down: circular TMDB headshot + name + role.
-private struct InfoCastChip: View {
-    @EnvironmentObject private var theme: ThemeManager
-    let member: TMDBService.CastMember
-
-    var body: some View {
-        VStack(spacing: 6) {
-            RemoteImage(url: member.profileURL)
-                .frame(width: 96, height: 96)
-                .background(Color.white.opacity(0.08))
-                .clipShape(Circle())
-                .overlay(Circle().strokeBorder(.white.opacity(0.12), lineWidth: 1))
-            Text(member.name)
-                .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.9))
-                .lineLimit(1)
-            if let character = member.character, !character.isEmpty {
-                Text(character)
-                    .font(.system(size: 19))
-                    .foregroundStyle(.white.opacity(0.5))
-                    .lineLimit(1)
-            }
-        }
-        .frame(width: 120)
     }
 }
 

@@ -197,6 +197,21 @@ final class TraktStore: ObservableObject {
         if id == profileID { reloadAccount() }
     }
 
+    /// Forget EVERY profile's Trakt login plus the shared (unsuffixed) one.
+    /// For an account switch: the previous user's tokens in any slot would be
+    /// reloaded by the next profile switch and pushed into the new account.
+    func forgetAllProfiles() {
+        applyingRemote = true
+        defer { applyingRemote = false }
+        for key in [Self.tokenKey, Self.userKey, Self.explicitLoginKey] {
+            UserDefaults.standard.removeObject(forKey: key)
+            for id in 1...Self.maxProfileID {
+                UserDefaults.standard.removeObject(forKey: key + ".p\(id)")
+            }
+        }
+        reloadAccount()
+    }
+
     /// Point the store at a profile. No-op unless per-profile accounts are on,
     /// in which case the previous profile's login is swapped out for this
     /// one's — which may be none at all, and that is the intended outcome.

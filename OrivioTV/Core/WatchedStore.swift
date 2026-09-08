@@ -71,7 +71,7 @@ final class WatchedStore: ObservableObject {
     /// moment later — twice the launch cost, and a reload cascade on top.
     /// `RatingsStore` and `TraktStore` already do this.
     private static let activeProfileKey = "orivio.profiles.active"
-    private var profileID = UserDefaults.standard.object(forKey: activeProfileKey) as? Int ?? 1
+    private(set) var profileID = UserDefaults.standard.object(forKey: activeProfileKey) as? Int ?? 1
     private var storageKey: String {
         profileID == 1 ? "orivio.watched.v1" : "orivio.watched.v1.p\(profileID)"
     }
@@ -80,12 +80,16 @@ final class WatchedStore: ObservableObject {
 
     func setProfile(_ id: Int) {
         guard id != profileID else { return }
+        // Parked per profile, not dropped: see LibraryStore.setProfile.
+        tombstonesByProfile[profileID] = tombstones
         profileID = id
         suppressChange = true
         items = [:]
+        tombstones = tombstonesByProfile[id] ?? [:]
         load()
         suppressChange = false
     }
+    private var tombstonesByProfile: [Int: [String: Date]] = [:]
 
     // MARK: - Queries
 
@@ -237,8 +241,11 @@ final class WatchedStore: ObservableObject {
     // MARK: - Persistence
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([String: WatchedItem].self, from: data) else { return }
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else { return }
+        guard let decoded = try? JSONDecoder().decode([String: WatchedItem].self, from: data) else {
+            UnreadableBlobGuard.preserve(data, key: storageKey)   // see ProgressStore
+            return
+        }
         items = decoded
     }
 

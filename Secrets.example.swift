@@ -13,8 +13,9 @@ import Foundation
 //  them blank. What each unlocks:
 //    • supabase*        → the Orivio account: QR login + cross-device sync
 //    • trakt*           → Trakt sign-in + scrobbling
-//    • tmdbAPIKey       → TMDB enrichment (cast, trailers, ratings, stills)
-//                         Get a free key at https://www.themoviedb.org/settings/api
+//
+//  TMDB is NOT here: each viewer enters their own key in the app under
+//  Settings → Integrations → TMDB (free, from themoviedb.org/settings/api).
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum Secrets {
@@ -33,7 +34,4 @@ enum Secrets {
     // SIMKL client id (create an app at https://simkl.com/settings/developer).
     // SIMKL's PIN login needs only the id — there is no secret to supply.
     static let simklClientID = ""
-
-    // TMDB API key (https://www.themoviedb.org/settings/api).
-    static let tmdbAPIKey = ""
 }

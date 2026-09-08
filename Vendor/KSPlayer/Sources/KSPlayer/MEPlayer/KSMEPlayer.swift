@@ -154,6 +154,7 @@ private extension KSMEPlayer {
         runOnMainThread { [weak self] in
             guard let self else { return }
             let isPaused = !(self.playbackState == .playing && self.loadState == .playable)
+            KSOptions.hostTrail?("KSMEPlayer.playOrPause paused=\(isPaused) playback=\(self.playbackState) load=\(self.loadState)")
             if isPaused {
                 self.audioOutput.pause()
                 self.videoOutput?.pause()
@@ -243,6 +244,7 @@ extension KSMEPlayer: MEPlayerDelegate {
         }
         if loadState == .playable {
             if !loadingState.isEndOfFile, loadingState.frameCount == 0, loadingState.packetCount == 0, options.preferredForwardBufferDuration != 0 {
+                KSOptions.hostTrail?("KSMEPlayer underrun → loading (frames=\(loadingState.frameCount) packets=\(loadingState.packetCount) loaded=\(loadingState.loadedTime)s)")
                 loadState = .loading
                 if playbackState == .playing {
                     runOnMainThread { [weak self] in
@@ -395,6 +397,10 @@ extension KSMEPlayer: MediaPlayerProtocol {
     }
 
     public func pause() {
+        // ORIVIO PATCH: only symbolicate when a trail sink is installed.
+        if let trail = KSOptions.hostTrail {
+            trail("KSMEPlayer.pause from: " + Thread.callStackSymbols.dropFirst().prefix(6).map { String($0.split(separator: " ", omittingEmptySubsequences: true).dropFirst(3).prefix(2).joined(separator: " ")) }.joined(separator: " | "))
+        }
         KSLog("pause \(self)")
         playbackState = .paused
         if #available(iOS 15.0, tvOS 15.0, macOS 12.0, *) {

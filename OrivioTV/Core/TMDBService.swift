@@ -20,8 +20,28 @@ struct TMDBSettings: Codable, Equatable {
     var useCollections: Bool = true
     /// Per-episode ratings + air dates.
     var useEpisodes: Bool = true
+    /// The viewer's OWN TMDB v3 API key. There is no app-embedded key any
+    /// more — TMDB keys are per-account and free, and one shared key meant
+    /// every install competed for the same rate limit. Optional so blobs
+    /// written before this field existed (and by other Orivio clients) still
+    /// decode; nil and "" both mean "not configured".
+    var apiKey: String?
 
     static let `default` = TMDBSettings()
+
+    /// Trimmed key, or "" when unset.
+    var trimmedAPIKey: String {
+        (apiKey ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// TMDB can actually answer: holding a key AND not switched off.
+    ///
+    /// A key is treated as consent — saving one turns `enabled` on (see
+    /// `TMDBSettingsStore.setAPIKey`), and installs that already had a key
+    /// from before this was true are migrated at launch. Otherwise every
+    /// collection stayed dark after the viewer did the one thing the screen
+    /// asked of them, because a second switch elsewhere was still off.
+    var isUsable: Bool { enabled && !trimmedAPIKey.isEmpty }
 }
 
 @MainActor
@@ -31,6 +51,7 @@ final class TMDBSettingsStore: ObservableObject {
             guard settings != oldValue else { return }
             save()
             TMDBService.preferredLanguage = settings.language
+            TMDBService.apiKey = settings.trimmedAPIKey
             if !applyingRemote { onLocalChange?() }
         }
     }
@@ -41,41 +62,137 @@ final class TMDBSettingsStore: ObservableObject {
 
     private static let key = "orivio.tmdb.settings.v1"
 
+    /// PER PROFILE (upstream scopes `tmdb_settings` per profile): each profile
+    /// keeps its own language, enrichment switches — and, on tvOS, its own
+    /// key, since keys here are the viewer's personal TMDB login. The legacy
+    /// device-wide blob (key included) goes to the PRIMARY profile; other
+    /// profiles start unconfigured and enter their own key in Settings →
+    /// Integrations → TMDB (Trakt-switch semantics).
+    private(set) var profileID: Int
+
+    /// Separate-vs-shared switch (Trakt-style). Shared = one TMDB setup
+    /// (key, language, enrichment switches) for the whole device.
+    static let feature = "tmdb"
+    var perProfileEnabled: Bool { ProfileScopedDefaults.isSeparate(Self.feature) }
+
+    func setPerProfile(_ on: Bool) {
+        guard on != perProfileEnabled else { return }
+        ProfileScopedDefaults.setSeparate(Self.feature, on)
+        applyingRemote = true
+        settings = Self.load(profile: profileID)
+        applyingRemote = false
+    }
+
     init() {
-        if let data = UserDefaults.standard.data(forKey: Self.key),
-           let decoded = try? JSONDecoder().decode(TMDBSettings.self, from: data) {
-            settings = decoded
-        } else {
-            settings = .default
-        }
+        profileID = ProfileScopedDefaults.activeProfileID
+        settings = Self.load(profile: profileID)
+        // A key that predates "a key means on" — flip it on rather than leaving
+        // the viewer with a configured, silent TMDB.
+        if !settings.enabled, !settings.trimmedAPIKey.isEmpty { settings.enabled = true }
         // Localize every TMDB request from launch (get() reads this global).
         TMDBService.preferredLanguage = settings.language
+        // Same for the key: every request reads it off the service.
+        TMDBService.apiKey = settings.trimmedAPIKey
+    }
+
+    private static func load(profile: Int) -> TMDBSettings {
+        if let data = ProfileScopedDefaults.data(key, feature: feature, profile),
+           let decoded = try? JSONDecoder().decode(TMDBSettings.self, from: data) {
+            return decoded
+        }
+        return .default
+    }
+
+    /// Point the store at a profile. The `settings` didSet re-points the
+    /// service globals (key + language), so requests speak for the new
+    /// profile immediately.
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        applyingRemote = true
+        settings = Self.load(profile: id)
+        applyingRemote = false
+    }
+
+    func forgetProfile(_ id: Int) {
+        ProfileScopedDefaults.forget([Self.key], profile: id)
+        if id == profileID {
+            applyingRemote = true
+            settings = Self.load(profile: id)
+            applyingRemote = false
+        }
+    }
+
+    /// Save a key. Turning TMDB on is part of saving one: there is no reason to
+    /// enter a key except to use it, and the extra switch was a trap.
+    func setAPIKey(_ key: String) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        var next = settings
+        next.apiKey = trimmed
+        if !trimmed.isEmpty { next.enabled = true }
+        settings = next
     }
 
     /// Apply settings pulled from the account without echoing them back up.
     func applyRemote(_ new: TMDBSettings) {
+        var new = new
+        // Never let a remote blob ERASE the key. Older clients (and Android)
+        // write this struct without an `apiKey` field at all, so taking the
+        // remote value wholesale would wipe the key this device just had
+        // typed into it the moment any other device pushed its preferences.
+        // A remote key that IS present is a real change and wins.
+        if new.trimmedAPIKey.isEmpty {
+            new.apiKey = settings.apiKey
+            // ...and neither can it meaningfully say whether TMDB is ON. A
+            // client that knows nothing about per-viewer keys writes its own
+            // `enabled`, and letting that land would switch TMDB off for every
+            // collection here on the next sync, for no reason the viewer could
+            // see. An explicit off still syncs from any client that carries a
+            // key, which is every client that can actually use TMDB.
+            new.enabled = settings.enabled
+        }
         guard new != settings else { return }
         applyingRemote = true
         settings = new
         applyingRemote = false
     }
 
-    var isEnabled: Bool { settings.enabled }
+    /// Enabled AND configured. Callers gate TMDB features on this, so turning
+    /// the switch on without a key never advertises sources that can't load.
+    var isEnabled: Bool { settings.isUsable }
+
+    /// Whether a key is set at all, regardless of the enable switch.
+    var hasAPIKey: Bool { !settings.trimmedAPIKey.isEmpty }
 
     private func save() {
         guard let data = try? JSONEncoder().encode(settings) else { return }
-        UserDefaults.standard.set(data, forKey: Self.key)
+        UserDefaults.standard.set(
+            data, forKey: ProfileScopedDefaults.writeKey(Self.key, feature: Self.feature, profileID))
     }
 }
 
-/// Thin TMDB v3 client. The API key is a client-embedded value recovered from
-/// the official app (same key the Android build ships in BuildConfig); TMDB v3
-/// keys are designed to live in the client. Used to resolve TMDB collection
-/// sources into MetaItems and to map TMDB ids to IMDB ids so those items flow
-/// through the existing Cinemeta detail/stream pipeline.
+/// Thin TMDB v3 client. The API key is the VIEWER's own — entered in
+/// Settings → Integrations → TMDB and pushed here by `TMDBSettingsStore`.
+/// There is no shared app key: keys are free, per-account, and rate-limited
+/// per key, so one embedded key throttled everybody at once. With no key set
+/// every request fails fast with `.missingKey` and the features that depend on
+/// TMDB simply stay empty. Used to resolve TMDB collection sources into
+/// MetaItems and to map TMDB ids to IMDB ids so those items flow through the
+/// existing Cinemeta detail/stream pipeline.
 enum TMDBService {
-    /// TMDB API key — supplied via Secrets (gitignored).
-    static let apiKey = Secrets.tmdbAPIKey
+    /// The viewer's TMDB v3 key. Read by every request on whatever task it
+    /// runs and written by the settings store on main, so it is lock-guarded
+    /// exactly like `preferredLanguage` below.
+    private static let keyLock = NSLock()
+    nonisolated(unsafe) private static var apiKeyStorage = ""
+    static var apiKey: String {
+        get { keyLock.lock(); defer { keyLock.unlock() }; return apiKeyStorage }
+        set { keyLock.lock(); defer { keyLock.unlock() }; apiKeyStorage = newValue }
+    }
+
+    /// Whether TMDB can be called at all. Callers that want to skip work
+    /// entirely (rather than eat a thrown `.missingKey`) check this first.
+    static var hasAPIKey: Bool { !apiKey.isEmpty }
     private static let base = "https://api.themoviedb.org/3"
     private static let imageBase = "https://image.tmdb.org/t/p"
 
@@ -152,11 +269,13 @@ enum TMDBService {
         case badResponse(Int)
         case missing
         case badPath(String)
+        case missingKey
         var errorDescription: String? {
             switch self {
             case .badResponse(let code): return "TMDB returned HTTP \(code)"
             case .missing: return "TMDB item not found"
             case .badPath(let path): return "TMDB request path is not a valid URL: \(path)"
+            case .missingKey: return "No TMDB API key — add yours in Settings → Integrations → TMDB"
             }
         }
     }
@@ -165,9 +284,21 @@ enum TMDBService {
     /// language setting so EVERY request is localized — not just the calls
     /// that happened to thread a `language:` argument. Set once at launch and
     /// on change by TMDBSettingsStore.
-    nonisolated(unsafe) static var preferredLanguage = "en"
+    /// Read by every TMDB request on whatever task it runs, written by the
+    /// settings store on main — guarded, so a language change can never tear a
+    /// concurrent read.
+    private static let languageLock = NSLock()
+    nonisolated(unsafe) private static var preferredLanguageStorage = "en"
+    static var preferredLanguage: String {
+        get { languageLock.lock(); defer { languageLock.unlock() }; return preferredLanguageStorage }
+        set { languageLock.lock(); defer { languageLock.unlock() }; preferredLanguageStorage = newValue }
+    }
 
     private static func get<T: Decodable>(_ path: String, query: [String: String] = [:]) async throws -> T {
+        // No key, no request. Every TMDB v3 endpoint needs one, and firing
+        // them anyway would just spend the network on guaranteed 401s.
+        let key = apiKey
+        guard !key.isEmpty else { throw TMDBError.missingKey }
         // `path` embeds ids that come from add-ons, Trakt and synced rows (e.g.
         // /find/<imdbID>) and URLComponents(string:) is strict — an id carrying
         // a space or any other illegal character made this force-unwrap TRAP,
@@ -177,7 +308,7 @@ enum TMDBService {
             ?? path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
                 .flatMap({ URLComponents(string: base + $0) })
         else { throw TMDBError.badPath(path) }
-        var items = [URLQueryItem(name: "api_key", value: apiKey)]
+        var items = [URLQueryItem(name: "api_key", value: key)]
         // Localize any request that didn't specify a language explicitly.
         if query["language"] == nil, preferredLanguage != "en" {
             items.append(URLQueryItem(name: "language", value: preferredLanguage))
@@ -192,6 +323,20 @@ enum TMDBService {
             throw TMDBError.badResponse(http.statusCode)
         }
         return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    /// Check a key before saving it, so a typo says so on the spot instead of
+    /// silently emptying every TMDB-backed row. `/configuration` is the
+    /// cheapest authenticated endpoint TMDB has.
+    static func validate(apiKey candidate: String) async -> Bool {
+        let key = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, var comps = URLComponents(string: base + "/configuration")
+        else { return false }
+        comps.queryItems = [URLQueryItem(name: "api_key", value: key)]
+        guard let url = comps.url,
+              let (_, response) = try? await session.data(from: url),
+              let http = response as? HTTPURLResponse else { return false }
+        return (200..<300).contains(http.statusCode)
     }
 
     private static func imageURL(_ path: String?, size: String) -> String? {
@@ -242,12 +387,21 @@ enum TMDBService {
         let path = isMovie ? "/movie/\(tmdbID)/external_ids" : "/tv/\(tmdbID)/external_ids"
         struct ExternalIDs: Decodable { let imdb_id: String? }
         // Coalesced on the cache key so concurrent callers share one round trip.
-        let imdb = await imdbCoalescer.resolve(cacheKey) {
-            (try? await get(path) as ExternalIDs)?.imdb_id
+        // "TMDB says there is no IMDb id" and "the request failed" are NOT
+        // the same answer. Storing "" for a 429/offline/timeout pinned the
+        // title to its `tmdb:` id for 90 days across relaunches — no streams,
+        // no sync matching, and nothing ever retried it. Only a response that
+        // arrived may write the negative entry.
+        // nil = the request failed (cache nothing); "" = TMDB answered and
+        // the title has no IMDb id (a real negative, cached).
+        let outcome: String? = await imdbCoalescer.resolve(cacheKey) {
+            guard let ids = try? await get(path) as ExternalIDs else { return nil }
+            return ids.imdb_id ?? ""
         }
-        storeIMDB(imdb ?? "", for: cacheKey)
-        await imdbDiskCache.store(imdb ?? "", for: cacheKey)
-        return imdb?.isEmpty == false ? imdb : nil
+        guard let imdb = outcome else { return nil }
+        storeIMDB(imdb, for: cacheKey)
+        await imdbDiskCache.store(imdb, for: cacheKey)
+        return imdb.isEmpty ? nil : imdb
     }
 
     /// Resolve an IMDb `tt…` id through TMDB. This is a fallback for newer or
@@ -860,14 +1014,38 @@ enum TMDBService {
             let movie_results: [M]?
             let tv_results: [M]?
         }
-        guard let body: FindResponse = try? await get("/find/\(id)", query: ["external_source": "imdb_id"]) else { return nil }
+        guard let body: FindResponse = try? await get("/find/\(id)", query: ["external_source": "imdb_id"]) else {
+            // A FAILED request (`/find` is the most rate-limited endpoint and
+            // the first hit of every Detail screen) is not "no match". Remember
+            // which so callers don't cache a negative for a title TMDB does know.
+            noteFindFailure(id)
+            return nil
+        }
         let result: (Int, Bool)?
         if wantMovie, let m = body.movie_results?.first { result = (m.id, true) }
         else if let t = body.tv_results?.first { result = (t.id, false) }
         else if let m = body.movie_results?.first { result = (m.id, true) }
         else { result = nil }
         if let result { storeFind(result, for: id) }
+        clearFindFailure(id)
         return result
+    }
+
+    /// Ids whose most recent `/find` REQUEST failed (as opposed to answering
+    /// "no match"). Callers that cache a negative on a nil resolve consult this
+    /// so a 429 or a blip is retried next time instead of pinned for the session.
+    private static var findFailures: Set<String> = []
+    private static func noteFindFailure(_ id: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        findFailures.insert(id)
+    }
+    private static func clearFindFailure(_ id: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        findFailures.remove(id)
+    }
+    private static func lastFindFailed(_ id: String) -> Bool {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return findFailures.contains(id)
     }
 
     /// Pull cast (with headshots), recommendations/similar, and collection for
@@ -1054,7 +1232,7 @@ enum TMDBService {
             return cached.isEmpty ? nil : cached
         }
         guard let (tmdbID, isMovie) = await resolveTMDBID(from: imdbID, type: type) else {
-            storeContentRating(nil, for: cacheKey)
+            if !lastFindFailed(imdbID) { storeContentRating(nil, for: cacheKey) }
             return nil
         }
 
@@ -1063,8 +1241,9 @@ enum TMDBService {
             struct ReleaseDates: Decodable { let results: [ReleaseCountry]? }
             struct ReleaseCountry: Decodable { let iso_3166_1: String?; let release_dates: [ReleaseInfo]? }
             struct ReleaseInfo: Decodable { let certification: String?; let type: Int? }
+            // A failed REQUEST is not a negative answer: caching it hid the
+            // rating for the rest of the session after one 429 or blip.
             guard let body: ReleaseDates = try? await get("/movie/\(tmdbID)/release_dates") else {
-                storeContentRating(nil, for: cacheKey)
                 return nil
             }
             let countries = body.results ?? []
@@ -1077,7 +1256,6 @@ enum TMDBService {
             struct ContentRatings: Decodable { let results: [TVRating]? }
             struct TVRating: Decodable { let iso_3166_1: String?; let rating: String? }
             guard let body: ContentRatings = try? await get("/tv/\(tmdbID)/content_ratings") else {
-                storeContentRating(nil, for: cacheKey)
                 return nil
             }
             let rows = body.results ?? []
@@ -1094,7 +1272,7 @@ enum TMDBService {
         let cacheKey = "\(type):\(imdbID):s\(season)"
         if let cached = cachedSeasonEpisodes(cacheKey) { return cached }
         guard let (tmdbID, _) = await resolveTMDBID(from: imdbID, type: type) else {
-            storeSeasonEpisodes([:], for: cacheKey)
+            if !lastFindFailed(imdbID) { storeSeasonEpisodes([:], for: cacheKey) }
             return [:]
         }
         struct SeasonResponse: Decodable {
@@ -1107,8 +1285,7 @@ enum TMDBService {
             let episodes: [Episode]?
         }
         guard let body: SeasonResponse = try? await get("/tv/\(tmdbID)/season/\(season)") else {
-            storeSeasonEpisodes([:], for: cacheKey)
-            return [:]
+            return [:]   // transient failure — not cached, retried next time
         }
         var map: [Int: EpisodeExtra] = [:]
         for ep in body.episodes ?? [] {
@@ -1129,7 +1306,7 @@ enum TMDBService {
         let cacheKey = "\(type):\(imdbID):s\(season):e\(number)"
         if let cached = cachedEpisodeCast(cacheKey) { return cached }
         guard let (tmdbID, isMovie) = await resolveTMDBID(from: imdbID, type: type), !isMovie else {
-            storeEpisodeCast([], for: cacheKey)
+            if !lastFindFailed(imdbID) { storeEpisodeCast([], for: cacheKey) }
             return []
         }
         struct CreditsResponse: Decodable {
@@ -1144,8 +1321,7 @@ enum TMDBService {
         guard let body: CreditsResponse = try? await get(
             "/tv/\(tmdbID)/season/\(season)/episode/\(number)/credits"
         ) else {
-            storeEpisodeCast([], for: cacheKey)
-            return []
+            return []   // transient failure — not cached, retried next time
         }
         let cast = (body.cast ?? []).prefix(12).map {
             CastMember(
@@ -1229,12 +1405,15 @@ enum TMDBService {
         guard let body: CreditsResponse = try? await get(
             "/person/\(personID)/combined_credits", query: ["language": language]
         ) else { return [] }
-        var seen = Set<Int>()
+        var seen = Set<String>()
         let raw: [TMDBRawItem] = (body.cast ?? [])
             .sorted { ($0.vote_average ?? 0) > ($1.vote_average ?? 0) }
             .compactMap { c in
                 let isTV = c.media_type?.lowercased() == "tv"
-                guard let title = c.title ?? c.name, !title.isEmpty, seen.insert(c.id).inserted else { return nil }
+                // Movie and TV ids are separate TMDB namespaces: dedupe per
+                // namespace or a film and a show sharing a number lose one.
+                guard let title = c.title ?? c.name, !title.isEmpty,
+                      seen.insert((isTV ? "t" : "m") + String(c.id)).inserted else { return nil }
                 return TMDBRawItem(
                     tmdbID: c.id, isMovie: !isTV, name: title,
                     poster: imageURL(c.poster_path, size: "w500") ?? imageURL(c.backdrop_path, size: "w780"),

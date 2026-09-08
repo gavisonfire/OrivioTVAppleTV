@@ -109,7 +109,7 @@ enum StreamProbe {
                             if sideData.type == AV_PKT_DATA_DOVI_CONF, let data = sideData.data {
                                 let record = data.withMemoryRebound(
                                     to: AVDOVIDecoderConfigurationRecord.self, capacity: 1
-                                ) { $0 }.pointee
+                                ) { $0.pointee }   // load inside the rebinding
                                 result.dvProfile = Int(record.dv_profile)
                             }
                         }

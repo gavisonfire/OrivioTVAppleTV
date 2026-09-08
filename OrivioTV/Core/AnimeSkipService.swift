@@ -89,8 +89,16 @@ enum AnimeSkipService {
         ]
         guard let url = comps.url,
               let (data, resp) = try? await session.data(from: url),
-              let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let entries = try? JSONDecoder().decode([ArmEntry].self, from: data) else {
+              let http = resp as? HTTPURLResponse else {
+            return []   // network failure: not a negative answer, retry next time
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            // 404 = no mapping exists (a real negative); anything else is
+            // transient and must not silence Skip Intro for the whole session.
+            if http.statusCode == 404 { storeMALIDs([], for: imdbID) }
+            return []
+        }
+        guard let entries = try? JSONDecoder().decode([ArmEntry].self, from: data) else {
             storeMALIDs([], for: imdbID)
             return []
         }

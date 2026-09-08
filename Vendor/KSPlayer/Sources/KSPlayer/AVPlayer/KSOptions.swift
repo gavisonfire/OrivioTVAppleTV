@@ -309,7 +309,12 @@ open class KSOptions {
      */
     open func process(assetTrack: some MediaPlayerTrack) {
         if assetTrack.mediaType == .video {
-            if [FFmpegFieldOrder.bb, .bt, .tt, .tb].contains(assetTrack.fieldOrder) {
+            // Orivio: gated on `autoDeInterlace` like the rest of the
+            // deinterlace machinery. Unconditionally, any track merely TAGGED
+            // interlaced (mis-flagged remuxes included) lost VideoToolbox and
+            // got a software decode plus a software yadif — a slideshow on
+            // the A10X — with nothing in the UI saying why.
+            if autoDeInterlace, [FFmpegFieldOrder.bb, .bt, .tt, .tb].contains(assetTrack.fieldOrder) {
                 // todo 先不要用yadif_videotoolbox，不然会crash。这个后续在看下要怎么解决
                 hardwareDecode = false
                 asynchronousDecompression = false

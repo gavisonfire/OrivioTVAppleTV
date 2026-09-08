@@ -27,6 +27,18 @@ enum ResolutionTier: Int, CaseIterable {
         default:      return .other
         }
     }
+
+    /// Section order — which is also the auto-pick order, since every
+    /// "first source" path walks the sections in sequence. On the 1080p Apple
+    /// TV HD a 2160p link is the WORST choice: the panel cannot show it, the
+    /// A8 has no HEVC hardware so a 4K HEVC remux is a software slideshow,
+    /// and it is the biggest download. 1080p leads there; 2160p sits after
+    /// 720p so it is still reachable on the page.
+    static var displayOrder: [ResolutionTier] {
+        PerformanceProfile.isLowPower
+            ? [.fhd1080, .hd720, .uhd2160, .sd480, .other]
+            : allCases
+    }
 }
 
 /// One block on the Sources page: an addon heading with resolution sections
@@ -120,7 +132,7 @@ enum SourceSelection {
         let cap = max(perTier, 1)
         return addonOrder(entries).compactMap { name in
             let own = entries.filter { $0.addonName == name && !isJunk($0) }
-            let sections: [SourceSection] = ResolutionTier.allCases.compactMap { tier in
+            let sections: [SourceSection] = ResolutionTier.displayOrder.compactMap { tier in
                 let inTier = own.filter { ResolutionTier.from(resolutionLabel: $0.resolutionLabel) == tier }
                 guard !inTier.isEmpty else { return nil }
                 let picked = Array(scored(inTier).prefix(cap))

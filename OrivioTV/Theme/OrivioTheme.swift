@@ -386,7 +386,7 @@ struct ThemeSnapshot: Codable, Equatable {
 final class ThemeManager: ObservableObject {
     @Published private var basePalette: ThemePalette {
         didSet {
-            UserDefaults.standard.set(basePalette.id, forKey: Self.key)
+            UserDefaults.standard.set(basePalette.id, forKey: scoped(Self.key))
             rebuildPalette()
             if !applyingRemote { onLocalChange?() }
         }
@@ -394,7 +394,7 @@ final class ThemeManager: ObservableObject {
     /// AMOLED mode: force pure-black surfaces.
     @Published var amoled: Bool {
         didSet {
-            UserDefaults.standard.set(amoled, forKey: Self.amoledKey)
+            UserDefaults.standard.set(amoled, forKey: scoped(Self.amoledKey))
             rebuildPalette()
             if !applyingRemote { onLocalChange?() }
         }
@@ -402,21 +402,21 @@ final class ThemeManager: ObservableObject {
     /// App-wide font family (applied at the root with `.fontDesign`).
     @Published var font: AppFont {
         didSet {
-            UserDefaults.standard.set(font.rawValue, forKey: Self.fontKey)
+            UserDefaults.standard.set(font.rawValue, forKey: scoped(Self.fontKey))
             if !applyingRemote { onLocalChange?() }
         }
     }
     /// Settings-surface complexity (Essential hides advanced options).
     @Published var experienceMode: ExperienceMode {
         didSet {
-            UserDefaults.standard.set(experienceMode.rawValue, forKey: Self.experienceKey)
+            UserDefaults.standard.set(experienceMode.rawValue, forKey: scoped(Self.experienceKey))
             if !applyingRemote { onLocalChange?() }
         }
     }
     /// Settings-screen presentation style (row/card shape).
     @Published var settingsUiStyle: SettingsUiStyle {
         didSet {
-            UserDefaults.standard.set(settingsUiStyle.rawValue, forKey: Self.settingsStyleKey)
+            UserDefaults.standard.set(settingsUiStyle.rawValue, forKey: scoped(Self.settingsStyleKey))
             if !applyingRemote { onLocalChange?() }
         }
     }
@@ -442,14 +442,67 @@ final class ThemeManager: ObservableObject {
     private static let experienceKey = "orivio.theme.experience"
     private static let settingsStyleKey = "orivio.theme.settingsstyle"
 
+    /// Theme is PER PROFILE (upstream scopes `theme_settings` per profile —
+    /// each family member keeps their own accent, font, and settings style).
+    /// The legacy device-wide keys go to the PRIMARY profile; other profiles
+    /// start at the shipped look (Trakt-switch semantics).
+    private(set) var profileID: Int
+
+    /// Separate-vs-shared switch (Trakt-style). Shared = one look for the
+    /// whole device, the pre-split behaviour.
+    static let feature = "theme"
+    var perProfileEnabled: Bool { ProfileScopedDefaults.isSeparate(Self.feature) }
+
+    func setPerProfile(_ on: Bool) {
+        guard on != perProfileEnabled else { return }
+        ProfileScopedDefaults.setSeparate(Self.feature, on)
+        reloadAppearance()
+    }
+
+    private func scoped(_ base: String) -> String {
+        ProfileScopedDefaults.writeKey(base, feature: Self.feature, profileID)
+    }
+
     init() {
-        let saved = UserDefaults.standard.string(forKey: Self.key) ?? "violet"
+        let pid = ProfileScopedDefaults.activeProfileID
+        profileID = pid
+        let feature = Self.feature
+        let saved = ProfileScopedDefaults.string(Self.key, feature: feature, pid) ?? "violet"
         basePalette = OrivioThemes.palette(id: saved)
-        amoled = UserDefaults.standard.bool(forKey: Self.amoledKey)
-        font = AppFont(rawValue: UserDefaults.standard.string(forKey: Self.fontKey) ?? "") ?? .system
-        experienceMode = ExperienceMode(rawValue: UserDefaults.standard.string(forKey: Self.experienceKey) ?? "") ?? .advanced
-        settingsUiStyle = SettingsUiStyle(rawValue: UserDefaults.standard.string(forKey: Self.settingsStyleKey) ?? "") ?? .classic
+        amoled = ProfileScopedDefaults.bool(Self.amoledKey, feature: feature, pid)
+        font = AppFont(rawValue: ProfileScopedDefaults.string(Self.fontKey, feature: feature, pid) ?? "") ?? .system
+        experienceMode = ExperienceMode(rawValue: ProfileScopedDefaults.string(Self.experienceKey, feature: feature, pid) ?? "") ?? .advanced
+        settingsUiStyle = SettingsUiStyle(rawValue: ProfileScopedDefaults.string(Self.settingsStyleKey, feature: feature, pid) ?? "") ?? .classic
         rebuildPalette()
+    }
+
+    /// Point the manager at a profile — the whole look swaps with it.
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        reloadAppearance()
+    }
+
+    /// Re-read every appearance value for the current profile + mode.
+    private func reloadAppearance() {
+        applyingRemote = true
+        defer { applyingRemote = false }
+        let feature = Self.feature
+        let id = profileID
+        basePalette = OrivioThemes.palette(id: ProfileScopedDefaults.string(Self.key, feature: feature, id) ?? "violet")
+        amoled = ProfileScopedDefaults.bool(Self.amoledKey, feature: feature, id)
+        font = AppFont(rawValue: ProfileScopedDefaults.string(Self.fontKey, feature: feature, id) ?? "") ?? .system
+        experienceMode = ExperienceMode(rawValue: ProfileScopedDefaults.string(Self.experienceKey, feature: feature, id) ?? "") ?? .advanced
+        settingsUiStyle = SettingsUiStyle(rawValue: ProfileScopedDefaults.string(Self.settingsStyleKey, feature: feature, id) ?? "") ?? .classic
+    }
+
+    /// Forget a deleted profile's theme so a recycled id starts from the seed.
+    func forgetProfile(_ id: Int) {
+        ProfileScopedDefaults.forget(
+            [Self.key, Self.amoledKey, Self.fontKey, Self.experienceKey, Self.settingsStyleKey],
+            profile: id
+        )
+        if id == profileID { reloadAppearance() }
     }
 
     /// Current theme as a syncable snapshot. The retired per-theme axes stay

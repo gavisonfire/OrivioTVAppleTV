@@ -39,6 +39,8 @@ final class OrivioSyncManager: ObservableObject {
     private let pluginStore: PluginStore?
     private let torrentSettings: TorrentSettingsStore?
     private let traktStore: TraktStore?
+    private let simklStore: SimklStore?
+    private let ratingsStore: RatingsStore?
     /// Reads the "Enrich Continue Watching" TMDB setting (the store lives
     /// outside this manager). nil → enrich (default).
     var enrichContinueWatchingEnabled: (() -> Bool)?
@@ -164,14 +166,33 @@ final class OrivioSyncManager: ObservableObject {
         // horizon and pushes that loss to every other device — so the history
         // they deliberately cleared floods back on the next import.
         var preserved: Set<String> = ["orivio.sync.client.v1", "orivio.sync.log.v1"]
-        let preservedPrefixes = ["orivio.sync.repairedWatchHistoryClear."]
+        var preservedPrefixes = ["orivio.sync.repairedWatchHistoryClear."]
         if !droppingPendingDeletes {
+            // A plain sign-out (same user expected back). The SEEDED flags stay
+            // too: sweeping them made the same user's next first pull additive,
+            // so everything they had deleted on another device while signed out
+            // here came back, and the replace-push then re-uploaded it. A
+            // different user is handled by `handleAccountIdentityChange`, which
+            // passes `droppingPendingDeletes: true` and sweeps everything.
+            // The collections adoption flag likewise records a one-shot scan
+            // that must not repeat for the same account (re-adopting packs the
+            // user has since deleted).
+            preservedPrefixes.append("orivio.sync.seeded.")
+            // The persisted dirty flags too: rows added while signed out are
+            // pushed before the (now reconciling) first pull only if the flag
+            // that says "unpushed" survives the sign-out.
+            preservedPrefixes.append("orivio.sync.dirty.")
+            preserved.insert(Self.adoptedCollectionsKey)
             preserved.formUnion(
                 defaults.dictionaryRepresentation().keys.filter {
                     $0.hasPrefix("orivio.sync.pendingWatchProgressDeletes.")
                         || $0.hasPrefix("orivio.sync.pendingLibraryDeletes.")
                         || $0.hasPrefix("orivio.sync.pendingWatchedDeletes.")
-                        || $0.hasPrefix("orivio.sync.pendingDeleteAttempts.")
+                        // The attempt counters ride with the queues they count.
+                        // (The prefix here used to name a key that never
+                        // existed, so the counters were swept while the queues
+                        // survived and a rejected key got a fresh five tries.)
+                        || $0.hasPrefix("orivio.sync.pendingWatchProgressDeleteAttempts.")
                 }
             )
         }
@@ -182,11 +203,35 @@ final class OrivioSyncManager: ObservableObject {
             defaults.removeObject(forKey: key)
         }
         addonsDirty = false
-        progressDirty = false
-        libraryDirty = false
         profilesDirty = false
         pluginsDirty = false
         appPreferencesDirty = false
+        // progress / library / watched dirty flags are persisted per profile
+        // (`orivio.sync.dirty.*`): the sweep above dropped them for a
+        // different account and kept them for a plain sign-out.
+    }
+
+    // MARK: - Persisted per-profile dirty flags
+
+    /// Progress, library and watched changes are pushed per PROFILE, so the
+    /// flag that says "this profile has unpushed local changes" is keyed per
+    /// profile — an in-memory global was cleared by whichever profile's push
+    /// landed next (a switch inside the 1.2 s debounce made profile B's push
+    /// clear profile A's flag, and A's mark was reconciled away). Persisted,
+    /// so a kill or a sign-out between the change and its push cannot turn the
+    /// next reconciling pull into a deletion.
+    private func dirtyKey(_ kind: String) -> String { "orivio.sync.dirty.\(kind).v1" }
+    private func isDirty(_ kind: String, profile: Int) -> Bool {
+        (UserDefaults.standard.array(forKey: dirtyKey(kind)) as? [Int] ?? []).contains(profile)
+    }
+    private func setDirty(_ kind: String, profile: Int, _ dirty: Bool) {
+        var set = Set(UserDefaults.standard.array(forKey: dirtyKey(kind)) as? [Int] ?? [])
+        if dirty { set.insert(profile) } else { set.remove(profile) }
+        if set.isEmpty {
+            UserDefaults.standard.removeObject(forKey: dirtyKey(kind))
+        } else {
+            UserDefaults.standard.set(Array(set).sorted(), forKey: dirtyKey(kind))
+        }
     }
 
     /// Set while the previous account's state is being retired, so the store
@@ -214,12 +259,23 @@ final class OrivioSyncManager: ObservableObject {
     private func resetAccountScopedCredentials() {
         isRetiringAccountState = true
         defer { isRetiringAccountState = false }
+        // EVERY profile's Trakt login, not just the active scope: with
+        // per-profile Trakt on, `signOut()` cleared one `.pN` slot and the
+        // others were reloaded by the next profile switch and pushed into the
+        // new account's provider credentials.
         traktStore?.signOut()
-        if let debridStore {
-            for provider in DebridProvider.allCases {
-                debridStore.setKey("", for: provider)
-            }
-        }
+        traktStore?.forgetAllProfiles()
+        // SIMKL logins never reach the account's credential table, but they
+        // mark the same user boundary: without this the next user keeps
+        // scrobbling into the previous user's SIMKL history.
+        simklStore?.signOut()
+        simklStore?.forgetAllProfiles()
+        // Ratings are pushed to whichever Trakt/SIMKL account is connected —
+        // the previous user's stars must not follow the next user there.
+        ratingsStore?.clearAllProfiles()
+        // Every profile's debrid logins, not just the active scope — same
+        // reasoning as Trakt's forgetAllProfiles above.
+        debridStore?.forgetAllProfiles()
     }
 
     /// Drop the PREVIOUS account's per-profile content: Continue Watching,
@@ -328,8 +384,10 @@ final class OrivioSyncManager: ObservableObject {
     /// Retire the previous account's state when a DIFFERENT user signs in.
     /// Signing out cleared only the Supabase tokens, so the next account
     /// inherited the last one's seeded flags, queued deletes and credentials.
-    private func handleAccountIdentityChange() {
-        guard let current = account.currentUserID else { return }
+    /// - Parameter userID: the id of the account signing in, passed in by the
+    ///   caller rather than read from `account` — see `handleAuthChange` for
+    ///   why the manager's own view of it is one step behind here.
+    private func handleAccountIdentityChange(userID current: String) {
         let defaults = UserDefaults.standard
         let previous = defaults.string(forKey: Self.lastAccountUserKey)
         defaults.set(current, forKey: Self.lastAccountUserKey)
@@ -448,9 +506,12 @@ final class OrivioSyncManager: ObservableObject {
         debridStore: DebridStore? = nil,
         pluginStore: PluginStore? = nil,
         torrentSettings: TorrentSettingsStore? = nil,
-        traktStore: TraktStore? = nil
+        traktStore: TraktStore? = nil,
+        simklStore: SimklStore? = nil,
+        ratingsStore: RatingsStore? = nil
     ) {
         self.account = account
+        self.ratingsStore = ratingsStore
         self.addonManager = addonManager
         self.progressStore = progressStore
         self.libraryStore = libraryStore
@@ -466,6 +527,7 @@ final class OrivioSyncManager: ObservableObject {
         self.pluginStore = pluginStore
         self.torrentSettings = torrentSettings
         self.traktStore = traktStore
+        self.simklStore = simklStore
 
         // Sync whenever we transition into a signed-in state.
         account.$authState
@@ -565,8 +627,16 @@ final class OrivioSyncManager: ObservableObject {
         NSLog("[OrivioSync] authChange -> %@ (wasSignedIn=%@)",
               String(describing: state), wasSignedIn ? "true" : "false")
         switch state {
-        case .signedIn:
-            guard account.currentUserID != nil else {
+        // The id comes from the STATE BEING PUBLISHED, never from
+        // `account.currentUserID`. `@Published` fires its subscribers from
+        // `willSet` — the property still holds the OLD value while this runs —
+        // so on a fresh sign-in that read came back nil and this method took
+        // the "no user id" exit below: no immediate sync, no auto-sync loop,
+        // and `handleAccountIdentityChange` bailed out too. Sessions restored
+        // at launch hid it, because the subscription's first delivery carries
+        // the value already in place.
+        case .signedIn(let userID, _):
+            guard !userID.isEmpty else {
                 profileStore.accountAvailable = false
                 stopAutoSync()
                 wasSignedIn = false
@@ -576,8 +646,13 @@ final class OrivioSyncManager: ObservableObject {
             profileStore.accountAvailable = true
             // Before anything can push, make sure no state belonging to a
             // previous account is still resident on this device.
-            handleAccountIdentityChange()
-            startAutoSync()
+            handleAccountIdentityChange(userID: userID)
+            // Every access-token refresh republishes `.signedIn` (hourly, on
+            // the first 401). Restarting the loop here cancelled whichever
+            // sync was awaiting inside that very refresh — the auto tick's own
+            // run, most of the time — so that sync aborted half-way with
+            // "Sync failed." Start the loop only when it is not running.
+            if autoSyncTask == nil { startAutoSync() }
             guard !wasSignedIn else { return }
             wasSignedIn = true
             // A session RESTORED at launch stays deferred: a heavyweight full
@@ -627,11 +702,16 @@ final class OrivioSyncManager: ObservableObject {
     /// Seconds between automatic full syncs while signed in and foregrounded.
     static let autoSyncInterval: TimeInterval = 30
     private var autoSyncTask: Task<Void, Never>?
-    /// Set by the player so a heavy multi-endpoint sync doesn't contend with
-    /// streaming for bandwidth mid-playback (this app already fights rebuffering
-    /// on high-bitrate remuxes). The tick is skipped, not dropped — the next one
-    /// after playback ends runs normally.
+    /// Set by the player. While a stream plays the tick runs `syncLight`
+    /// instead of the full multi-endpoint sync: a few small JSON requests that
+    /// keep Continue Watching, the library and watched history current on
+    /// every device mid-film, without the metadata enrichment and the twenty
+    /// preference/addon/plugin round trips that used to make the whole tick
+    /// something worth skipping. Nothing is skipped any more.
     @MainActor static var playbackActive = false
+
+    /// Ticks seen while playback was active (see the loop below).
+    private var playbackTicks = 0
 
     private func startAutoSync() {
         autoSyncTask?.cancel()
@@ -644,11 +724,58 @@ final class OrivioSyncManager: ObservableObject {
                 // behind it.
                 guard !isSyncing else { continue }
                 if Self.playbackActive {
-                    NSLog("[OrivioSync] auto-sync tick skipped — playback active")
+                    // The light pass still decodes JSON and merges three
+                    // stores ON THE MAIN ACTOR — thousands of watched rows on
+                    // a long-lived install — while the A8/A10X is decoding a
+                    // film beside it. Every third tick there (90s) keeps the
+                    // other devices current without a periodic hiccup.
+                    playbackTicks += 1
+                    let constrained = PerformanceProfile.isLowPower || PerformanceProfile.isMidPower
+                    if constrained, playbackTicks % 3 != 1 { continue }
+                    await syncLight(reason: "auto, playback active")
                     continue
                 }
+                playbackTicks = 0
                 await syncNow()
             }
+        }
+    }
+
+    /// The in-playback sync. Flushes anything dirty, then pulls the three
+    /// stores another device changes while you watch — Continue Watching, the
+    /// library, watched history — and nothing else: no profile, add-on,
+    /// preference or plugin round trips, and no metadata enrichment (see
+    /// `enrichMetadata`), so it is a handful of small JSON requests that
+    /// cannot contend with a stream. Same profile pinning as `syncNow`.
+    func syncLight(reason: String) async {
+        guard account.accessToken != nil, account.currentUserID != nil else { return }
+        guard !isSyncing, !isRetiringAccountState else { return }
+        isSyncing = true
+        defer { isSyncing = false }
+        let profile = pid
+        do {
+            if profilesDirty { try await pushProfiles() }
+            if isDirty("addons", profile: profile) { try await pushAddons(profile: profile) }
+            if progressDirty { try await pushWatchProgressAll(profile: profile) }
+            await reconcileProgressDeletesBeforePull(profile: profile)
+            // Still-pending deletes postpone the progress pull so it cannot
+            // resurrect them (same rule as refreshContinueWatching).
+            if loadPendingDeletes(profile: profile).isEmpty {
+                try await pullWatchProgress(profile: profile)
+            }
+            if libraryDirty { try await pushLibrary(profile: profile) }
+            await reconcileLibraryDeletesBeforePull(profile: profile)
+            try await pullLibrary(profile: profile)
+            if watchedDirty { try await pushWatchedItems(profile: profile) }
+            await reconcileWatchedDeletesBeforePull(profile: profile)
+            try await pullWatchedItems(profile: profile)
+            NSLog("[OrivioSync] light sync ok — %@", reason)
+        } catch let change as ProfileChangedMidSync {
+            NSLog("[OrivioSync] light sync abandoned — profile switched %d -> %d mid-run",
+                  change.from, change.to)
+        } catch {
+            NSLog("[OrivioSync] light sync FAILED (%@): %@", reason, String(describing: error))
+            lastSyncError = describe(error)
         }
     }
 
@@ -714,7 +841,7 @@ final class OrivioSyncManager: ObservableObject {
             // "Sync Add-ons" button consulted it: a periodic full sync landing
             // inside the 1.2s debounce would reconcile an add-on you had just
             // removed back onto the device, and then push it up again.
-            if addonsDirty { try await pushAddons(profile: runProfile) }
+            if isDirty("addons", profile: runProfile) { try await pushAddons(profile: runProfile) }
             try await pullAddons(profile: runProfile)
             try ensureProfile(runProfile)
             // Flush local progress edits before pulling. The account pull is a
@@ -729,6 +856,9 @@ final class OrivioSyncManager: ObservableObject {
             await reconcileLibraryDeletesBeforePull(profile: runProfile)
             try await pullLibrary(profile: runProfile)
             try ensureProfile(runProfile)
+            // Marks whose debounced push never landed go up BEFORE the pull,
+            // or the reconcile below reads them as deleted elsewhere.
+            if watchedDirty { try await pushWatchedItems(profile: runProfile) }
             await reconcileWatchedDeletesBeforePull(profile: runProfile)
             try await pullWatchedItems(profile: runProfile)
             // Collections ride the tvOS-preferences blob (pullAppPreferences).
@@ -797,6 +927,12 @@ final class OrivioSyncManager: ObservableObject {
     }
 
     func pushThisDevice() async {
+        // Mid-film this is the Stremio tick's "we merged something" nudge,
+        // thirty seconds apart at most — the light pass carries it.
+        if Self.playbackActive {
+            await syncLight(reason: "device push during playback")
+            return
+        }
         OrivioSyncDiagnostics.record(.info, area: "Orivio", "Device push requested; running full two-way sync for profile \(pid).")
         await syncNow()
     }
@@ -807,9 +943,23 @@ final class OrivioSyncManager: ObservableObject {
         watchedStore.setProfile(pid)
         collectionsStore.setProfile(pid)
         homeCatalogSettings.setProfile(pid)
+        rescopePerProfileStores(pid)
         // Only rescopes when per-profile Trakt accounts are on; otherwise the
         // login stays device-wide.
         traktStore?.setProfile(pid)
+    }
+
+    /// The stores split per profile in the upstream-parity pass: add-ons and
+    /// plugins (honouring the profile's use-primary fallbacks), debrid logins,
+    /// player settings, TMDB settings, theme, badges.
+    private func rescopePerProfileStores(_ id: Int) {
+        addonManager.setProfile(addonPID(for: id))
+        pluginStore?.setProfile(pluginPID(for: id))
+        debridStore?.setProfile(id)
+        playerSettings?.setProfile(id)
+        tmdbSettings?.setProfile(id)
+        themeManager?.setProfile(id)
+        streamBadges?.setProfile(id)
     }
 
     // MARK: - Addons
@@ -818,7 +968,15 @@ final class OrivioSyncManager: ObservableObject {
     /// lands. Guards reconciliation: pulling the account down and deleting
     /// whatever it doesn't list would destroy an add-on added on THIS device
     /// while the push was failing (offline, token expired). Dirty ⇒ push first.
-    private var addonsDirty = false
+    ///
+    /// Per profile (like `progressDirty`) now that add-on lists are: an edit
+    /// on profile A followed by a quick switch to B must not make B's next
+    /// sync look like it has pending edits — nor clear A's flag before A's
+    /// list ever went up.
+    private var addonsDirty: Bool {
+        get { isDirty("addons", profile: pid) }
+        set { setDirty("addons", profile: pid, newValue) }
+    }
 
     private func scheduleAddonPush() {
         // Never while the previous account's state is being retired: the
@@ -844,7 +1002,7 @@ final class OrivioSyncManager: ObservableObject {
         // may reconcile is per-profile, and a switch between these two calls
         // used to read it from the wrong profile.
         let profile = pid
-        if addonsDirty {
+        if isDirty("addons", profile: profile) {
             // Local edits go first or the pull below would reconcile them away.
             try await pushAddons(profile: profile)
         }
@@ -857,7 +1015,7 @@ final class OrivioSyncManager: ObservableObject {
         // Never before this account's own list has been read — see
         // `pulledAddonProfiles`. A local edit still pushes normally, because the
         // pull that precedes every push in `syncNow` marks the profile read.
-        guard pulledAddonProfiles.contains(profile) || addonsDirty else {
+        guard pulledAddonProfiles.contains(profile) || isDirty("addons", profile: profile) else {
             OrivioSyncDiagnostics.record(
                 .info, area: "Orivio",
                 "Skipped the add-on push: this account's own list has not been read yet."
@@ -873,15 +1031,21 @@ final class OrivioSyncManager: ObservableObject {
             if !addon.manifest.name.isEmpty { obj["name"] = addon.manifest.name }
             return obj
         }
+        // The REAL profile id. This was hardcoded to 1 (as was the pull's
+        // filter), which flattened every profile into one account row set —
+        // and since Android has always pushed per-profile rows, tvOS was
+        // also blind to the per-profile add-ons the account already held.
+        // Routed through `addonPID` so a "use primary add-ons" profile writes
+        // profile 1's rows (its own stay dormant), matching Android.
         let body: [String: Any] = [
             "p_addons": entries,
-            "p_profile_id": 1,
+            "p_profile_id": addonPID(for: profile),
             "p_origin_client_id": clientID
         ]
         _ = try await authedPost(RPC.url(RPC.pushAddons), body: body)
         // Only now is the account known to hold this device's list, so a later
         // pull may safely reconcile against it.
-        addonsDirty = false
+        setDirty("addons", profile: profile, false)
         // A push proves this profile has add-on data on the account, which lets
         // a subsequent empty pull be read as a genuine "cleared elsewhere".
         setSeeded("addons", profile: profile)
@@ -894,8 +1058,9 @@ final class OrivioSyncManager: ObservableObject {
             // with no explanation.
             throw OrivioAuthError.message("account not fully signed in")
         }
-        // PostgREST select, filtered to our rows for the default profile.
-        let path = "/rest/v1/addons?user_id=eq.\(userID)&profile_id=eq.1&select=url,sort_order,enabled,name"
+        // PostgREST select, filtered to our rows for THIS profile — via
+        // `addonPID`, so a "use primary add-ons" profile reads profile 1's rows.
+        let path = "/rest/v1/addons?user_id=eq.\(userID)&profile_id=eq.\(addonPID(for: profile))&select=url,sort_order,enabled,name"
         let data = try await authedGet(path)
         let rows = try JSONDecoder().decode([SupabaseAddon].self, from: data)
         let orderedAddons = rows.sorted { $0.sortOrder < $1.sortOrder }.map {
@@ -926,7 +1091,11 @@ final class OrivioSyncManager: ObservableObject {
 
     // MARK: - Watch progress
 
-    private var progressDirty = false
+    /// The ACTIVE profile's flag (see the persisted per-profile flags).
+    private var progressDirty: Bool {
+        get { isDirty("progress", profile: pid) }
+        set { setDirty("progress", profile: pid, newValue) }
+    }
 
     private func pushWatchProgress() {
         // Never while the previous account's state is being retired: the
@@ -934,9 +1103,10 @@ final class OrivioSyncManager: ObservableObject {
         // data into account B. See `isRetiringAccountState`.
         guard !isRetiringAccountState else { return }
         progressDirty = true
+        let profile = pid   // the profile that CHANGED, not whoever is active when this fires
         Task { [weak self] in
             guard let self else { return }
-            try? await self.pushWatchProgressAll(profile: self.pid)
+            try? await self.pushWatchProgressAll(profile: profile)
         }
     }
 
@@ -950,6 +1120,10 @@ final class OrivioSyncManager: ObservableObject {
             // Pinned exactly like syncNow: this is a miniature sync, and the
             // profile can change between any two of these awaits.
             let profile = self.pid
+            // A local change whose push is still in flight must go up first —
+            // `replaceWithOrivioSnapshot` would otherwise read a snapshot that
+            // predates it and drop (and tombstone) the title just watched.
+            if self.progressDirty { try? await self.pushWatchProgressAll(profile: profile) }
             // Reassert not-yet-confirmed removals so the pull can't resurrect
             // them, push the deletes to the server, THEN pull the snapshot.
             await self.reconcileProgressDeletesBeforePull(profile: profile)
@@ -1104,8 +1278,13 @@ final class OrivioSyncManager: ObservableObject {
     }
 
     private func repairAccidentalWatchHistoryClearState(profile: Int) {
+        // ONLY the legacy per-profile flag is evidence of the accidental
+        // clear this repairs. `WatchHistoryClearState.clearedAt` is also what
+        // the user's own "Clear Watch History" sets — and a profile without
+        // the repair stamp (any profile created after the repair shipped)
+        // then had its deliberate clear undone by the next tick: horizon
+        // dropped, both delete queues emptied, the history re-imported.
         let hadClearState = UserDefaults.standard.bool(forKey: clearedWatchHistoryKey(profile: profile))
-            || WatchHistoryClearState.clearedAt != nil
         guard hadClearState,
               !UserDefaults.standard.bool(forKey: repairedWatchHistoryClearKey(profile: profile)) else { return }
 
@@ -1139,6 +1318,9 @@ final class OrivioSyncManager: ObservableObject {
         // round trips deleting its rows and pushing the horizon.
         let profile = pid
         let clearedAt = WatchHistoryClearState.markClearedNow()
+        // A user-initiated clear is never an "accidental" one: stamp the
+        // profile so the legacy repair can't touch what this just set up.
+        UserDefaults.standard.set(true, forKey: repairedWatchHistoryClearKey(profile: profile))
         OrivioSyncDiagnostics.record(
             .warning, area: "Orivio",
             "User cleared watch history (horizon \(clearedAt)) for profile \(profile)."
@@ -1177,7 +1359,7 @@ final class OrivioSyncManager: ObservableObject {
         // this profile's history under the other profile's id.
         try ensureProfile(profile)
         _ = try await send(endpoint: RPC.url(RPC.pushWatchProgress), method: "POST", body: payload)
-        progressDirty = false
+        setDirty("progress", profile: profile, false)
         if !snapshot.isEmpty { setSeeded("progress", profile: profile) }
     }
 
@@ -1322,6 +1504,9 @@ final class OrivioSyncManager: ObservableObject {
     /// Watching rows arrive bare. Fill them in from a meta addon (Cinemeta) so
     /// the cards render, best-effort and capped.
     private func enrichMetadata(_ entries: [WatchProgress]) async -> [WatchProgress] {
+        // A run of meta-addon requests. While a stream plays the sync stays
+        // JSON-only; the next idle pass fills in titles and artwork.
+        if Self.playbackActive { return entries }
         // The "Enrich Continue Watching" setting gates ONLY the optional artwork
         // backfill for rows that already have a real title (leaner: fewer
         // meta-addon calls). A raw "tt…" id is never an acceptable card title,
@@ -1394,11 +1579,12 @@ final class OrivioSyncManager: ObservableObject {
         // data into account B. See `isRetiringAccountState`.
         guard !isRetiringAccountState else { return }
         libraryDirty = true
+        let profile = pid   // the profile that changed
         pushLibraryTask?.cancel()
         pushLibraryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             guard !Task.isCancelled, let self else { return }
-            try? await self.pushLibrary(profile: self.pid)
+            try? await self.pushLibrary(profile: profile)
         }
     }
 
@@ -1408,7 +1594,10 @@ final class OrivioSyncManager: ObservableObject {
     /// debounced push hadn't uploaded yet — and the following push would then
     /// re-upload the row the user had just removed (the remove/re-add
     /// ping-pong). Addons and profiles already work this way.
-    private var libraryDirty = false
+    private var libraryDirty: Bool {
+        get { isDirty("library", profile: pid) }
+        set { setDirty("library", profile: pid, newValue) }
+    }
 
     // The library push is upsert-with-replace and has no per-item delete RPC,
     // so a removal only reaches the account as an ABSENCE from the next push.
@@ -1542,6 +1731,7 @@ final class OrivioSyncManager: ObservableObject {
     }
 
     private func enrichLibraryMetadata(_ items: [SavedLibraryItem]) async -> [SavedLibraryItem] {
+        if Self.playbackActive { return items }   // see enrichMetadata
         let rawTitleItems = items.filter { isRawSyncTitle($0.name, id: $0.id) }
         let rawTitleKeys = Set(rawTitleItems.map(\.key))
         let artworkItems = items.filter { item in
@@ -1635,7 +1825,7 @@ final class OrivioSyncManager: ObservableObject {
         }
         // Only now is the account known to hold this device's list, so a later
         // pull may safely reconcile against it.
-        libraryDirty = false
+        setDirty("library", profile: profile, false)
         if !items.isEmpty { setSeeded("library", profile: profile) }
     }
 
@@ -1700,16 +1890,28 @@ final class OrivioSyncManager: ObservableObject {
 
     // MARK: - Watched items
 
+    /// Set on every local mark, cleared only by a push that landed. The
+    /// debounced push swallows its error, so a mark whose one push hit a
+    /// Wi-Fi blip was forgotten — and the next pull (which runs BEFORE the
+    /// push in both sync paths) reconciled it away as remotely deleted once
+    /// it aged past the grace window. Same shape as `libraryDirty`.
+    private var watchedDirty: Bool {
+        get { isDirty("watched", profile: pid) }
+        set { setDirty("watched", profile: pid, newValue) }
+    }
+
     private func scheduleWatchedPush() {
         // Never while the previous account's state is being retired: the
         // store callbacks that retirement fires would arm a push of account A's
         // data into account B. See `isRetiringAccountState`.
         guard !isRetiringAccountState else { return }
+        watchedDirty = true
+        let profile = pid   // the profile that changed
         pushWatchedTask?.cancel()
         pushWatchedTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             guard !Task.isCancelled, let self else { return }
-            try? await self.pushWatchedItems(profile: self.pid)
+            try? await self.pushWatchedItems(profile: profile)
         }
     }
 
@@ -1809,7 +2011,9 @@ final class OrivioSyncManager: ObservableObject {
         // The store read and the id in the body have to agree.
         try ensureProfile(profile)
         let items = watchedStore.allForSync()
-        guard !items.isEmpty else { return }
+        // Nothing to push means nothing left unpushed (removals travel by the
+        // delete queue): clear the flag or it could never clear again.
+        guard !items.isEmpty else { setDirty("watched", profile: profile, false); return }
         let entries: [[String: Any]] = items.compactMap { item in
             guard let watchedAt = Self.epochMilliseconds(item.watchedAt) else { return nil }
             var obj: [String: Any] = [
@@ -1831,6 +2035,7 @@ final class OrivioSyncManager: ObservableObject {
         ]
         _ = try await authedPost(RPC.url(RPC.pushWatchedItems), body: body)
         setSeeded("watched", profile: profile)   // items is non-empty (guarded above)
+        setDirty("watched", profile: profile, false)
     }
 
     /// - Parameter profile: used for every page and for the store write, so a
@@ -1959,6 +2164,7 @@ final class OrivioSyncManager: ObservableObject {
         watchedStore.setProfile(id)
         collectionsStore.setProfile(id)
         homeCatalogSettings.setProfile(id)
+        rescopePerProfileStores(id)
         traktStore?.setProfile(id)
         guard account.accessToken != nil else { return }
         // Serialize behind any in-flight full sync (e.g. picking a profile at
@@ -2762,8 +2968,22 @@ final class OrivioSyncManager: ObservableObject {
     /// a profile flagged "uses primary plugins" shares profile 1's rows, so a
     /// push from that profile must not fork its own plugin set.
     private func pluginPID(for profile: Int) -> Int {
+        // Shared mode (the "Separate plugins per profile" switch is off) is
+        // "every profile uses primary": one list, canonical at profile 1's
+        // rows, so every device sharing the account converges on it.
+        guard ProfileScopedDefaults.isSeparate(PluginStore.feature) else { return 1 }
         let active = profileStore.allForSync().first { $0.id == profile }
         return (active?.usesPrimaryPlugins ?? true) ? 1 : profile
+    }
+
+    /// Same fallback for add-ons: a profile marked "use primary add-ons" —
+    /// or a device with the separate-add-ons switch off entirely — reads and
+    /// writes profile 1's list, locally and on the wire (the upstream
+    /// semantics of `uses_primary_addons` on the profile row).
+    private func addonPID(for profile: Int) -> Int {
+        guard ProfileScopedDefaults.isSeparate(AddonManager.feature) else { return 1 }
+        let active = profileStore.allForSync().first { $0.id == profile }
+        return (active?.usesPrimaryAddons ?? true) ? 1 : profile
     }
 
     /// Push plugin repos to the dedicated `plugins` table (`sync_push_plugins`),

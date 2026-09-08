@@ -1,64 +1,57 @@
 import Foundation
 import Network
 
-/// A tiny HTTP server on the Apple TV so add-ons can be added from a phone.
+/// A one-field page this Apple TV serves on the local network so an API key can
+/// be pasted from a phone instead of typed with the remote.
 ///
-/// Typing a manifest URL on a TV remote is miserable, and the existing
-/// "Add-on Setup" QR only goes the other way (it *exports* what is installed).
-/// This serves a one-field page on the local network; the QR on screen is just
-/// its address, so scanning it opens the form with no app to install.
+/// TMDB has no device/QR login: every v3 endpoint is authenticated by an API
+/// key, and the flow that would hand one out needs a key to start. So the QR
+/// can't come from TMDB — it points at this TV instead. Scan it, the phone
+/// opens a form, the key arrives here, and the TV saves it. The phone is where
+/// the key already is (it's on themoviedb.org in a browser tab), which is the
+/// whole point.
 ///
-/// Deliberately small and deliberately local:
+/// Same shape and same limits as `AddonImportServer`, which does this for
+/// manifest URLs:
 ///
-/// * Bound to the LAN interface only, and only while the screen showing the QR
-///   is open — `stop()` on disappear. It is not a background service.
-/// * No shell, no filesystem, no proxying. The only thing it accepts is a
-///   manifest URL, which goes through the same `AddonManager.install` path as
-///   a URL typed on the TV, so the same validation applies.
-/// * http, not https: a self-signed certificate on a LAN address would make
-///   every phone show a security warning, which trains exactly the wrong
-///   instinct. Nothing secret crosses it.
+/// * Bound to the LAN, and only while the screen showing the QR is open —
+///   `stop()` on disappear. Not a background service.
+/// * One route, one field. It accepts a string and hands it to `onSubmit`;
+///   there is no shell, no filesystem, no proxying.
+/// * http, not https. A self-signed cert on a LAN address trains people to
+///   click through security warnings. That means the key crosses the local
+///   network in the clear, which is why the page says so and why the screen
+///   still offers on-TV entry for anyone who'd rather not.
 @MainActor
-final class AddonImportServer: ObservableObject {
-    /// What the QR encodes, e.g. "http://192.168.1.20:8090". nil until the
+final class KeyHandoffServer: ObservableObject {
+    /// What the QR encodes, e.g. "http://192.168.1.20:8098". nil until the
     /// listener is actually up.
     @Published private(set) var address: String?
-    /// What an install actually turned out to be. A manifest URL says nothing
-    /// about what you just added — the point of echoing this back is to show
-    /// the add-on, not the link that fetched it.
-    struct AddedAddon: Identifiable, Equatable {
-        var id: String { manifestURL }
-        let manifestURL: String
-        let name: String
-        let logo: String?
-        let description: String?
+    @Published private(set) var lastError: String?
+    /// Set once a submitted value was accepted, so the TV can say so.
+    @Published private(set) var accepted = false
+
+    /// What the page is asking for. Rendered on the phone.
+    let title: String
+    let blurb: String
+    let placeholder: String
+
+    /// Validates and stores a submitted value. Returns the message to show on
+    /// the phone, and whether it was accepted.
+    var onSubmit: ((String) async -> (accepted: Bool, message: String))?
+
+    init(title: String, blurb: String, placeholder: String) {
+        self.title = title
+        self.blurb = blurb
+        self.placeholder = placeholder
     }
 
-    /// Add-ons accepted so far this session, newest first — echoed to both the
-    /// phone and the TV so you can see the phone worked.
-    @Published private(set) var accepted: [AddedAddon] = []
-    @Published private(set) var lastError: String?
-
-    /// Installs an accepted URL. Set by the view so this type stays free of
-    /// any dependency on AddonManager.
-    var onInstall: ((String) async -> Result<AddedAddon, Error>)?
-
-    /// Page copy, with the add-on flow's wording as the default. The server
-    /// is deliberately generic — anything pasted goes through `onInstall` —
-    /// so other paste-from-phone flows (the custom IPTV playlist) reuse it by
-    /// swapping these before `start()`.
-    var pageTitle = "Add add-ons"
-    var pagePrompt = "Paste one manifest URL, or a whole Add-on Setup export — one URL per line. Scanning the Export Add-on Setup QR from another Orivio gives you exactly that list."
-    var pagePlaceholder = "https://…/manifest.json"
-    var pageButton = "Add to Orivio"
-    var pageEmptyMessage = "Enter a manifest URL."
+    /// One above `AddonImportServer`'s, so both screens can be open at once
+    /// without fighting over the port.
+    private static let port: UInt16 = 8098
 
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
-
-    /// Fixed rather than ephemeral so the QR is stable across restarts of the
-    /// screen; high enough to need no privilege.
-    private static let port: UInt16 = 8099
 
     func start() {
         guard listener == nil else { return }
@@ -114,9 +107,8 @@ final class AddonImportServer: ObservableObject {
         connections.removeValue(forKey: ObjectIdentifier(connection))
     }
 
-    /// Read until the headers are complete AND the declared body has arrived.
-    /// A form POST routinely splits across packets, so parsing the first chunk
-    /// alone would silently lose submissions.
+    /// Read until the headers are complete AND the declared body has arrived —
+    /// a form POST routinely splits across packets.
     private func receive(_ connection: NWConnection, buffer: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) {
             [weak self] chunk, _, isComplete, error in
@@ -126,8 +118,8 @@ final class AddonImportServer: ObservableObject {
             Task { @MainActor in
                 if error != nil { self.drop(connection); return }
                 guard let request = HTTPRequest(buffer), request.isComplete else {
-                    // Cap it: without this a connection that never sends a
-                    // complete request grows this buffer without bound.
+                    // Cap it: a connection that never completes its request
+                    // would otherwise grow this buffer without bound.
                     if isComplete || buffer.count > 64 * 1024 { self.drop(connection) }
                     else { self.receive(connection, buffer: buffer) }
                     return
@@ -138,32 +130,21 @@ final class AddonImportServer: ObservableObject {
     }
 
     private func respond(to request: HTTPRequest, on connection: NWConnection) async {
-        var body = page(accepted: accepted, message: nil)
+        var message: String?
+        var ok = false
         if request.method == "POST" {
-            let raw = Self.formValue("url", in: request.body)
-            let urls = raw
-                .replacingOccurrences(of: ",", with: "\n")
-                .split(whereSeparator: \.isNewline)
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-            var results: [String] = []
-            for url in urls {
-                guard let onInstall else { break }
-                switch await onInstall(url) {
-                case .success(let addon):
-                    // Newest first, and never twice: re-adding an installed
-                    // add-on succeeds, and a duplicate row would suggest two.
-                    accepted.removeAll { $0.manifestURL == addon.manifestURL }
-                    accepted.insert(addon, at: 0)
-                    results.append("Added \(addon.name)")
-                case .failure(let error):
-                    results.append("Couldn't add: \(error.localizedDescription)")
-                }
+            let value = Self.formValue("value", in: request.body)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.isEmpty {
+                message = "Nothing entered."
+            } else if let onSubmit {
+                let result = await onSubmit(value)
+                ok = result.accepted
+                message = result.message
+                if ok { accepted = true }
             }
-            body = page(accepted: accepted,
-                        message: results.isEmpty ? pageEmptyMessage : results.joined(separator: " · "))
         }
-        send(body, on: connection)
+        send(Self.page(server: self, message: message, accepted: ok), on: connection)
     }
 
     private func send(_ html: String, on connection: NWConnection) {
@@ -197,7 +178,6 @@ final class AddonImportServer: ObservableObject {
             else { return nil }
             method = requestLine.split(separator: " ").first.map(String.init) ?? "GET"
             body = String(text[headerEnd.upperBound...])
-            // A POST is only complete once the declared body length is here.
             let declared = text.range(of: #"(?i)content-length:\s*(\d+)"#, options: .regularExpression)
                 .flatMap { Int(text[$0].filter(\.isNumber)) } ?? 0
             isComplete = method != "POST" || body.utf8.count >= declared
@@ -215,8 +195,6 @@ final class AddonImportServer: ObservableObject {
         return ""
     }
 
-    /// Escaped so an add-on name can't inject markup into the page the phone
-    /// renders — the names come from third-party manifests.
     private static func escape(_ s: String) -> String {
         s.replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
@@ -224,64 +202,45 @@ final class AddonImportServer: ObservableObject {
             .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
-    private func page(accepted: [AddedAddon], message: String?) -> String {
-        Self.page(accepted: accepted, message: message,
-                  title: pageTitle, prompt: pagePrompt,
-                  placeholder: pagePlaceholder, button: pageButton)
-    }
-
-    private static func page(accepted: [AddedAddon], message: String?,
-                             title: String, prompt: String,
-                             placeholder: String, button: String) -> String {
-        // Logos load straight from the add-on's own host — the phone has
-        // internet, and proxying them through the TV would mean this server
-        // fetching arbitrary URLs on request, which it deliberately does not.
-        let rows = accepted.map { addon -> String in
-            let art = addon.logo.map { "<img src=\"\(escape($0))\" alt=\"\" loading=lazy>" }
-                ?? "<span class=ph></span>"
-            let blurb = addon.description.map { "<p>\(escape($0))</p>" } ?? ""
-            return "<li>\(art)<div><strong>\(escape(addon.name))</strong>\(blurb)</div></li>"
-        }
-        let list = accepted.isEmpty ? ""
-            : "<h2>Added</h2><ul class=addons>" + rows.joined() + "</ul>"
-        let note = message.map { "<p class=note>\(escape($0))</p>" } ?? ""
+    private static func page(server: KeyHandoffServer, message: String?, accepted: Bool) -> String {
+        let note = message.map {
+            "<p class=\"note \(accepted ? "ok" : "bad")\">\(escape($0))</p>"
+        } ?? ""
+        // The field is not `type=password`: the point of pasting from the phone
+        // is being able to SEE that the right thing landed in the box.
         return """
         <!doctype html><html><head><meta charset=utf-8>
         <meta name=viewport content="width=device-width,initial-scale=1">
-        <title>\(escape(title)) · Orivio</title><style>
+        <title>\(escape(server.title))</title><style>
         :root{color-scheme:dark}
         body{margin:0;padding:24px;background:#0d0f14;color:#f2f2f7;
              font:16px/1.5 -apple-system,system-ui,sans-serif}
         h1{font-size:22px;margin:0 0 4px} p{color:#9a9aa6;margin:0 0 20px}
-        textarea{width:100%;box-sizing:border-box;padding:14px;font-size:16px;
+        a{color:#a78bfa}
+        input{width:100%;box-sizing:border-box;padding:14px;font-size:16px;
               border-radius:12px;border:1px solid #2c2f3a;background:#161923;color:#fff;
-              font-family:ui-monospace,Menlo,monospace;resize:vertical}
+              font-family:ui-monospace,Menlo,monospace}
         button{margin-top:12px;width:100%;padding:14px;font-size:17px;font-weight:600;
                border:0;border-radius:12px;background:#7c3aed;color:#fff}
-        .note{margin:16px 0 0;color:#c7c7d1}
-        ul.addons{list-style:none;padding:0;margin:8px 0 0}
-        ul.addons li{display:flex;gap:12px;align-items:flex-start;margin:14px 0}
-        ul.addons img,.ph{width:44px;height:44px;border-radius:10px;flex:0 0 44px;
-             object-fit:contain;background:#161923}
-        ul.addons strong{font-size:17px}
-        ul.addons p{margin:2px 0 0;font-size:14px;color:#9a9aa6}
+        .note{margin:16px 0 0} .ok{color:#4ade80} .bad{color:#f87171}
+        .fine{margin-top:24px;font-size:13px;color:#6b6b78}
         </style></head><body>
-        <h1>\(escape(title))</h1>
-        <p>\(escape(prompt))</p>
+        <h1>\(escape(server.title))</h1>
+        <p>\(server.blurb)</p>
         <form method=post action="/">
-        <textarea name=url rows=6 autocapitalize=off autocorrect=off
-                  spellcheck=false placeholder="\(escape(placeholder))" autofocus></textarea>
-        <button type=submit>\(escape(button))</button>
-        </form>\(note)\(list)
+        <input name=value autocapitalize=off autocorrect=off spellcheck=false
+               placeholder="\(escape(server.placeholder))" autofocus>
+        <button type=submit>Send to the TV</button>
+        </form>\(note)
+        <p class=fine>This page is served by your Apple TV on your own network,
+        over plain http. Only use it on a network you trust.</p>
         </body></html>
         """
     }
 
-    /// This device's IPv4 address on the LAN.
-    ///
-    /// Walks the interface list rather than assuming a name: the Apple TV is
-    /// "en0" over Ethernet and Wi-Fi both, but not on every model, and picking
-    /// wrong yields a QR that resolves to nothing.
+    /// This device's IPv4 address on the LAN. Walks the interface list rather
+    /// than assuming a name — the Apple TV is "en0" over Ethernet and Wi-Fi
+    /// both, but not on every model, and picking wrong yields a dead QR.
     private static func lanAddress() -> String? {
         var head: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&head) == 0, let first = head else { return nil }

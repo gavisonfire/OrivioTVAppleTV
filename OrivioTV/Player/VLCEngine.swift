@@ -110,11 +110,18 @@ final class VLCEngine: NSObject {
     var currentSubtitleID: Int32 { player.currentVideoSubTitleIndex }
 
     func selectAudio(_ id: Int32) { player.currentAudioTrackIndex = id }
+    /// The PiP window's mute control. Decoding continues, output is silenced.
+    func setMuted(_ muted: Bool) { player.audio?.isMuted = muted }
     /// `-1` disables subtitles in VLC.
     func selectSubtitle(_ id: Int32) { player.currentVideoSubTitleIndex = id }
 
     func addExternalSubtitle(_ url: URL) {
-        player.addPlaybackSlave(url, type: .subtitle, enforce: true)
+        // `enforce` is libvlc's "select this slave now" flag. The view model
+        // adds up to 25 addon tracks in a loop expecting them merely LISTED
+        // (the user, the preferred language or the remembered "off" pick);
+        // with it on, every track was selected as it landed and the last one
+        // won, over the subtitles-off default.
+        player.addPlaybackSlave(url, type: .subtitle, enforce: false)
     }
 }
 

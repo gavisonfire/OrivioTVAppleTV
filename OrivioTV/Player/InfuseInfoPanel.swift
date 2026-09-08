@@ -1,0 +1,916 @@
+import AVFoundation
+import AVKit
+import KSPlayer
+import SwiftUI
+
+// MARK: - Info panel (swipe down)
+//
+// Infuse's tvOS info sheet: four tab pills centred at the top — Info, Video,
+// Audio, Subtitles — over one wide dark card. Moving focus across the pills
+// switches the card; Down steps into the card's rows; a row with a value
+// opens a full-screen picker (`InfusePickerScreen`); Menu steps back out of
+// a picker, then closes the sheet; Up on the pills closes it too.
+//
+// Everything the app has that Infuse doesn't — sources, episodes, engine,
+// Picture in Picture — sits under OPTIONS on the Info tab, so the visible
+// player stays Infuse's and nothing is lost.
+
+struct InfuseInfoPanel: View {
+    @ObservedObject var viewModel: PlayerViewModel
+    @EnvironmentObject private var store: PlayerSettingsStore
+    @FocusState private var focus: Focus?
+    @State private var picker: InfusePickerSpec?
+    /// Where focus goes back to when the picker closes.
+    @State private var pickerReturnFocus: Focus?
+    /// The focus before the current one, to tell "Up from a row" apart from
+    /// a sideways move along the pills.
+    @State private var lastFocus: Focus?
+    /// The rows only become focusable once the viewer presses Down from a
+    /// pill, and until focus has landed anywhere only the Info pill is
+    /// focusable — so the engine's first pass has exactly one place to go.
+    @State private var rowsEnabled = false
+    @State private var firstFocusLanded = false
+    private var rowsHaveFocus: Bool {
+        if case .row = focus { return true }
+        return false
+    }
+    /// Bumped to pop the AirPlay route picker (the Speaker row).
+    @State private var routePickerToken = 0
+    @State private var speakerName = InfuseInfoPanel.currentSpeakerName()
+
+    enum Focus: Hashable {
+        case tab(Int)
+        case row(String)
+    }
+
+    private static let tabs = ["Info", "Video", "Audio", "Subtitles"]
+
+    /// Focus one main-actor turn later — the rows are being (re)enabled or
+    /// the sheet is still mounting on the pass that asks for it.
+    private func landFocus(_ target: Focus) {
+        Task { @MainActor in focus = target }
+    }
+
+    var body: some View {
+        ZStack {
+            // (The dim behind the sheet is PlayerScreen's, so it fades in
+            // place instead of sliding down with the sheet as a grey slab.)
+            VStack(spacing: 22) {
+                tabBar
+                card
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 42)
+            .padding(.horizontal, FusionMetrics.sideInset)
+            .ignoresSafeArea()
+            // The sheet stays put under a picker — dimmed, and out of the
+            // focus engine's reach — so it is exactly where you left it when
+            // the picker closes.
+            .opacity(picker == nil ? 1 : 0.35)
+            .disabled(picker != nil)
+
+            if let picker {
+                InfusePickerScreen(viewModel: viewModel, spec: picker) {
+                    closePicker()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .defaultFocus($focus, .tab(0))
+        .onAppear {
+            // Open on the Info pill: it is the only focusable thing until
+            // focus has landed once (the other pills and every row are
+            // disabled), so the engine cannot choose anything else. The
+            // binding is NOT pre-set — a pre-set binding made defaultFocus a
+            // no-op and the engine then picked a row by geometry.
+            lastFocus = nil
+            rowsEnabled = false
+            firstFocusLanded = false
+            viewModel.infoFocusOnTabs = true
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                if focus == nil { focus = .tab(0) }
+            }
+        }
+        .onChange(of: focus) { _, new in
+            defer { lastFocus = new }
+            if new != nil { firstFocusLanded = true }
+            guard case .tab(let index) = new else {
+                if new != nil { viewModel.infoFocusOnTabs = false }
+                return
+            }
+            viewModel.infoFocusOnTabs = true
+            // Up out of the rows lands on whichever pill is nearest by
+            // geometry, which is usually NOT the open tab. Coming from a row,
+            // the destination is the current tab, full stop.
+            if case .row = lastFocus, index != viewModel.infoTab {
+                landFocus(.tab(viewModel.infoTab))
+                return
+            }
+            viewModel.infoTab = index
+        }
+        // Back closed the picker from the view model (window-level Menu).
+        .onChange(of: viewModel.infoPickerVisible) { _, visible in
+            if !visible, picker != nil { closePicker() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIFocusSystem.movementDidFailNotification),
+                   perform: focusMoveFailed)
+        .animation(FusionMotion.controlsAppear, value: picker == nil)
+    }
+
+    // MARK: Tabs
+
+    private var tabBar: some View {
+        HStack(spacing: 20) {
+            ForEach(Array(Self.tabs.enumerated()), id: \.offset) { index, title in
+                Button {
+                    viewModel.infoTab = index
+                } label: {
+                    InfuseTabLabel(title: title, selected: viewModel.infoTab == index)
+                }
+                .buttonStyle(PlainCardButtonStyle())
+                .focused($focus, equals: .tab(index))
+                // While focus is down in the rows only the OPEN tab is
+                // reachable, so Up comes straight back to it instead of
+                // visiting whichever pill the engine finds nearest first.
+                .disabled((rowsHaveFocus && index != viewModel.infoTab)
+                          || (!firstFocusLanded && index != 0))
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// The engine reported a move it could not make. Only then — never on a
+    /// guess about timing — hand focus across the gap it can't see: Up from
+    /// a row to the open tab's pill, Down from a pill to that tab's first
+    /// row. (The pill can sit far to one side of the rows, outside the
+    /// engine's angular window; the Info tab's options are at the right
+    /// edge.) A move the engine DID make, however long it takes to report,
+    /// never triggers this — which is what stopped Up between rows from
+    /// jumping to the pills.
+    private func focusMoveFailed(_ note: Notification) {
+        guard viewModel.overlay == .info, picker == nil,
+              let context = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext
+        else { return }
+        switch context.focusHeading {
+        case .up:
+            if case .row = focus { focus = .tab(viewModel.infoTab) }
+        case .down:
+            // The rows are disabled until now — enable them, then land on the
+            // first one a turn later, once they are focusable.
+            if case .tab = focus, let first = firstRow(ofTab: viewModel.infoTab) {
+                rowsEnabled = true
+                landFocus(.row(first))
+            }
+        default:
+            break
+        }
+    }
+
+    /// The row Down from the pills should land on, per tab.
+    private func firstRow(ofTab tab: Int) -> String? {
+        switch tab {
+        case 1: return "video.zoom"
+        case 2: return viewModel.audioOptions.first.map { "audio.track.\($0.id)" } ?? "audio.speaker"
+        case 3: return viewModel.subtitleOptions.first.map { "sub.track.\($0.id)" } ?? "sub.font"
+        default: return "info.source"
+        }
+    }
+
+    // MARK: Card
+
+    private var card: some View {
+        Group {
+            switch viewModel.infoTab {
+            case 1: videoTab
+            case 2: audioTab
+            case 3: subtitlesTab
+            default: infoTab
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .disabled(!rowsEnabled)
+        .background(
+            RoundedRectangle(cornerRadius: 36, style: .continuous)
+                .fill(Color(hex: 0x1B1B1D).opacity(0.94))
+        )
+    }
+
+    // MARK: Info tab
+
+    private var infoTab: some View {
+        let summary = viewModel.infuseFileSummary()
+        let episode = viewModel.currentVideo
+        let still = episode?.thumbnail.flatMap { $0.isEmpty ? nil : $0 }
+        return HStack(alignment: .top, spacing: 40) {
+            HStack(alignment: .center, spacing: 28) {
+                Group {
+                    if let still {
+                        RemoteImage(url: still, maxDimension: 320)
+                            .frame(width: 320, height: 180)
+                    } else {
+                        RemoteImage(url: viewModel.displayMeta.poster, maxDimension: 250)
+                            .frame(width: 168, height: 250)
+                    }
+                }
+                .background(Color.black)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .allowsHitTesting(false)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(viewModel.infoCardTitle)
+                        .font(.system(size: 27, weight: .bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    HStack(spacing: 20) {
+                        if let runtime = summary.runtime {
+                            Text(runtime).padding(.trailing, 60)
+                        }
+                        ForEach(Array(summary.details.enumerated()), id: \.offset) { _, item in
+                            Text(item)
+                        }
+                    }
+                    .font(.system(size: 25, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(1)
+                }
+            }
+            .padding(.vertical, 16)
+            .padding(.leading, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            optionsColumn(header: "Options") {
+                optionRow("info.source", label: "Source", value: viewModel.currentEntry.addonName) {
+                    viewModel.loadSourcesIfNeeded()
+                    return InfusePickerSpec(title: "Sources", content: .sources)
+                }
+                if viewModel.currentVideo?.season != nil {
+                    optionRow("info.episodes", label: "Episodes", value: viewModel.currentVideo?.seasonEpisodeCode) {
+                        InfusePickerSpec(title: "Episodes", content: .episodes)
+                    }
+                }
+                optionRow("info.engine", label: "Engine", value: viewModel.engineName) {
+                    InfusePickerSpec(title: "Engine", content: .items(
+                        PlayerEngine.allCases.filter { $0 != .external }.map { engine in
+                            InfusePickerItem(id: engine.rawValue, title: engine.label,
+                                             selected: viewModel.effectiveEngine == engine) {
+                                viewModel.switchEngine(engine)
+                            }
+                        }
+                    ))
+                }
+                if viewModel.pictureInPicture.isPossible {
+                    actionRow("info.pip", label: "Picture in Picture") {
+                        viewModel.pictureInPicture.start()
+                    }
+                } else if viewModel.canEnterPictureInPictureViaNativeEngine {
+                    actionRow("info.pip", label: "Picture in Picture", value: "via Native engine") {
+                        viewModel.enterPictureInPictureViaNativeEngine()
+                    }
+                }
+            }
+            .frame(width: 520)
+            .padding(.top, 12)
+            .padding(.trailing, 60)
+            .padding(.bottom, 20)
+        }
+    }
+
+    // MARK: Video tab
+
+    private var videoTab: some View {
+        optionsColumn(header: "Options") {
+            optionRow("video.zoom", label: "Zoom Mode", value: zoomLabel(viewModel.aspectMode)) {
+                InfusePickerSpec(title: "Zoom Mode", content: .items(
+                    AspectMode.allCases.map { mode in
+                        InfusePickerItem(id: mode.rawValue, title: zoomLabel(mode),
+                                         selected: viewModel.aspectMode == mode) {
+                            viewModel.setAspect(mode)
+                        }
+                    }
+                ))
+            }
+            optionRow("video.aspect", label: "Aspect Ratio", value: viewModel.aspectRatioLabel) {
+                InfusePickerSpec(title: "Aspect Ratio", content: .items(
+                    PlayerViewModel.aspectRatioOptions.map { option in
+                        InfusePickerItem(id: option.label, title: option.label,
+                                         selected: option.value == viewModel.aspectRatioOverride) {
+                            viewModel.aspectRatioOverride = option.value
+                        }
+                    }
+                ))
+            }
+            optionRow("video.shift", label: "Vertical Shift", value: viewModel.verticalShift.label) {
+                InfusePickerSpec(title: "Vertical Shift", content: .items(
+                    PlayerViewModel.VerticalShift.allCases.map { shift in
+                        InfusePickerItem(id: shift.rawValue, title: shift.label,
+                                         selected: viewModel.verticalShift == shift) {
+                            viewModel.verticalShift = shift
+                        }
+                    }
+                ))
+            }
+            if !viewModel.chapters.isEmpty {
+                let current = viewModel.currentChapter
+                let currentIndex = viewModel.chapters.firstIndex { $0.start == current?.start } ?? 0
+                optionRow("video.chapters", label: "Chapters",
+                          value: current.map { PlayerViewModel.chapterLabel($0, index: currentIndex) } ?? "—") {
+                    InfusePickerSpec(title: "Chapters", content: .items(
+                        viewModel.chapters.enumerated().map { index, chapter in
+                            InfusePickerItem(id: "chapter-\(index)",
+                                             title: PlayerViewModel.chapterLabel(chapter, index: index),
+                                             subtitle: TimeFormat.clock(chapter.start),
+                                             selected: index == currentIndex) {
+                                viewModel.seek(toChapter: chapter)
+                            }
+                        }
+                    ))
+                }
+            }
+            optionRow("video.speed", label: "Playback Speed", value: speedLabel(viewModel.playbackSpeed)) {
+                InfusePickerSpec(title: "Playback Speed", content: .items(
+                    Self.speeds.map { speed in
+                        InfusePickerItem(id: "\(speed)", title: speedLabel(speed),
+                                         selected: viewModel.playbackSpeed == speed) {
+                            viewModel.setSpeed(speed)
+                        }
+                    }
+                ))
+            }
+            if let dolby = viewModel.dolbyVisionStatus {
+                InfuseOptionRow(label: "Dolby Vision", value: dolby, interactive: false)
+            }
+        }
+        .frame(width: 560)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 22)
+    }
+
+    private static let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+    private func zoomLabel(_ mode: AspectMode) -> String {
+        switch mode {
+        case .fit: return "Normal"
+        case .zoom: return "Crop"
+        case .stretch: return "Stretch"
+        }
+    }
+
+    private func speedLabel(_ speed: Float) -> String {
+        speed == 1 ? "Normal" : String(format: "%gx", speed)
+    }
+
+    // MARK: Audio tab
+
+    private var audioTab: some View {
+        twoColumns {
+            tracksColumn(prefix: "audio", options: viewModel.audioOptions,
+                         selectedID: viewModel.selectedAudioID) { option in
+                viewModel.selectAudio(option)
+            }
+        } trailing: {
+            optionsColumn(header: "Options") {
+                actionRow("audio.speaker", label: "Speaker", value: speakerName) {
+                    routePickerToken += 1
+                }
+            }
+            .background {
+                // Invisible AVRoutePickerView; the row pokes it to present
+                // the system AirPlay / output sheet.
+                AirPlayRoutePickerHost(presentToken: routePickerToken)
+                    .frame(width: 1, height: 1)
+                    .clipped()
+                    .opacity(0.02)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { _ in
+                speakerName = Self.currentSpeakerName()
+            }
+        }
+    }
+
+    /// The current audio output route, as the TV names it.
+    private static func currentSpeakerName() -> String {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        guard let output = outputs.first else { return "Apple TV" }
+        switch output.portType {
+        case .HDMI: return "TV"
+        case .airPlay: return output.portName
+        case .bluetoothA2DP, .bluetoothLE, .bluetoothHFP: return output.portName
+        default: return output.portName.isEmpty ? "Apple TV" : output.portName
+        }
+    }
+
+    // MARK: Subtitles tab
+
+    private var subtitlesTab: some View {
+        twoColumns {
+            tracksColumn(prefix: "sub", options: viewModel.subtitleOptions,
+                         selectedID: viewModel.selectedSubtitleID) { option in
+                viewModel.selectSubtitle(option)
+            }
+        } trailing: {
+            optionsColumn(header: "Options") {
+                let s = store.settings
+                optionRow("sub.font", label: "Font", value: fontLabel(s.subtitleFontName)) {
+                    InfusePickerSpec(title: "Font", content: .items(
+                        PlayerSettings.subtitleFontOptions.map { option in
+                            InfusePickerItem(id: "font-\(option.0)", title: option.1,
+                                             selected: s.subtitleFontName == option.0) {
+                                store.settings.subtitleFontName = option.0
+                            }
+                        }
+                    ))
+                }
+                optionRow("sub.size", label: "Size", value: "\(s.subtitleSize) pt") {
+                    InfusePickerSpec(title: "Size", content: .items(
+                        PlayerSettings.subtitleSizeValues.map { size in
+                            InfusePickerItem(id: "size-\(size)", title: "\(size) pt",
+                                             selected: s.subtitleSize == size) {
+                                store.settings.subtitleSize = size
+                                // KSPlayer's own cue styling reads this static.
+                                SubtitleModel.textFontSize = CGFloat(size)
+                            }
+                        }
+                    ))
+                }
+                optionRow("sub.color", label: "Color", value: colorLabel(s.subtitleTextColorHex)) {
+                    InfusePickerSpec(title: "Color", content: .items(
+                        PlayerSettings.subtitleColorOptions.map { option in
+                            InfusePickerItem(id: "color-\(option.0)", title: option.1,
+                                             selected: s.subtitleTextColorHex == option.0) {
+                                store.settings.subtitleTextColorHex = option.0
+                            }
+                        }
+                    ))
+                }
+                optionRow("sub.weight", label: "Weight", value: s.subtitleBold ? "Bold" : "Regular") {
+                    InfusePickerSpec(title: "Weight", content: .items([
+                        InfusePickerItem(id: "regular", title: "Regular", selected: !s.subtitleBold) {
+                            store.settings.subtitleBold = false
+                        },
+                        InfusePickerItem(id: "bold", title: "Bold", selected: s.subtitleBold) {
+                            store.settings.subtitleBold = true
+                        }
+                    ]))
+                }
+                optionRow("sub.outline", label: "Outline", value: s.subtitleOutlineEnabled ? "Bordered" : "Off") {
+                    InfusePickerSpec(title: "Outline", content: .items([
+                        InfusePickerItem(id: "bordered", title: "Bordered", selected: s.subtitleOutlineEnabled) {
+                            store.settings.subtitleOutlineEnabled = true
+                        },
+                        InfusePickerItem(id: "off", title: "Off", selected: !s.subtitleOutlineEnabled) {
+                            store.settings.subtitleOutlineEnabled = false
+                        }
+                    ]))
+                }
+                optionRow("sub.background", label: "Background", value: s.subtitleBackground ? "On" : "Off") {
+                    InfusePickerSpec(title: "Background", content: .items([
+                        InfusePickerItem(id: "on", title: "On", selected: s.subtitleBackground) {
+                            store.settings.subtitleBackground = true
+                        },
+                        InfusePickerItem(id: "off", title: "Off", selected: !s.subtitleBackground) {
+                            store.settings.subtitleBackground = false
+                        }
+                    ]))
+                }
+                optionRow("sub.opacity", label: "Opacity", value: "\(s.subtitleBackgroundOpacity)%") {
+                    InfusePickerSpec(title: "Opacity", content: .items(
+                        PlayerSettings.subtitleBackgroundOpacityValues.map { value in
+                            InfusePickerItem(id: "opacity-\(value)", title: "\(value)%",
+                                             selected: s.subtitleBackgroundOpacity == value) {
+                                store.settings.subtitleBackgroundOpacity = value
+                            }
+                        }
+                    ))
+                }
+                optionRow("sub.offset", label: "Vertical Alignment", value: offsetLabel(s.subtitleVerticalOffset)) {
+                    InfusePickerSpec(title: "Vertical Alignment", content: .items(
+                        PlayerSettings.subtitleOffsetValues.map { value in
+                            InfusePickerItem(id: "offset-\(value)", title: offsetLabel(value),
+                                             selected: s.subtitleVerticalOffset == value) {
+                                store.settings.subtitleVerticalOffset = value
+                            }
+                        }
+                    ))
+                }
+                optionRow("sub.delay", label: "Delay", value: PlayerViewModel.formatDelay(viewModel.subtitleDelay)) {
+                    InfusePickerSpec(title: "Delay", content: .items(
+                        PlayerSettings.subtitleDelayValues.map { value in
+                            InfusePickerItem(id: "delay-\(value)", title: PlayerViewModel.formatDelay(value),
+                                             selected: viewModel.subtitleDelay == value) {
+                                viewModel.nudgeSubtitleDelay(by: value - viewModel.subtitleDelay)
+                            }
+                        }
+                    ))
+                }
+            }
+        }
+    }
+
+    private func fontLabel(_ name: String) -> String {
+        PlayerSettings.subtitleFontOptions.first { $0.0 == name }?.1 ?? "Default"
+    }
+
+    private func colorLabel(_ hex: String) -> String {
+        PlayerSettings.subtitleColorOptions.first { $0.0.caseInsensitiveCompare(hex) == .orderedSame }?.1 ?? "White"
+    }
+
+    private func offsetLabel(_ value: Int) -> String {
+        value == 0 ? "Default" : (value > 0 ? "Up \(value)" : "Down \(-value)")
+    }
+
+    // MARK: Layout helpers
+
+    /// TRACKS on the left, OPTIONS on the right — the Audio and Subtitles
+    /// cards. Both columns start well in from the card's edge, as Infuse's do.
+    private func twoColumns<Leading: View, Trailing: View>(
+        @ViewBuilder leading: () -> Leading,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(alignment: .top, spacing: 40) {
+            leading().frame(maxWidth: .infinity, alignment: .leading)
+            trailing().frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 230)
+        .padding(.vertical, 22)
+    }
+
+    private func optionsColumn<Rows: View>(header: String, @ViewBuilder rows: () -> Rows) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            InfuseColumnHeader(text: header)
+            rows()
+        }
+    }
+
+    /// A list of tracks with a checkmark on the active one. Scrolls past
+    /// eight rows, fading at the bottom edge like Infuse's.
+    private func tracksColumn(prefix: String, options: [TrackOption], selectedID: String?,
+                              onSelect: @escaping (TrackOption) -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            InfuseColumnHeader(text: "Tracks")
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if options.isEmpty {
+                        InfuseOptionRow(label: "No tracks in this stream", value: nil, interactive: false)
+                    }
+                    ForEach(options) { option in
+                        Button {
+                            onSelect(option)
+                        } label: {
+                            InfuseTrackRow(
+                                title: option.id == "sub-off" ? "None" : option.displayName,
+                                selected: option.id == selectedID
+                            )
+                        }
+                        .buttonStyle(PlainCardButtonStyle())
+                        .focused($focus, equals: .row("\(prefix).track.\(option.id)"))
+                    }
+                }
+                .padding(.bottom, 20)
+            }
+            .scrollClipDisabled()
+            // Sized to the rows (up to eight), so a one-track list doesn't
+            // stretch the card to the scroller's maximum.
+            .frame(height: InfuseRowMetrics.height * CGFloat(min(max(options.count, 1), 8)) + 20)
+            .mask(
+                LinearGradient(
+                    stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.85),
+                            .init(color: .clear, location: 1)],
+                    startPoint: .top, endPoint: .bottom
+                )
+            )
+        }
+    }
+
+    /// A row that opens a picker. `make` builds the picker when pressed so the
+    /// spec always reflects the current values.
+    private func optionRow(_ id: String, label: String, value: String?,
+                           make: @escaping () -> InfusePickerSpec) -> some View {
+        Button {
+            pickerReturnFocus = .row(id)
+            picker = make()
+            viewModel.infoPickerVisible = true
+        } label: {
+            InfuseOptionRow(label: label, value: value, interactive: true)
+        }
+        .buttonStyle(PlainCardButtonStyle())
+        .focused($focus, equals: .row(id))
+    }
+
+    private func actionRow(_ id: String, label: String, value: String? = nil,
+                           action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            InfuseOptionRow(label: label, value: value, interactive: true)
+        }
+        .buttonStyle(PlainCardButtonStyle())
+        .focused($focus, equals: .row(id))
+    }
+
+    private func closePicker() {
+        picker = nil
+        viewModel.infoPickerVisible = false
+        landFocus(pickerReturnFocus ?? .tab(viewModel.infoTab))
+    }
+}
+
+// MARK: - AirPlay route picker
+
+/// A hidden `AVRoutePickerView`. tvOS has no API to present the output
+/// sheet directly; poking the picker's own button is the accepted way.
+struct AirPlayRoutePickerHost: UIViewRepresentable {
+    let presentToken: Int
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator { var lastToken = 0 }
+
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let view = AVRoutePickerView()
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: AVRoutePickerView, context: Context) {
+        guard context.coordinator.lastToken != presentToken else { return }
+        context.coordinator.lastToken = presentToken
+        guard presentToken > 0 else { return }
+        DispatchQueue.main.async {
+            guard let button = view.subviews.compactMap({ $0 as? UIButton }).first else { return }
+            button.sendActions(for: .primaryActionTriggered)
+            button.sendActions(for: .touchUpInside)
+        }
+    }
+}
+
+// MARK: - Pieces
+
+enum InfuseRowMetrics {
+    static let height: CGFloat = 52
+    static let font: CGFloat = 29
+}
+
+private struct InfuseTabLabel: View {
+    @Environment(\.isFocused) private var isFocused
+    let title: String
+    let selected: Bool
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 31, weight: .semibold))
+            .foregroundStyle(isFocused ? .black : .white)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
+            .background {
+                if isFocused {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.white)
+                } else if selected {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.white.opacity(0.24))
+                }
+            }
+            .focusLift(OrivioFocus.card, isFocused)
+    }
+}
+
+struct InfuseColumnHeader: View {
+    let text: String
+    var body: some View {
+        Text(text.uppercased())
+            .font(.system(size: 22, weight: .medium))
+            .kerning(0.8)
+            .foregroundStyle(.white.opacity(0.55))
+            .padding(.top, 10)
+            .padding(.bottom, 14)
+    }
+}
+
+/// Label left, value right. Focus brightens both — there is no platter.
+struct InfuseOptionRow: View {
+    @Environment(\.isFocused) private var isFocused
+    let label: String
+    let value: String?
+    let interactive: Bool
+
+    var body: some View {
+        HStack(spacing: 20) {
+            Text(label)
+                .font(.system(size: InfuseRowMetrics.font, weight: isFocused ? .semibold : .regular))
+                .foregroundStyle(isFocused ? .white : .white.opacity(interactive ? 0.85 : 0.6))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            if let value {
+                Text(value)
+                    .font(.system(size: InfuseRowMetrics.font, weight: .regular))
+                    .foregroundStyle(isFocused ? .white : .white.opacity(0.45))
+                    .lineLimit(1)
+            }
+        }
+        .frame(height: InfuseRowMetrics.height)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+    }
+}
+
+struct InfuseTrackRow: View {
+    @Environment(\.isFocused) private var isFocused
+    let title: String
+    let selected: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "checkmark")
+                .font(.system(size: 22, weight: .medium))
+                .opacity(selected ? 1 : 0)
+                .frame(width: 26)
+            Text(title)
+                .font(.system(size: InfuseRowMetrics.font, weight: isFocused ? .semibold : .regular))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(isFocused ? .white : .white.opacity(selected ? 0.85 : 0.7))
+        .frame(height: InfuseRowMetrics.height)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, -38)   // checkmark hangs in the gutter, text aligns with the header
+        .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Full-screen picker
+
+struct InfusePickerItem: Identifiable {
+    let id: String
+    let title: String
+    var subtitle: String? = nil
+    let selected: Bool
+    let action: () -> Void
+}
+
+enum InfusePickerContent {
+    case items([InfusePickerItem])
+    /// Live lists that change while open (sources still loading, episode
+    /// metadata arriving) — built from the view model on every pass.
+    case sources
+    case episodes
+}
+
+struct InfusePickerSpec {
+    let title: String
+    let content: InfusePickerContent
+}
+
+/// Infuse's option picker: a dimmed screen, the setting's name in grey at
+/// the top, and a centred stack of rounded rows — white with a checkmark on
+/// the focused one. Choosing a row applies it and calls `onClose`.
+struct InfusePickerScreen: View {
+    @ObservedObject var viewModel: PlayerViewModel
+    @EnvironmentObject private var streamBadges: StreamBadgeStore
+    let spec: InfusePickerSpec
+    let onClose: () -> Void
+    @FocusState private var focus: String?
+
+    private var items: [InfusePickerItem] {
+        switch spec.content {
+        case .items(let items):
+            return items
+        case .sources:
+            return viewModel.allEntries.map { entry in
+                var detail = entry.addonName
+                if !entry.displayDetail.isEmpty { detail += " · \(entry.displayDetail)" }
+                let tags = [entry.resolutionLabel, entry.fileSizeLabel].compactMap { $0 }
+                if !tags.isEmpty { detail += " · " + tags.joined(separator: " · ") }
+                let badges = streamBadges.badges(for: entry).map(\.name)
+                if !badges.isEmpty { detail += " · " + badges.joined(separator: " · ") }
+                return InfusePickerItem(id: entry.id.uuidString, title: entry.displayName,
+                                        subtitle: detail,
+                                        selected: entry.id == viewModel.currentEntry.id) {
+                    viewModel.switchSource(entry)
+                }
+            }
+        case .episodes:
+            guard let season = viewModel.currentVideo?.season else { return [] }
+            return viewModel.displayMeta.episodes(season: season).map { episode in
+                InfusePickerItem(
+                    id: episode.id,
+                    title: "\(episode.episode.map { "\($0). " } ?? "")\(episode.title ?? "Episode")",
+                    subtitle: episode.overview.flatMap { $0.isEmpty ? nil : $0 },
+                    selected: episode.id == viewModel.currentVideo?.id
+                ) {
+                    viewModel.play(episode: episode)
+                }
+            }
+        }
+    }
+
+    private var emptyLabel: String? {
+        switch spec.content {
+        case .sources:
+            if viewModel.isLoadingSources { return "Searching sources…" }
+            return viewModel.allEntries.isEmpty ? "No sources found" : nil
+        case .episodes:
+            return items.isEmpty ? "The episode list hasn't loaded yet" : nil
+        case .items(let items):
+            return items.isEmpty ? "Nothing to choose" : nil
+        }
+    }
+
+    private var hasSubtitles: Bool { items.contains { $0.subtitle != nil } }
+    private var rowWidth: CGFloat { hasSubtitles ? 1100 : 600 }
+
+    var body: some View {
+        ZStack {
+            Group {
+                if PerformanceProfile.isLowPower || PerformanceProfile.isMidPower {
+                    Color(hex: 0x141416).opacity(0.9)
+                } else {
+                    Rectangle().fill(.ultraThinMaterial)
+                        .overlay(Color.black.opacity(0.55))
+                }
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+
+            VStack(spacing: 0) {
+                Text(spec.title)
+                    .font(.system(size: 53, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.45))
+                    .padding(.top, 100)
+                    .padding(.bottom, 64)
+
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 12) {
+                        if let emptyLabel {
+                            // Focusable so Menu still has somewhere to land.
+                            Button {} label: {
+                                InfusePickerRow(title: emptyLabel, subtitle: nil, selected: false,
+                                                width: rowWidth)
+                            }
+                            .buttonStyle(PlainCardButtonStyle())
+                            .focused($focus, equals: "empty")
+                        }
+                        ForEach(items) { item in
+                            Button {
+                                item.action()
+                                onClose()
+                            } label: {
+                                InfusePickerRow(title: item.title, subtitle: item.subtitle,
+                                                selected: item.selected, width: rowWidth)
+                            }
+                            .buttonStyle(PlainCardButtonStyle())
+                            .focused($focus, equals: item.id)
+                            .id(item.id)
+                        }
+                    }
+                    .padding(.vertical, 20)
+                }
+                .scrollClipDisabled()
+            }
+        }
+        .defaultFocus($focus, items.first { $0.selected }?.id ?? items.first?.id ?? "empty")
+        .onAppear {
+            focus = items.first { $0.selected }?.id ?? items.first?.id ?? "empty"
+        }
+    }
+}
+
+private struct InfusePickerRow: View {
+    @Environment(\.isFocused) private var isFocused
+    let title: String
+    let subtitle: String?
+    let selected: Bool
+    let width: CGFloat
+
+    var body: some View {
+        HStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 29, weight: .medium))
+                    .lineLimit(1)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.system(size: 21, weight: .regular))
+                        .foregroundStyle(isFocused ? .black.opacity(0.6) : .white.opacity(0.55))
+                        .lineLimit(2)
+                }
+            }
+            Spacer(minLength: 0)
+            if selected {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(isFocused ? .black.opacity(0.5) : .white.opacity(0.6))
+            }
+        }
+        .foregroundStyle(isFocused ? .black : .white)
+        .padding(.horizontal, 24)
+        .padding(.vertical, subtitle == nil ? 0 : 10)
+        .frame(width: width)
+        .frame(minHeight: 67)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(isFocused ? Color.white.opacity(0.93) : Color.white.opacity(0.12))
+                .shadow(color: .black.opacity(isFocused ? 0.4 : 0), radius: 14, y: 6)
+        )
+        .focusLift(OrivioFocus.row, isFocused)
+    }
+}

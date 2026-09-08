@@ -448,7 +448,7 @@ struct CommunityCollectionsView: View {
                     }
 
                     if !tmdbSettings.isEnabled {
-                        Text("Enable TMDB in Settings → Integrations so these categories have something to show.")
+                        Text("Turn on TMDB and add your own API key in Settings → Integrations so these categories have something to show.")
                             .font(.system(size: 19))
                             .foregroundStyle(OrivioPrimitives.error)
                     }

@@ -25,9 +25,54 @@ final class PluginStore: ObservableObject {
     private var applyingRemote = false
 
     private let runtime = PluginRuntime()
+    /// Shared across profiles on purpose: entries are keyed by scraper URL, so
+    /// two profiles with the same repo share the download, never the choice.
     private static let jsCache = DiskCache<String>(name: "scrapers")
     private static let reposKey = "orivio.plugins.repos.v1"
     private static let scrapersKey = "orivio.plugins.scrapers.v1"
+
+    /// Plugins are PER PROFILE (upstream scopes `plugin_settings` and even the
+    /// plugin JS dir per profile; its `plugins` table has always carried
+    /// profile_id, honoured by this app's sync via `pluginPID`). A profile's
+    /// first load seeds from the legacy device-wide list. A profile with
+    /// `usesPrimaryPlugins` is pointed at profile 1's list by the callers of
+    /// `setProfile` — the same fallback upstream applies.
+    private(set) var profileID = ProfileScopedDefaults.activeProfileID
+
+    /// Separate-vs-shared switch (Trakt-style). Shared = one device-wide
+    /// repo/scraper list for every profile, the pre-split behaviour.
+    static let feature = "plugins"
+    var perProfileEnabled: Bool { ProfileScopedDefaults.isSeparate(Self.feature) }
+
+    func setPerProfile(_ on: Bool) {
+        guard on != perProfileEnabled else { return }
+        ProfileScopedDefaults.setSeparate(Self.feature, on)
+        applyingRemote = true
+        defer { applyingRemote = false }
+        repositories = []
+        scrapers = []
+        load()
+    }
+
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        applyingRemote = true
+        defer { applyingRemote = false }
+        repositories = []
+        scrapers = []
+        load()
+    }
+
+    /// Forget a deleted profile's plugins so a recycled id starts from the seed.
+    func forgetProfile(_ id: Int) {
+        ProfileScopedDefaults.forget([Self.reposKey, Self.scrapersKey], profile: id)
+        if id == profileID {
+            repositories = []
+            scrapers = []
+            load()
+        }
+    }
 
     private let session: URLSession = {
         let c = URLSessionConfiguration.default
@@ -98,12 +143,13 @@ final class PluginStore: ObservableObject {
 
     /// Drop every repository and scraper. For an ACCOUNT SWITCH only — see
     /// `AddonManager.clearAll`. Silent, so retiring the previous account's
-    /// state cannot arm a push of the result.
+    /// state cannot arm a push of the result. EVERY profile's list plus the
+    /// legacy seed, for the same reason as add-ons: a surviving slot would
+    /// load the previous user's repos straight into the new account.
     func clearAll() {
-        guard !repositories.isEmpty || !scrapers.isEmpty else { return }
         repositories.removeAll()
         scrapers.removeAll()
-        save()
+        ProfileScopedDefaults.forgetAll([Self.reposKey, Self.scrapersKey])
     }
 
     func removeRepository(_ id: String) {
@@ -175,15 +221,60 @@ final class PluginStore: ObservableObject {
         if let q = result.quality { detailParts.append(q) }
         if let size = result.size { detailParts.append(size) }
         if let lang = result.language { detailParts.append(lang) }
+        // Request headers the scraper decoded (Referer / User-Agent for CDN
+        // links) used to be dropped here — every engine already applies
+        // `behaviorHints.proxyHeaders`, so the same link 403'd in the player
+        // while working on Android.
+        var hints: StreamBehaviorHints?
+        if let headers = result.headers, !headers.isEmpty {
+            hints = StreamBehaviorHints(proxyHeaders: StreamProxyHeaders(request: headers))
+        }
+        // A magnet link is a TORRENT, not a direct link: routed as a URL it
+        // was handed straight to the player, which cannot open `magnet:`.
+        // Give it the shape the debrid / TorrServer path expects.
+        let lowered = result.url.lowercased()
+        if lowered.hasPrefix("magnet:") {
+            let parsed = Self.parseMagnet(result.url)
+            // No info hash anywhere → nothing any resolver can act on.
+            // (Returned as a torrent row with no hash it is neither playable
+            // nor resolvable and the merge drops it; make that explicit.)
+            let hash = result.infoHash ?? parsed.infoHash
+            let stream = Stream(
+                name: result.provider ?? scraperName,
+                title: title,
+                description: detailParts.isEmpty ? nil : detailParts.joined(separator: " · "),
+                url: nil,
+                infoHash: hash,
+                sources: parsed.trackers.isEmpty ? nil : parsed.trackers.map { "tracker:" + $0 },
+                behaviorHints: hints
+            )
+            return StreamEntry(addonName: result.provider ?? scraperName, stream: stream)
+        }
         let stream = Stream(
             name: result.provider ?? scraperName,
             title: title,
             description: detailParts.isEmpty ? nil : detailParts.joined(separator: " · "),
             url: result.url,
             infoHash: result.infoHash,
-            behaviorHints: nil
+            behaviorHints: hints
         )
         return StreamEntry(addonName: result.provider ?? scraperName, stream: stream)
+    }
+
+    /// `xt=urn:btih:<hash>` plus `tr=` trackers out of a magnet URI.
+    nonisolated private static func parseMagnet(_ magnet: String) -> (infoHash: String?, trackers: [String]) {
+        guard let comps = URLComponents(string: magnet) else { return (nil, []) }
+        var hash: String?
+        var trackers: [String] = []
+        for item in comps.queryItems ?? [] {
+            guard let value = item.value, !value.isEmpty else { continue }
+            if item.name == "xt", value.lowercased().hasPrefix("urn:btih:") {
+                hash = String(value.dropFirst("urn:btih:".count)).lowercased()
+            } else if item.name == "tr" {
+                trackers.append(value)
+            }
+        }
+        return (hash, trackers)
     }
 
     // MARK: Sync (repo list only)
@@ -256,11 +347,11 @@ final class PluginStore: ObservableObject {
     private func notifyLocalChange() { if !applyingRemote { onLocalChange?() } }
 
     private func load() {
-        if let data = UserDefaults.standard.data(forKey: Self.reposKey),
+        if let data = ProfileScopedDefaults.data(Self.reposKey, feature: Self.feature, profileID),
            let decoded = try? JSONDecoder().decode([PluginRepository].self, from: data) {
             repositories = decoded
         }
-        if let data = UserDefaults.standard.data(forKey: Self.scrapersKey),
+        if let data = ProfileScopedDefaults.data(Self.scrapersKey, feature: Self.feature, profileID),
            let decoded = try? JSONDecoder().decode([ScraperInfo].self, from: data) {
             scrapers = decoded
         }
@@ -268,10 +359,12 @@ final class PluginStore: ObservableObject {
 
     private func save() {
         if let data = try? JSONEncoder().encode(repositories) {
-            UserDefaults.standard.set(data, forKey: Self.reposKey)
+            UserDefaults.standard.set(
+                data, forKey: ProfileScopedDefaults.writeKey(Self.reposKey, feature: Self.feature, profileID))
         }
         if let data = try? JSONEncoder().encode(scrapers) {
-            UserDefaults.standard.set(data, forKey: Self.scrapersKey)
+            UserDefaults.standard.set(
+                data, forKey: ProfileScopedDefaults.writeKey(Self.scrapersKey, feature: Self.feature, profileID))
         }
     }
 }

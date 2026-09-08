@@ -84,7 +84,9 @@ enum CloudLibraryService {
         let resp = try JSONDecoder().decode(PremiumizeListAll.self, from: data)
         return (resp.files ?? []).map {
             CloudFile(id: $0.id ?? UUID().uuidString, name: $0.name ?? "File",
-                      size: $0.size.map(Int64.init), directURL: $0.stream_link ?? $0.link)
+                      // `Int64(Double)` traps on non-finite / out-of-range input.
+                      size: $0.size.flatMap { $0.isFinite && $0 >= 0 && $0 < 9.2e18 ? Int64($0) : nil },
+                      directURL: $0.stream_link ?? $0.link)
         }
     }
 

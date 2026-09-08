@@ -182,6 +182,45 @@ enum StremioAccountService {
         return StremioUser(email: u.email, avatar: u.avatar)
     }
 
+    /// Cheap change detection. `datastoreMeta` returns only ids and
+    /// modification times for the collection, so a signature of it says
+    /// whether the full `datastoreGet` (the whole library, potentially
+    /// megabytes) is worth fetching at all. The result is a list of
+    /// `[id, mtime]` pairs; objects with `_id`/`_mtime` are accepted too.
+    static func fetchLibrarySignature(authKey: String) async throws -> String {
+        let (data, _) = try await post("/api/datastoreMeta",
+            ["authKey": authKey, "collection": "libraryItem"])
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw StremioAccountError.server("Unexpected datastoreMeta response")
+        }
+        if let error = root["error"] as? [String: Any], let message = error["message"] as? String, !message.isEmpty {
+            throw StremioAccountError.server(message)
+        }
+        guard let result = root["result"] as? [Any] else {
+            throw StremioAccountError.server("datastoreMeta returned no result")
+        }
+        var pairs: [String] = []
+        pairs.reserveCapacity(result.count)
+        for entry in result {
+            if let pair = entry as? [Any], pair.count >= 2 {
+                pairs.append("\(pair[0])|\(pair[1])")
+            } else if let dict = entry as? [String: Any] {
+                let id = dict["_id"] ?? dict["id"] ?? ""
+                let mtime = dict["_mtime"] ?? dict["mtime"] ?? ""
+                pairs.append("\(id)|\(mtime)")
+            }
+        }
+        // The `[[id, mtime]]` shape is assumed from stremio-core. A non-empty
+        // result whose entries match neither form yields a CONSTANT signature,
+        // and "unchanged" every tick would silence pulls for the session —
+        // fail safe by throwing, which the caller treats as "do a full pull".
+        guard result.isEmpty || !pairs.isEmpty else {
+            throw StremioAccountError.server("datastoreMeta shape not recognised")
+        }
+        pairs.sort()
+        return "\(pairs.count):" + StremioSync.fnv64(pairs.joined(separator: "\n"))
+    }
+
     /// The full `libraryItem` datastore (library + progress + watched, all in one).
     static func fetchLibrary(authKey: String) async throws -> [StremioLibraryItem] {
         struct Resp: Decodable { let result: [StremioLibraryItem]? }
@@ -342,6 +381,7 @@ struct StremioLibraryItem: Decodable {
     let removed: Bool?
     let temp: Bool?
     let ctime: String?
+    let mtime: String?
     let state: State?
 
     struct State: Decodable {
@@ -397,10 +437,11 @@ struct StremioLibraryItem: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case id = "_id", type, name, poster, removed, temp
-        case ctime = "_ctime", state
+        case ctime = "_ctime", mtime = "_mtime", state
     }
 
     var ctimeDate: Date? { StremioDate.parse(ctime) }
+    var mtimeDate: Date? { StremioDate.parse(mtime) }
 }
 
 /// Lenient ISO-8601 parser (Stremio timestamps carry fractional seconds).
@@ -428,6 +469,18 @@ enum StremioSync {
     /// written back from here, untouched.
     private(set) static var lastPulledStates: [String: [String: Any]] = [:]
 
+    /// What the last pull knew about each item beyond its playback state, so
+    /// a row rebuilt here (a Continue Watching clear for a title not in the
+    /// local library) keeps the item's real type/name/temp instead of
+    /// replacing a saved series with a nameless `temp` movie stub.
+    struct PulledItemMeta {
+        let type: String
+        let name: String
+        let temp: Bool
+        let removed: Bool
+    }
+    private(set) static var lastPulledItemMeta: [String: PulledItemMeta] = [:]
+
     /// Pull the Stremio library and merge it into Orivio's Library / Continue
     /// Watching / Watched stores. One-way (Stremio → Orivio); non-destructive
     /// (`reconcile: false`) so it never deletes local items. Returns a summary.
@@ -453,6 +506,14 @@ enum StremioSync {
         var continueWatching: [WatchProgress] = []
         var watchedItems: [WatchedItem] = []
         var pulledStates: [String: [String: Any]] = [:]
+        var pulledMeta: [String: PulledItemMeta] = [:]
+        // Titles Stremio marks `removed` that this device still holds as
+        // saved. Skipping them from `saved` was never enough: the additive
+        // merge kept the local copy, and the next push wrote it back with
+        // `removed: false` — a title removed in Stremio came back on every
+        // launch. Only a removal NEWER than the local add counts; an older one
+        // means the user re-saved it here afterwards.
+        var removedRemotely: [SavedLibraryItem] = []
         let clearedAt = WatchHistoryClearState.clearedAt
         // Import accounting, so "nothing came across" can be answered with
         // numbers instead of a guess.
@@ -462,6 +523,7 @@ enum StremioSync {
         for li in items {
             let removed = li.removed ?? false
             let temp = li.temp ?? false
+            pulledMeta[li.id] = PulledItemMeta(type: li.type, name: li.name, temp: temp, removed: removed)
 
             // Saved Library = explicitly added (not removed, not a temp progress-only row).
             if !removed && !temp {
@@ -469,6 +531,9 @@ enum StremioSync {
                     id: li.id, type: li.type, name: li.name,
                     poster: li.poster, addedAt: li.ctimeDate ?? Date()
                 ))
+            } else if removed, let local = library.item(id: li.id, type: li.type),
+                      let removedAt = li.mtimeDate, removedAt > local.addedAt {
+                removedRemotely.append(local)
             }
 
             guard let st = li.state else { continue }
@@ -527,6 +592,12 @@ enum StremioSync {
         }
 
         lastPulledStates = pulledStates
+        lastPulledItemMeta = pulledMeta
+        for local in removedRemotely {
+            // A real removal: the account hub and the trackers hear about it
+            // exactly as if the user had removed it here.
+            library.remove(id: local.id, type: local.type)
+        }
 
         let addonStates = addonDescriptors
             .filter { !$0.transportUrl.isEmpty }
@@ -535,8 +606,11 @@ enum StremioSync {
         if !addonStates.isEmpty {
             _ = await addonManager.applyRemote(addons: addonStates, reconcile: false)
         }
+        let playing = await MainActor.run { OrivioSyncManager.playbackActive }
         if !saved.isEmpty {
-            saved = await enrichLibraryItems(saved, addonManager: addonManager)
+            // Metadata lookups are a run of add-on requests: skipped while a
+            // stream plays, filled in by the next idle pass.
+            if !playing { saved = await enrichLibraryItems(saved, addonManager: addonManager) }
             library.mergeRemote(saved, reconcile: false)
         }
         OrivioSyncDiagnostics.record(
@@ -547,7 +621,9 @@ enum StremioSync {
         )
         if !continueWatching.isEmpty {
             let before = continueWatching.count
-            continueWatching = await enrichContinueWatching(continueWatching, addonManager: addonManager)
+            if !playing {
+                continueWatching = await enrichContinueWatching(continueWatching, addonManager: addonManager)
+            }
             if continueWatching.count != before {
                 OrivioSyncDiagnostics.record(
                     .info, area: "Stremio",
@@ -573,6 +649,8 @@ enum StremioSync {
         /// False when the library PUT failed. The cleared-progress ids ride in
         /// that payload, so on failure they must stay queued for the next run.
         let libraryPushed: Bool
+        /// Rows actually sent (zero when nothing had changed).
+        let changedRows: Int
     }
 
     @MainActor
@@ -581,42 +659,114 @@ enum StremioSync {
                              library: LibraryStore,
                              progress: ProgressStore,
                              watched: WatchedStore,
-                             clearedProgressIDs: Set<String> = []) async -> PushOutcome {
+                             clearedProgressIDs: Set<String> = [],
+                             removedLibraryItems: [StremioSyncManager.PendingLibraryRemoval] = []) async -> PushOutcome {
         var warnings: [String] = []
         var libraryPushed = true
+        let playing = await MainActor.run { OrivioSyncManager.playbackActive }
 
-        do {
-            try await StremioAccountService.setAddonCollection(authKey: authKey, addons: addonManager.addons)
-        } catch {
-            warnings.append("add-ons")
-            OrivioSyncDiagnostics.record(.warning, area: "Stremio", "Add-on push to Stremio failed: \(error.localizedDescription)")
+        // Add-ons: `addonCollectionSet` replaces the account's whole list, so
+        // send it only when the list actually changed since the last push.
+        // What actually goes on the wire: local ORDER (the user's priority,
+        // which `setAddonCollection` sends as-is) and only resolved manifests
+        // (placeholders are dropped from the payload). A sorted set of URLs
+        // missed a reorder and a placeholder that resolved after its push.
+        let addonSignature = addonManager.addons
+            .filter { !$0.manifest.isPlaceholder }
+            .map(\.manifestURL)
+            .joined(separator: "\n")
+        var addonsSent = false
+        if addonSignature != lastPushedAddonSignature {
+            do {
+                try await StremioAccountService.setAddonCollection(authKey: authKey, addons: addonManager.addons)
+                lastPushedAddonSignature = addonSignature
+                addonsSent = true
+            } catch {
+                warnings.append("add-ons")
+                OrivioSyncDiagnostics.record(.warning, area: "Stremio", "Add-on push to Stremio failed: \(error.localizedDescription)")
+            }
         }
 
         let serviceProgress = progress.serviceBackedForSync()
-        let savedLibrary = await enrichLibraryItems(library.allForSync(), addonManager: addonManager)
-        if savedLibrary != library.allForSync() { library.mergeRemote(savedLibrary, reconcile: false) }
+        let rawLibrary = library.allForSync()
+        let savedLibrary = playing ? rawLibrary : await enrichLibraryItems(rawLibrary, addonManager: addonManager)
+        if savedLibrary != rawLibrary { library.mergeRemote(savedLibrary, reconcile: false) }
         let items = makeLibraryPutPayload(
             library: savedLibrary,
             progress: serviceProgress,
             watched: watched.allForSync(),
-            clearedProgressIDs: clearedProgressIDs
+            clearedProgressIDs: clearedProgressIDs,
+            removedLibraryItems: removedLibraryItems
         )
-        do {
-            try await StremioAccountService.putLibrary(authKey: authKey, items: items)
-        } catch {
-            libraryPushed = false
-            warnings.append("library")
-            OrivioSyncDiagnostics.record(.warning, area: "Stremio", "Library push to Stremio failed: \(error.localizedDescription)")
+        // Only rows whose content changed since the last successful put. The
+        // whole library used to go up every thirty seconds whether or not a
+        // byte of it had moved; now a film in progress is a one-row put.
+        var changed: [[String: Any]] = []
+        var changedHashes: [String: String] = [:]
+        for row in items {
+            guard let id = row["_id"] as? String else { continue }
+            let hash = rowHash(row)
+            if lastPushedRowHashes[id] != hash {
+                changed.append(row)
+                changedHashes[id] = hash
+            }
+        }
+        if !changed.isEmpty {
+            do {
+                try await StremioAccountService.putLibrary(authKey: authKey, items: changed)
+                lastPushedRowHashes.merge(changedHashes) { $1 }
+            } catch {
+                libraryPushed = false
+                warnings.append("library")
+                OrivioSyncDiagnostics.record(.warning, area: "Stremio", "Library push to Stremio failed: \(error.localizedDescription)")
+            }
         }
 
-        let summary = "Pushed combined \(addonManager.addons.count) add-ons · \(library.allForSync().count) library · \(serviceProgress.count) in-progress · \(watched.allForSync().count) watched"
+        let summary: String
+        if changed.isEmpty && !addonsSent {
+            summary = "Stremio up to date"
+        } else {
+            summary = "Pushed \(changed.count) changed of \(items.count) rows"
+                + (addonsSent ? " · \(addonManager.addons.count) add-ons" : "")
+                + " (\(library.allForSync().count) library · \(serviceProgress.count) in-progress · \(watched.allForSync().count) watched)"
+        }
         guard !warnings.isEmpty else {
-            return PushOutcome(summary: summary, libraryPushed: libraryPushed)
+            return PushOutcome(summary: summary, libraryPushed: libraryPushed, changedRows: changed.count)
         }
         return PushOutcome(
             summary: "\(summary) · Stremio push failed for \(warnings.joined(separator: ", "))",
-            libraryPushed: libraryPushed
+            libraryPushed: libraryPushed,
+            changedRows: changed.count
         )
+    }
+
+    /// What this device last sent, so an unchanged row is not re-sent every
+    /// tick. In memory only: a relaunch pushes everything once, as before.
+    private(set) static var lastPushedRowHashes: [String: String] = [:]
+    private(set) static var lastPushedAddonSignature: String?
+
+    /// A different Stremio account signed in: nothing sent before applies.
+    static func resetPushCache() {
+        lastPushedRowHashes = [:]
+        lastPushedAddonSignature = nil
+        lastPulledStates = [:]
+        lastPulledItemMeta = [:]
+    }
+
+    private static func rowHash(_ row: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else { return UUID().uuidString }
+        return fnv64(text)
+    }
+
+    /// FNV-1a, stable across launches (unlike `hashValue`).
+    static func fnv64(_ text: String) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return String(hash, radix: 16)
     }
 
     private static func metadataTypes(for type: String, id: String) -> [String] {
@@ -683,9 +833,34 @@ enum StremioSync {
         library: [SavedLibraryItem],
         progress: [WatchProgress],
         watched: [WatchedItem],
-        clearedProgressIDs: Set<String> = []
+        clearedProgressIDs: Set<String> = [],
+        removedLibraryItems: [StremioSyncManager.PendingLibraryRemoval] = []
     ) -> [[String: Any]] {
         var rows: [String: [String: Any]] = [:]
+
+        // Titles removed from the library HERE. `datastorePut` cannot express
+        // absence, so a removal has to be written as the item with
+        // `removed: true` — otherwise the account never hears about it and
+        // its own copy comes straight back on the next pull.
+        let stillSaved = Set(library.map(\.id))
+        for removal in removedLibraryItems where !stillSaved.contains(removal.id) {
+            let now = isoString(Date())
+            var row: [String: Any] = [
+                "_id": removal.id,
+                "_ctime": now,
+                "_mtime": now,
+                "id": removal.id,
+                "type": removal.type,
+                "name": removal.name,
+                "title": removal.name,
+                "removed": true,
+                "temp": false
+            ]
+            // Keep Stremio's own playback state: un-saving a title is not
+            // clearing its resume point (`datastorePut` replaces the item).
+            if let state = lastPulledStates[removal.id] { row["state"] = state }
+            rows[removal.id] = row
+        }
 
         for item in library {
             let now = isoString(item.addedAt)
@@ -755,13 +930,15 @@ enum StremioSync {
         // unsave the title. Applied before the watched pass, which may then
         // legitimately overwrite the state with a "watched" marker.
         for id in clearedProgressIDs {
+            let known = lastPulledItemMeta[id]
             var row = rows[id] ?? [
                 "_id": id,
                 "_ctime": isoString(Date()),
                 "id": id,
-                "type": "movie",
-                "removed": false,
-                "temp": true
+                "type": known?.type ?? "movie",
+                "name": known?.name ?? "",
+                "removed": known?.removed ?? false,
+                "temp": known?.temp ?? true
             ]
             row["_mtime"] = isoString(Date())
             row["state"] = [

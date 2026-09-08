@@ -87,6 +87,34 @@ struct HomePresentationSnapshot: Codable, Equatable {
     var catalogTypeSuffixEnabled = true
     var showFullReleaseDate = true
     var detailPageTrailerButtonEnabled = true
+    var showFeaturedBar = true
+}
+
+/// Tolerant decoding (in an extension so the memberwise init survives): a blob
+/// written before a field existed decodes with that field's default instead of
+/// failing wholesale and resetting every presentation pref on app update.
+extension HomePresentationSnapshot {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = HomePresentationSnapshot()
+        homeLayout = (try? c.decode(HomeLayout.self, forKey: .homeLayout)) ?? d.homeLayout
+        landscapePosters = (try? c.decode(Bool.self, forKey: .landscapePosters)) ?? d.landscapePosters
+        fullscreenHero = (try? c.decode(Bool.self, forKey: .fullscreenHero)) ?? d.fullscreenHero
+        posterSize = (try? c.decode(PosterSize.self, forKey: .posterSize)) ?? d.posterSize
+        showPosterLabels = (try? c.decode(Bool.self, forKey: .showPosterLabels)) ?? d.showPosterLabels
+        continueWatchingSortMode = (try? c.decode(ContinueWatchingSortMode.self, forKey: .continueWatchingSortMode)) ?? d.continueWatchingSortMode
+        nextUpFromFurthestEpisode = (try? c.decode(Bool.self, forKey: .nextUpFromFurthestEpisode)) ?? d.nextUpFromFurthestEpisode
+        showUnairedNextUp = (try? c.decode(Bool.self, forKey: .showUnairedNextUp)) ?? d.showUnairedNextUp
+        useEpisodeThumbnailsInCw = (try? c.decode(Bool.self, forKey: .useEpisodeThumbnailsInCw)) ?? d.useEpisodeThumbnailsInCw
+        blurUnwatchedEpisodes = (try? c.decode(Bool.self, forKey: .blurUnwatchedEpisodes)) ?? d.blurUnwatchedEpisodes
+        blurContinueWatchingNextUp = (try? c.decode(Bool.self, forKey: .blurContinueWatchingNextUp)) ?? d.blurContinueWatchingNextUp
+        posterCornerRadius = (try? c.decode(Int.self, forKey: .posterCornerRadius)) ?? d.posterCornerRadius
+        catalogAddonNameEnabled = (try? c.decode(Bool.self, forKey: .catalogAddonNameEnabled)) ?? d.catalogAddonNameEnabled
+        catalogTypeSuffixEnabled = (try? c.decode(Bool.self, forKey: .catalogTypeSuffixEnabled)) ?? d.catalogTypeSuffixEnabled
+        showFullReleaseDate = (try? c.decode(Bool.self, forKey: .showFullReleaseDate)) ?? d.showFullReleaseDate
+        detailPageTrailerButtonEnabled = (try? c.decode(Bool.self, forKey: .detailPageTrailerButtonEnabled)) ?? d.detailPageTrailerButtonEnabled
+        showFeaturedBar = (try? c.decode(Bool.self, forKey: .showFeaturedBar)) ?? d.showFeaturedBar
+    }
 }
 
 // MARK: - Sync payload (matches Android's home-catalog settings_json exactly)
@@ -174,6 +202,11 @@ final class HomeCatalogSettingsStore: ObservableObject {
     /// Show the title label beneath poster cards.
     @Published var showPosterLabels: Bool = true {
         didSet { guard showPosterLabels != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// The inline "Featured" hero bar between Continue Watching and the
+    /// catalog rows. Off removes it from Home entirely.
+    @Published var showFeaturedBar: Bool = true {
+        didSet { guard showFeaturedBar != oldValue else { return }; save(); notifyPresentationChange() }
     }
     /// Continue Watching row ordering.
     @Published var continueWatchingSortMode: ContinueWatchingSortMode = .recentlyWatched {
@@ -501,6 +534,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         var catalogTypeSuffixEnabled: Bool?
         var showFullReleaseDate: Bool?
         var detailPageTrailerButtonEnabled: Bool?
+        var showFeaturedBar: Bool?
     }
 
     private func notifyLocalChange() {
@@ -531,7 +565,8 @@ final class HomeCatalogSettingsStore: ObservableObject {
             catalogAddonNameEnabled: catalogAddonNameEnabled,
             catalogTypeSuffixEnabled: catalogTypeSuffixEnabled,
             showFullReleaseDate: showFullReleaseDate,
-            detailPageTrailerButtonEnabled: detailPageTrailerButtonEnabled
+            detailPageTrailerButtonEnabled: detailPageTrailerButtonEnabled,
+            showFeaturedBar: showFeaturedBar
         )
     }
 
@@ -556,6 +591,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         catalogTypeSuffixEnabled = d.catalogTypeSuffixEnabled
         showFullReleaseDate = d.showFullReleaseDate
         detailPageTrailerButtonEnabled = d.detailPageTrailerButtonEnabled
+        showFeaturedBar = d.showFeaturedBar
     }
 
     /// Apply presentation prefs pulled from the account without echoing back up.
@@ -578,13 +614,21 @@ final class HomeCatalogSettingsStore: ObservableObject {
         catalogTypeSuffixEnabled = s.catalogTypeSuffixEnabled
         showFullReleaseDate = s.showFullReleaseDate
         detailPageTrailerButtonEnabled = s.detailPageTrailerButtonEnabled
+        showFeaturedBar = s.showFeaturedBar
         suppressChange = false
         save()
     }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode(Persisted.self, from: data) else {
+        let raw = UserDefaults.standard.data(forKey: storageKey)
+        let decodedBlob = raw.flatMap { try? JSONDecoder().decode(Persisted.self, from: $0) }
+        // A blob that exists but no longer decodes (a newer build's enum case,
+        // say) is preserved before the defaults below get written over it on
+        // this profile's first save.
+        if let raw, decodedBlob == nil {
+            UnreadableBlobGuard.preserve(raw, key: storageKey)
+        }
+        guard let decoded = decodedBlob else {
             // A profile with no saved blob must reset EVERY field, not just
             // order/disabled/titles/hideUnreleased/homeLayout: the presentation
             // prefs used to keep the previous profile's values and then got
@@ -621,6 +665,7 @@ final class HomeCatalogSettingsStore: ObservableObject {
         catalogTypeSuffixEnabled = decoded.catalogTypeSuffixEnabled ?? true
         showFullReleaseDate = decoded.showFullReleaseDate ?? true
         detailPageTrailerButtonEnabled = decoded.detailPageTrailerButtonEnabled ?? true
+        showFeaturedBar = decoded.showFeaturedBar ?? true
         suppressChange = false
     }
 
@@ -645,7 +690,8 @@ final class HomeCatalogSettingsStore: ObservableObject {
             catalogAddonNameEnabled: catalogAddonNameEnabled,
             catalogTypeSuffixEnabled: catalogTypeSuffixEnabled,
             showFullReleaseDate: showFullReleaseDate,
-            detailPageTrailerButtonEnabled: detailPageTrailerButtonEnabled
+            detailPageTrailerButtonEnabled: detailPageTrailerButtonEnabled,
+            showFeaturedBar: showFeaturedBar
         )
         guard let data = try? JSONEncoder().encode(persisted) else { return }
         UserDefaults.standard.set(data, forKey: storageKey)

@@ -58,7 +58,13 @@ final class ImageCache: @unchecked Sendable {
         let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         diskURL = caches.appendingPathComponent("orivio-images", isDirectory: true)
         try? fm.createDirectory(at: diskURL, withIntermediateDirectories: true)
-        ioQueue.async(flags: .barrier) { [weak self] in self?.trimDisk() }
+        // The LRU trim walks every cached file's attributes under a BARRIER —
+        // thousands of files on a full 512 MB cache — and it used to run at
+        // launch, exactly when the first screenful of posters is trying to
+        // read from this same queue. Deferred past first paint; a trim is
+        // housekeeping, and a cache a little over budget for ten seconds
+        // costs nothing.
+        ioQueue.asyncAfter(deadline: .now() + 10, flags: .barrier) { [weak self] in self?.trimDisk() }
         // Under real memory pressure, decoded pixels are the cheapest thing to
         // give back (they re-decode from disk on demand) — dropping them here
         // is what keeps tvOS from jetsamming the whole app instead.
@@ -318,7 +324,12 @@ final class ImageCache: @unchecked Sendable {
     /// the viewer is looking at, not something below the fold.
     func warm(urls: [String]) {
         var seen = Set<String>()
-        let unique = urls.filter { seen.insert($0).inserted }.prefix(8)
+        // Eight parallel full-size backdrop downloads at user-initiated
+        // priority land at the same instant as the first poster grid; on the
+        // HD's older Wi-Fi (and the 3 GB box's decode budget) that contention
+        // is visible, so the older tiers warm fewer.
+        let limit = PerformanceProfile.isLowPower ? 3 : (PerformanceProfile.isMidPower ? 5 : 8)
+        let unique = urls.filter { seen.insert($0).inserted }.prefix(limit)
         for urlString in unique {
             guard let url = URL(string: urlString) else { continue }
             Task.detached(priority: .userInitiated) { [weak self] in
@@ -428,9 +439,29 @@ struct RemoteImage: View {
     /// identical, but a grid of cards stops decoding full "original" TMDB art
     /// it can never show. `nil` (heroes/backdrops) = device framebuffer cap.
     var maxDimension: CGFloat? = nil
+    /// Hard decode cap in PIXELS on the longest side, for full-bleed art that
+    /// has no point size to derive from (see `PerformanceProfile.backdropPixelCap`).
+    var maxPixels: CGFloat? = nil
 
     @State private var image: UIImage?
     @State private var shownKey: String?
+
+    init(url: String?, contentMode: ContentMode = .fill, alignment: Alignment = .center,
+         maxDimension: CGFloat? = nil, maxPixels: CGFloat? = nil) {
+        self.url = url
+        self.contentMode = contentMode
+        self.alignment = alignment
+        self.maxDimension = maxDimension
+        self.maxPixels = maxPixels
+        // A memory-cache hit is on screen from the FIRST frame, with no
+        // placeholder and no fade. Without this a poster inside a view that
+        // slides in (the player's info sheet) appeared a beat after its card,
+        // fading in over a black box while the card was still moving.
+        if let url, let cached = ImageCache.shared.image(for: Self.memoryKey(url, maxDimension: maxDimension, maxPixels: maxPixels)) {
+            _image = State(initialValue: cached)
+            _shownKey = State(initialValue: url)
+        }
+    }
 
     var body: some View {
         Color.clear.overlay(alignment: alignment) {
@@ -448,9 +479,24 @@ struct RemoteImage: View {
         .task(id: url) { await load(url) }
     }
 
-    /// Pixel budget for the decode (longest side), from the rendered size.
+    /// Pixel budget for the decode (longest side), from the rendered size
+    /// and/or an explicit pixel cap.
     private var pixelBudget: CGFloat? {
-        maxDimension.map { $0 * UIScreen.main.scale * 1.5 }
+        Self.pixelBudget(maxDimension: maxDimension, maxPixels: maxPixels)
+    }
+
+    private static func pixelBudget(maxDimension: CGFloat?, maxPixels: CGFloat?) -> CGFloat? {
+        let fromPoints = maxDimension.map { $0 * UIScreen.main.scale * 1.5 }
+        switch (fromPoints, maxPixels) {
+        case (let a?, let b?): return min(a, b)
+        case (let a?, nil): return a
+        case (nil, let b?): return b
+        case (nil, nil): return nil
+        }
+    }
+
+    private static func memoryKey(_ value: String, maxDimension: CGFloat?, maxPixels: CGFloat?) -> String {
+        pixelBudget(maxDimension: maxDimension, maxPixels: maxPixels).map { "\(value)#\(Int($0))" } ?? value
     }
 
     /// Memory-cache key: the URL plus the budget bucket, so a small card decode
@@ -1652,9 +1698,14 @@ struct OrivioEmptyState: View {
     let icon: String
     let title: String
     let message: String
+    /// Hold focus while this is the only thing on a PUSHED screen: with
+    /// nothing focusable, Menu never reaches `.onExitCommand` and suspends
+    /// the app instead of popping the page (see FocusAnchor).
+    var holdsFocus: Bool = false
 
     var body: some View {
         VStack(spacing: OrivioSpacing.md) {
+            if holdsFocus { FocusAnchor() }
             Image(systemName: icon)
                 .font(.system(size: 60))
                 .foregroundStyle(theme.palette.textTertiary)

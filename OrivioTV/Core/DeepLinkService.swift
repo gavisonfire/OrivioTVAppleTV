@@ -15,6 +15,27 @@ enum DeepLink: Equatable {
     case externalPlaybackFailed(message: String?)
 }
 
+/// The URL scheme an external player must call back on to reach THIS install.
+///
+/// Not `orivio`: that scheme is declared by every build of this app that has
+/// ever been sideloaded onto the box (the user's had three), and tvOS resolves
+/// a shared scheme to whichever one it likes — Infuse's x-success kept opening
+/// NuvioTVOS instead of coming back here. The second URL type in Info.plist is
+/// the bundle id, which is unique per install; read it from the Info.plist
+/// rather than from `Bundle.main.bundleIdentifier`, because the SYSTEM
+/// registers what the plist says and a re-signing tool that rewrites the id
+/// leaves the plist's scheme as the one that actually routes.
+enum AppCallbackScheme {
+    static let value: String = {
+        let fallback = "orivio"
+        guard let types = Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]]
+        else { return fallback }
+        let schemes = types.flatMap { ($0["CFBundleURLSchemes"] as? [String]) ?? [] }
+        // The shared ones are the generic names; anything else is ours alone.
+        return schemes.first { $0 != "orivio" && $0 != "stremio" } ?? fallback
+    }()
+}
+
 enum DeepLinkService {
     static func parse(_ url: URL) -> DeepLink? {
         let scheme = (url.scheme ?? "").lowercased()
@@ -29,7 +50,10 @@ enum DeepLinkService {
         // Both accepted: "orivio" is current, "nuvio" stays valid for links
         // saved before the rename and for external-player callbacks issued by
         // an older build that is still mid-handoff.
-        guard scheme == "orivio" || scheme == "nuvio" else {
+        // …and the install-unique callback scheme, which every OUTGOING path
+        // (Infuse x-success, the Top Shelf extension) already uses.
+        guard scheme == "orivio" || scheme == "nuvio"
+                || scheme == AppCallbackScheme.value.lowercased() else {
             // A bare https manifest link also installs.
             if scheme == "https", url.absoluteString.lowercased().hasSuffix("manifest.json") {
                 return .addonInstall(url: url.absoluteString)

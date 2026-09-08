@@ -15,25 +15,41 @@ final class LiveTVSettingsStore: ObservableObject {
     @Published var countryCode: String { didSet { UserDefaults.standard.set(countryCode, forKey: Self.countryKey) } }
     /// ISO-639-3 lowercase (iptv-org language file), "" = all.
     @Published var languageCode: String { didSet { UserDefaults.standard.set(languageCode, forKey: Self.langKey) } }
+    /// User-supplied M3U playlist URL. When set (non-blank), it REPLACES the
+    /// built-in iptv-org source outright — no merging, and the location /
+    /// language filters don't apply (those are paths into iptv-org's playlist
+    /// tree, meaningless against someone else's server). Cleared = the
+    /// built-in list is right back; nothing about it is forgotten.
+    @Published var customPlaylistURL: String { didSet { UserDefaults.standard.set(customPlaylistURL, forKey: Self.customURLKey) } }
 
     private static let enabledKey = "orivio.livetv.enabled.v1"
     private static let countryKey = "orivio.livetv.country.v1"
     private static let langKey = "orivio.livetv.language.v1"
+    private static let customURLKey = "orivio.livetv.customurl.v1"
 
     private init() {
         // Default ON (the tab ships enabled); only an explicit false hides it.
         enabled = (UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool) ?? true
         countryCode = UserDefaults.standard.string(forKey: Self.countryKey) ?? ""
         languageCode = UserDefaults.standard.string(forKey: Self.langKey) ?? ""
+        customPlaylistURL = UserDefaults.standard.string(forKey: Self.customURLKey) ?? ""
     }
 
     static let base = "https://iptv-org.github.io/iptv"
 
-    /// Playlist to load. LANGUAGE wins over location: a preferred language means
+    /// Whether a custom playlist is set and therefore replaces the built-in one.
+    var usesCustomPlaylist: Bool {
+        !customPlaylistURL.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// Playlist to load. A CUSTOM playlist wins over everything — that's its
+    /// contract: adding one takes over from the built-in list entirely.
+    /// Otherwise LANGUAGE wins over location: a preferred language means
     /// "only channels in that language, wherever they're from" — so a US viewer
     /// who prefers English still sees BBC (English/UK) but not Al Majd
     /// (Arabic/Saudi). Location matters only when no language is chosen.
     var primaryPlaylistURL: String {
+        if usesCustomPlaylist { return customPlaylistURL.trimmingCharacters(in: .whitespaces) }
         if !languageCode.isEmpty { return "\(Self.base)/languages/\(languageCode).m3u" }
         if !countryCode.isEmpty { return "\(Self.base)/countries/\(countryCode).m3u" }
         return M3UService.iptvOrgURL

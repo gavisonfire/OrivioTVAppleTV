@@ -33,18 +33,30 @@ final class LiveTVViewModel: ObservableObject {
         guard !loaded else { return }
         loaded = true
         await load(addonManager: addonManager)
+        // A load cancelled by `onDisappear` (tapping a channel mid-load) must
+        // not latch: it dropped the IPTV list for the rest of the visit.
+        if Task.isCancelled { loaded = false }
     }
 
+    /// Two settings changes in quick succession (country, then language)
+    /// start two overlapping loads; without this the slower, OLDER one could
+    /// publish last and the tab showed the playlist just moved away from.
+    private var loadGeneration = 0
+
     func load(addonManager: AddonManager) async {
+        loadGeneration += 1
+        let generation = loadGeneration
         isLoading = sections.isEmpty
 
         // 1) Add-on tv catalogs (fast) — show these first.
         let addonSections = await addonSections(addonManager)
+        guard generation == loadGeneration else { return }
         sections = addonSections
         if !addonSections.isEmpty { isLoading = false }
 
-        // 2) Embedded IPTV list — from the language/country playlist chosen in
-        // Settings → Live TV, so channels that don't apply are simply absent.
+        // 2) The IPTV list — the viewer's own playlist when one is set in
+        // Settings → Live TV (it replaces the built-in source entirely),
+        // otherwise the language/country iptv-org playlist chosen there.
         loadingIPTV = true
         let settings = LiveTVSettingsStore.shared
         var m3u = await M3UService.channels(from: settings.primaryPlaylistURL)
@@ -52,8 +64,10 @@ final class LiveTVViewModel: ObservableObject {
         // Safety net: if a language is chosen but its iptv-org playlist came
         // back empty (unsupported/unavailable), pull the global list and keep
         // only channels whose country is one where that language is spoken, so
-        // non-matching-language channels are still hidden.
-        if !settings.languageCode.isEmpty && m3u.isEmpty {
+        // non-matching-language channels are still hidden. Never for a custom
+        // playlist: falling back to the global list would resurrect the very
+        // built-in source the custom URL is meant to replace.
+        if !settings.usesCustomPlaylist && !settings.languageCode.isEmpty && m3u.isEmpty {
             let allowed = settings.countriesForLanguage(settings.languageCode)
             if !allowed.isEmpty {
                 let global = await M3UService.channels(from: M3UService.iptvOrgURL)
@@ -61,6 +75,7 @@ final class LiveTVViewModel: ObservableObject {
             }
         }
 
+        guard generation == loadGeneration else { return }
         sections = addonSections + m3uSections(m3u)
         loadingIPTV = false
         isLoading = false
@@ -119,6 +134,13 @@ enum ChannelSort: String, CaseIterable, Identifiable {
 }
 
 struct LiveTVView: View {
+    /// The grouped rows skipped the id dedupe the filtered grid does; addon
+    /// `tv` catalogs are not `deduplicatedByID()` and a repeated id crashes
+    /// the tvOS focus engine inside `ForEach`.
+    static func uniqueByID<S: Sequence>(_ channels: S) -> [LiveChannel] where S.Element == LiveChannel {
+        var seen = Set<String>()
+        return channels.filter { seen.insert($0.id).inserted }
+    }
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var addonManager: AddonManager
     @ObservedObject private var liveSettings = LiveTVSettingsStore.shared
@@ -137,7 +159,9 @@ struct LiveTVView: View {
     /// title opened the wrong row's channels.
     @State private var selectedGroupID = ""
 
-    private var settingsKey: String { "\(liveSettings.countryCode)|\(liveSettings.languageCode)" }
+    private var settingsKey: String {
+        "\(liveSettings.countryCode)|\(liveSettings.languageCode)|\(liveSettings.customPlaylistURL)"
+    }
 
     var body: some View {
         ZStack {
@@ -310,7 +334,7 @@ struct LiveTVView: View {
             }
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
-                    ForEach(section.channels.prefix(40)) { channel in
+                    ForEach(Self.uniqueByID(section.channels.prefix(40))) { channel in
                         Button { play(channel) } label: {
                             ChannelCard(channel: channel)
                         }

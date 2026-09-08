@@ -18,11 +18,12 @@ struct AutoLinkPreferences: Codable, Hashable {
     var maxSizeGB = 0.0
     /// Only pick a debrid-cached / instantly-playable source.
     var cachedOnly = false
-    /// Skip Dolby Vision sources when auto-picking. On by default: DV Profile 5
-    /// has no compatible base layer, so a source that isn't handled by the
-    /// (experimental) native-DV path plays back green/purple — better not to
-    /// auto-play one. Turn off to let auto-play choose DV sources.
-    var avoidDolbyVision = true
+    /// Skip Dolby Vision sources when auto-picking. OFF by default — the DV
+    /// pipeline handles profiles 5/8 (and 7 with conversion) now, so avoiding
+    /// DV out of the box just downgraded auto-picks for no reason. The toggle
+    /// stays for setups where DV still renders green/purple. Enabling the
+    /// selector also resets this to off (see ProfilesView.autoLinkSection).
+    var avoidDolbyVision = false
 
     init() {}
 
@@ -43,7 +44,7 @@ struct AutoLinkPreferences: Codable, Hashable {
         let decodedMaxSize = (try? c.decode(Double.self, forKey: .maxSizeGB)) ?? 0
         maxSizeGB = Self.sanitizedMaxSizeGB(decodedMaxSize)
         cachedOnly = (try? c.decode(Bool.self, forKey: .cachedOnly)) ?? false
-        avoidDolbyVision = (try? c.decode(Bool.self, forKey: .avoidDolbyVision)) ?? true
+        avoidDolbyVision = (try? c.decode(Bool.self, forKey: .avoidDolbyVision)) ?? false
     }
 }
 
@@ -189,6 +190,15 @@ final class ProfileStore: ObservableObject {
         activeProfileID = UserDefaults.standard.object(forKey: Self.activeKey) as? Int ?? 1
         if !profiles.contains(where: { $0.id == activeProfileID }) {
             activeProfileID = profiles.first?.id ?? 1
+            // Persist the correction: every other store reads the raw key at
+            // its own init, so an in-memory-only fix left the UI on one
+            // profile while progress/library/ratings read and wrote another's.
+            // NEVER when the profile LIST failed to decode: the synthesised
+            // "Profile 1" would then make every real id fail this test and a
+            // device on profile 3 would be reset to 1 for good.
+            if !listBlobUnreadable {
+                UserDefaults.standard.set(activeProfileID, forKey: Self.activeKey)
+            }
         }
     }
 
@@ -463,5 +473,124 @@ final class ProfileStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(profiles) else { return }
         UserDefaults.standard.set(data, forKey: Self.listKey)
         listBlobUnreadable = false
+    }
+}
+
+// MARK: - Per-profile UserDefaults scoping
+
+/// The one rule upstream Nuvio's whole profile system reduces to: every
+/// PERSONAL store's persistence container is suffixed per profile, and the
+/// bare (legacy) name is what the PRIMARY profile inherits. AddonManager
+/// introduced the pattern on tvOS; this helper is that pattern extracted so
+/// the other personal stores (plugins, debrid, player, TMDB, theme, badges)
+/// scope identically.
+///
+/// The legacy fallback applies to PROFILE 1 ALONE — the exact semantics of
+/// the Trakt pane's per-profile switch: splitting hands the existing
+/// device-wide state (logins included) to the primary profile, and every
+/// other profile starts FRESH, able to connect its own accounts and shape
+/// its own setup. Seeding every profile from the legacy value looked kinder
+/// but meant profile 2 opened TMDB/debrid settings onto profile 1's login,
+/// which is precisely what the split promises not to do.
+///
+/// Reads fall back only when the scoped key is ABSENT. Stores where "empty"
+/// is a legitimate user state must therefore WRITE an empty marker (empty
+/// string/data/array) on removal rather than deleting the scoped key —
+/// deletion would resurrect the legacy value for the primary profile.
+enum ProfileScopedDefaults {
+    /// Same key ProfileStore writes; read directly so stores are scoped
+    /// correctly from launch, before any manager wires them up.
+    static var activeProfileID: Int {
+        UserDefaults.standard.object(forKey: "orivio.profiles.active") as? Int ?? 1
+    }
+
+    static func key(_ base: String, _ profile: Int) -> String { "\(base).p\(profile)" }
+
+    // MARK: Separate vs shared
+
+    /// Each split store can be flipped between SEPARATE per-profile state and
+    /// ONE shared device-wide copy — the same choice the Trakt pane's
+    /// "Separate Trakt per profile" switch offers, generalized. Defaults ON
+    /// (separate): that's the behaviour the split shipped with. Shared mode
+    /// reads and writes the bare legacy keys, so turning a switch off always
+    /// falls straight back to the device-wide copy — and turning it back on
+    /// finds each profile's own state (or the seed) exactly where it was.
+    static func isSeparate(_ feature: String) -> Bool {
+        (UserDefaults.standard.object(forKey: separateFlagKey(feature)) as? Bool) ?? true
+    }
+
+    static func setSeparate(_ feature: String, _ on: Bool) {
+        UserDefaults.standard.set(on, forKey: separateFlagKey(feature))
+    }
+
+    private static func separateFlagKey(_ feature: String) -> String {
+        "orivio.perProfile.\(feature).v1"
+    }
+
+    /// The key WRITES go to under the feature's current mode.
+    static func writeKey(_ base: String, feature: String, _ profile: Int) -> String {
+        isSeparate(feature) ? key(base, profile) : base
+    }
+
+    /// Mode-aware reads: separate → scoped with the legacy seed fallback;
+    /// shared → the legacy key alone.
+    static func data(_ base: String, feature: String, _ profile: Int) -> Data? {
+        isSeparate(feature) ? data(base, profile) : UserDefaults.standard.data(forKey: base)
+    }
+
+    static func string(_ base: String, feature: String, _ profile: Int) -> String? {
+        isSeparate(feature) ? string(base, profile) : UserDefaults.standard.string(forKey: base)
+    }
+
+    static func bool(_ base: String, feature: String, _ profile: Int, default def: Bool = false) -> Bool {
+        isSeparate(feature) ? bool(base, profile, default: def)
+            : (UserDefaults.standard.object(forKey: base) as? Bool) ?? def
+    }
+
+    static func data(_ base: String, _ profile: Int) -> Data? {
+        if let scoped = UserDefaults.standard.data(forKey: key(base, profile)) {
+            // De-pollution, same as TraktStore's adopt cleanup: while every
+            // profile briefly seeded from the legacy value, incidental
+            // echo-writes (TMDB's enabled-flip on init, theme didSets on a
+            // switch, the hourly manifest refresh) persisted BYTE-IDENTICAL
+            // copies of the primary's state into other profiles' slots — so
+            // profile 2 opened TMDB onto profile 1's login. A copy that still
+            // exactly equals the legacy blob was never this profile's own;
+            // drop it once and start fresh. State a profile actually touched
+            // differs and is left alone.
+            if profile != 1, scoped == UserDefaults.standard.data(forKey: base) {
+                UserDefaults.standard.removeObject(forKey: key(base, profile))
+                return nil
+            }
+            return scoped
+        }
+        return profile == 1 ? UserDefaults.standard.data(forKey: base) : nil
+    }
+
+    static func string(_ base: String, _ profile: Int) -> String? {
+        if let scoped = UserDefaults.standard.string(forKey: key(base, profile)) { return scoped }
+        return profile == 1 ? UserDefaults.standard.string(forKey: base) : nil
+    }
+
+    static func bool(_ base: String, _ profile: Int, default def: Bool = false) -> Bool {
+        if let scoped = UserDefaults.standard.object(forKey: key(base, profile)) as? Bool { return scoped }
+        if profile == 1, let legacy = UserDefaults.standard.object(forKey: base) as? Bool { return legacy }
+        return def
+    }
+
+    /// Remove one profile's scoped copies (profile deletion).
+    static func forget(_ bases: [String], profile: Int) {
+        for base in bases { UserDefaults.standard.removeObject(forKey: key(base, profile)) }
+    }
+
+    /// Remove EVERY profile's scoped copies plus the legacy seed (account
+    /// switch, for credential-bearing stores).
+    static func forgetAll(_ bases: [String]) {
+        for base in bases {
+            UserDefaults.standard.removeObject(forKey: base)
+            for id in 1...ProfileStore.maxProfiles {
+                UserDefaults.standard.removeObject(forKey: key(base, id))
+            }
+        }
     }
 }

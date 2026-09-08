@@ -83,6 +83,19 @@ final class RatingsStore: ObservableObject {
         if changed { save() }
     }
 
+    /// Wipe every profile slot's ratings (account switch). No tracker hooks
+    /// fire: this retires the previous user's data, it is not an un-rate.
+    func clearAllProfiles() {
+        suppressChange = true
+        defer { suppressChange = false }
+        UserDefaults.standard.removeObject(forKey: Self.baseKey)
+        for id in 2...ProfileStore.maxProfiles {
+            UserDefaults.standard.removeObject(forKey: "\(Self.baseKey).p\(id)")
+        }
+        ratings = [:]
+        types = [:]
+    }
+
     func allForSync() -> [(metaID: String, type: String, rating: Int)] {
         ratings.map { ($0.key, types[$0.key] ?? "movie", $0.value) }
     }
@@ -92,8 +105,11 @@ final class RatingsStore: ObservableObject {
     private struct Persisted: Codable { var ratings: [String: Int]; var types: [String: String] }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let p = try? JSONDecoder().decode(Persisted.self, from: data) else { return }
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else { return }
+        guard let p = try? JSONDecoder().decode(Persisted.self, from: data) else {
+            UnreadableBlobGuard.preserve(data, key: storageKey)   // see ProgressStore
+            return
+        }
         ratings = p.ratings
         types = p.types
     }

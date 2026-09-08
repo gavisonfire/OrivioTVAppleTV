@@ -40,8 +40,12 @@ struct AddonManifest: Codable, Identifiable, Hashable {
         logo = (try? c.decodeIfPresent(String.self, forKey: .logo)) ?? nil
         types = (try? c.decodeIfPresent([String].self, forKey: .types)) ?? nil
         idPrefixes = (try? c.decodeIfPresent([String].self, forKey: .idPrefixes)) ?? nil
-        catalogs = (try? c.decodeIfPresent([ManifestCatalog].self, forKey: .catalogs)) ?? nil
-        resources = (try? c.decodeIfPresent([ManifestResource].self, forKey: .resources)) ?? nil
+        // Element-wise, as the comment above promises: `try?` around the whole
+        // array nil'd every catalog/resource when ONE entry was malformed —
+        // a stream addon whose manifest carried one odd resource object then
+        // silently contributed nothing to Sources.
+        catalogs = c.contains(.catalogs) ? c.lossyArrayHelper(ManifestCatalog.self, forKey: .catalogs) : nil
+        resources = c.contains(.resources) ? c.lossyArrayHelper(ManifestResource.self, forKey: .resources) : nil
     }
 
     init(id: String, name: String, version: String?, description: String?,
@@ -317,7 +321,9 @@ struct MetaItem: Codable, Identifiable, Hashable {
         runtime = try? c.decode(String.self, forKey: .runtime)
         genres = try? c.decode([String].self, forKey: .genres)
         cast = try? c.decode([String].self, forKey: .cast)
-        videos = try? c.decode([MetaVideo].self, forKey: .videos)
+        // Element-wise: one episode with a numeric/missing id used to nil the
+        // WHOLE list, so the Detail page showed no episodes for that show.
+        videos = c.lossyArrayHelper(MetaVideo.self, forKey: .videos)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -817,10 +823,22 @@ struct Stream: Codable, Hashable {
             score -= 400
         }
 
-        // Codec (hardware-decode reality on the Apple TV's A10X).
-        if hay.contains("av1") { score -= 150 }
-        else if hay.contains("hevc") || hay.contains("x265") || hay.contains("h265") || hay.contains("h.265") { score += 40 }
-        else if hay.contains("x264") || hay.contains("h264") || hay.contains("h.264") || hay.contains("avc") { score += 15 }
+        // Codec (hardware-decode reality of the box). The A10X and newer
+        // decode HEVC in hardware and AV1 in software only. The Apple TV HD's
+        // A8 has NO HEVC decoder either: a 1080p HEVC link there is a
+        // software decode the two cores cannot sustain — so on that box the
+        // codec ladder inverts and H.264 leads.
+        let isHEVC = hay.contains("hevc") || hay.contains("x265") || hay.contains("h265") || hay.contains("h.265")
+        let isAVC = hay.contains("x264") || hay.contains("h264") || hay.contains("h.264") || hay.contains("avc")
+        if PerformanceProfile.isLowPower {
+            if hay.contains("av1") { score -= 300 }
+            else if isHEVC { score -= 120 }
+            else if isAVC { score += 40 }
+        } else {
+            if hay.contains("av1") { score -= 150 }
+            else if isHEVC { score += 40 }
+            else if isAVC { score += 15 }
+        }
 
         // Dynamic range.
         if hay.contains("dolby vision") || hay.contains("dolby.vision") || hay.contains("dovi")
@@ -961,7 +979,12 @@ struct Stream: Codable, Hashable {
               let value = Double(haystack[numberRange]) else { return nil }
         let multiplier: Double = haystack[unitRange].lowercased().hasPrefix("m")
             ? 1_048_576 : 1_073_741_824
-        return Int64(value * multiplier)
+        // `Int64(Double)` TRAPS past 2^63. The digits come from addon text
+        // (`\d+` is unbounded), so a long numeric id glued to "GB" in a
+        // release title was a remote crash while the Sources list was built.
+        let product = value * multiplier
+        guard product.isFinite, product < 9.2e18 else { return nil }
+        return Int64(product)
     }
 }
 
@@ -997,6 +1020,17 @@ struct StreamBehaviorHints: Codable, Hashable {
         filename = (try? c.decodeIfPresent(String.self, forKey: .filename)) ?? nil
         proxyHeaders = (try? c.decodeIfPresent(StreamProxyHeaders.self, forKey: .proxyHeaders)) ?? nil
     }
+
+    /// Memberwise: for streams built in-app (plugin scrapers) rather than
+    /// decoded from an addon response.
+    init(bingeGroup: String? = nil, notWebReady: Bool? = nil, videoSize: Int64? = nil,
+         filename: String? = nil, proxyHeaders: StreamProxyHeaders? = nil) {
+        self.bingeGroup = bingeGroup
+        self.notWebReady = notWebReady
+        self.videoSize = videoSize
+        self.filename = filename
+        self.proxyHeaders = proxyHeaders
+    }
 }
 
 struct StreamProxyHeaders: Codable, Hashable {
@@ -1009,6 +1043,8 @@ struct StreamProxyHeaders: Codable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         request = (try? c.decodeIfPresent([String: String].self, forKey: .request)) ?? nil
     }
+
+    init(request: [String: String]?) { self.request = request }
 
     /// Non-empty header map, or nil — the form every caller actually wants.
     var requestHeaders: [String: String]? {
@@ -1076,7 +1112,37 @@ struct StreamEntry: Identifiable, Hashable {
 
 struct CatalogResponse: Codable {
     let metas: [MetaItem]?
+
+    private enum CodingKeys: String, CodingKey { case metas }
+
+    /// Lossy array decode, same policy as `StreamsResponse`: one malformed
+    /// meta (a numeric `id` from a loose aggregator) drops that entry, not the
+    /// whole Home row / search result / See-All page.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        metas = c.lossyArrayHelper(MetaItem.self, forKey: .metas)
+    }
+
+    init(metas: [MetaItem]?) { self.metas = metas }
 }
+
+/// Element-wise decode of an array where one bad element must not sink the
+/// rest — the policy every addon-facing list in this file shares.
+extension KeyedDecodingContainerProtocol {
+    fileprivate func lossyArrayHelper<T: Decodable>(_ type: T.Type, forKey key: Key) -> [T]? {
+        guard var array = try? nestedUnkeyedContainer(forKey: key) else { return nil }
+        var collected: [T] = []
+        while !array.isAtEnd {
+            if let element = try? array.decode(T.self) {
+                collected.append(element)
+            } else {
+                _ = try? array.decode(AnyIgnorable.self)
+            }
+        }
+        return collected
+    }
+}
+
 
 struct MetaResponse: Codable {
     let meta: MetaItem?

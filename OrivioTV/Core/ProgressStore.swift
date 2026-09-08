@@ -150,8 +150,10 @@ final class ProgressStore: ObservableObject {
         saveSequence += 1
         let sequence = saveSequence
         let key = storageKey
+        let shelfTicket = shelf == nil ? 0 : TopShelfExporter.nextSequence()
         Task.detached(priority: .utility) {
-            await ProgressPersister.shared.write(snapshot, key: key, sequence: sequence, shelf: shelf)
+            await ProgressPersister.shared.write(snapshot, key: key, sequence: sequence,
+                                                 shelf: shelf, shelfSequence: shelfTicket)
         }
     }
 
@@ -287,15 +289,25 @@ final class ProgressStore: ObservableObject {
     /// persisted, so just re-point storage and reload.
     func setProfile(_ id: Int) {
         guard id != profileID else { return }
+        // The removal tombstones belong to the profile being left — carried
+        // over, a title profile A just removed was skipped from profile B's
+        // first pull for the whole grace window. Parked per profile rather
+        // than dropped: they are the only guard the Trakt/Stremio merges have
+        // against re-adding what that profile removed.
+        tombstonesByProfile[profileID] = tombstones
         profileID = id
         suppressChange = true
         items = [:]
         // The in-playback overrides belong to the profile we are LEAVING. Left
         // in place, the next save/push folds them into the new profile's data.
         transientOverrides.removeAll()
+        tombstones = tombstonesByProfile[id] ?? [:]
+        externallyMerged.removeAll()
+        awaitingServerAck.removeAll()
         load()
         suppressChange = false
     }
+    private var tombstonesByProfile: [Int: [String: Date]] = [:]
 
     /// Re-export the Top Shelf snapshot without touching stored progress.
     /// Needed when something OTHER than progress changes what may be shown —
@@ -305,7 +317,8 @@ final class ProgressStore: ObservableObject {
     /// save or relaunch.
     func refreshTopShelf() {
         let shelf = TopShelfExporter.entries(from: continueWatching)
-        Task.detached(priority: .utility) { TopShelfExporter.write(shelf) }
+        let ticket = TopShelfExporter.nextSequence()
+        Task.detached(priority: .utility) { await TopShelfExporter.writeOrdered(shelf, sequence: ticket) }
     }
 
     /// All entries, for a full push to the account backend.
@@ -467,6 +480,22 @@ final class ProgressStore: ObservableObject {
         if changed { save() }
     }
 
+    /// Drop every row a given sync source contributed (a Stremio account
+    /// switch retiring the previous account's Continue Watching). No
+    /// tombstones and no callbacks: the rows are not being removed by the
+    /// user, and the incoming account's copies must not be blocked.
+    func removeRows(syncSource source: String) {
+        suppressChange = true
+        defer { suppressChange = false }
+        let next = items.filter { _, item in item.syncSource != source }
+        guard next.count != items.count else { return }
+        for id in items.keys where next[id] == nil {
+            transientOverrides.removeValue(forKey: id)
+        }
+        items = next
+        save()
+    }
+
     func removeLocalOnlyProgress() {
         let next = items.filter { _, item in
             guard let source = item.syncSource else { return false }
@@ -543,6 +572,16 @@ final class ProgressStore: ObservableObject {
                       Self.serviceSyncSources.contains(source) else { continue }
                 next[id] = local
             }
+        }
+        // The same deletion grace `mergeRemote` grants: a row updated in the
+        // last two minutes may simply not have reached the server yet (its
+        // push is in flight). Dropping it here — and tombstoning it — hid the
+        // title just watched from Continue Watching until the tombstone
+        // expired, three minutes later.
+        let graceCutoff = Date().addingTimeInterval(-Self.deletionGrace)
+        for (id, local) in items where next[id] == nil {
+            guard local.updatedAt >= graceCutoff, Self.sanitized(local) != nil else { continue }
+            next[id] = local
         }
 
         guard next != items else { return }
@@ -1058,10 +1097,19 @@ final class ProgressStore: ObservableObject {
             // tvOS home shelf reflects existing Continue Watching immediately
             // (save() only fires during playback).
             let shelf = TopShelfExporter.entries(from: continueWatching)
-            Task.detached(priority: .utility) { TopShelfExporter.write(shelf) }
+            let ticket = TopShelfExporter.nextSequence()
+            Task.detached(priority: .utility) { await TopShelfExporter.writeOrdered(shelf, sequence: ticket) }
         }
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([String: WatchProgress].self, from: data) else {
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else {
+            items = [:]
+            return
+        }
+        guard let decoded = try? JSONDecoder().decode([String: WatchProgress].self, from: data) else {
+            // An UNREADABLE blob is not an empty one. Treating it as empty let
+            // the first save overwrite the whole history with one row (and the
+            // deletion reconcile then removed the rest from the account). Keep
+            // the bytes recoverable before anything writes over them.
+            UnreadableBlobGuard.preserve(data, key: storageKey)
             items = [:]
             return
         }
@@ -1108,11 +1156,37 @@ private actor ProgressPersister {
     private var lastSequence: [String: UInt64] = [:]
 
     func write(_ snapshot: [String: WatchProgress], key: String,
-               sequence: UInt64, shelf: [TopShelfExporter.Entry]?) {
+               sequence: UInt64, shelf: [TopShelfExporter.Entry]?,
+               shelfSequence: UInt64) async {
         guard sequence > (lastSequence[key] ?? 0) else { return }
         lastSequence[key] = sequence
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         UserDefaults.standard.set(data, forKey: key)
-        if let shelf { TopShelfExporter.write(shelf) }
+        if let shelf { await TopShelfExporter.writeOrdered(shelf, sequence: shelfSequence) }
+    }
+}
+
+/// A persisted blob that no longer decodes must not be mistaken for "nothing
+/// saved": the next save would overwrite it and the history is gone. Copy the
+/// raw bytes aside (once) under `<key>.unreadable` so they stay recoverable.
+enum UnreadableBlobGuard {
+    /// Copies go to a FILE under Application Support, not back into the
+    /// defaults domain: doubling a large blob there would push the domain
+    /// toward the CFPreferences size abort the collections store already met.
+    /// One copy per key, kept until a human looks at it.
+    static func preserve(_ data: Data, key: String) {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        else { return }
+        let dir = base.appendingPathComponent("orivio-unreadable", isDirectory: true)
+        let file = dir.appendingPathComponent(key + ".json")
+        guard !FileManager.default.fileExists(atPath: file.path) else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do {
+            try data.write(to: file, options: .atomic)
+            NSLog("[OrivioStore] %@ did not decode (%d bytes) — kept a copy at %@",
+                  key, data.count, file.path)
+        } catch {
+            NSLog("[OrivioStore] %@ did not decode and the copy failed: %@", key, String(describing: error))
+        }
     }
 }

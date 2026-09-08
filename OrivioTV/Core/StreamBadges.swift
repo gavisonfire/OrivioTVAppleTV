@@ -35,9 +35,19 @@ final class StreamBadgeStore: ObservableObject {
         ("small", "Small", 0.8), ("medium", "Medium", 1.0), ("large", "Large", 1.35)
     ]
     private static let sizeKey = "orivio.badges.size.v1"
+    /// Per profile like the rest of the badge config (upstream scopes its
+    /// whole `stream_badge_settings` store). Static because the renderer
+    /// reads `sizeScale` far from the store; the active profile id in
+    /// defaults is always current, so scoping through it here is safe.
     static var sizeRaw: String {
-        get { UserDefaults.standard.string(forKey: sizeKey) ?? "medium" }
-        set { UserDefaults.standard.set(newValue, forKey: sizeKey) }
+        get {
+            ProfileScopedDefaults.string(sizeKey, feature: feature,
+                                         ProfileScopedDefaults.activeProfileID) ?? "medium"
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: ProfileScopedDefaults.writeKey(
+                sizeKey, feature: feature, ProfileScopedDefaults.activeProfileID))
+        }
     }
     static var sizeScale: CGFloat {
         sizeOptions.first { $0.0 == sizeRaw }?.2 ?? 1.0
@@ -61,8 +71,11 @@ final class StreamBadgeStore: ObservableObject {
     private var remoteRulesByPlatform: [String: String] = [:]
     private static let preferredPlatformKey = "orivio.badges.platform.v1"
     var preferredRemoteProfileID: String {
-        get { UserDefaults.standard.string(forKey: Self.preferredPlatformKey) ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: Self.preferredPlatformKey) }
+        get { ProfileScopedDefaults.string(Self.preferredPlatformKey, feature: Self.feature, profileID) ?? "" }
+        set {
+            UserDefaults.standard.set(newValue, forKey: ProfileScopedDefaults.writeKey(
+                Self.preferredPlatformKey, feature: Self.feature, profileID))
+        }
     }
     /// Expand every platform blob's imports into selectable profiles.
     func setRemoteRules(_ rulesByPlatform: [String: String]) {
@@ -126,10 +139,69 @@ final class StreamBadgeStore: ObservableObject {
         lastStatus = await remoteSync()
     }
 
+    /// Badge config is PER PROFILE; the legacy device-wide config goes to the
+    /// PRIMARY profile, other profiles start without a pack (Trakt-switch
+    /// semantics). Removal writes empty markers instead of deleting the
+    /// scoped keys, or the legacy value would resurrect a removed pack.
+    private(set) var profileID = ProfileScopedDefaults.activeProfileID
+
+    /// Separate-vs-shared switch (Trakt-style). Shared = one badge pack for
+    /// the whole device, the pre-split behaviour.
+    static let feature = "badges"
+    var perProfileEnabled: Bool { ProfileScopedDefaults.isSeparate(Self.feature) }
+
+    func setPerProfile(_ on: Bool) {
+        guard on != perProfileEnabled else { return }
+        ProfileScopedDefaults.setSeparate(Self.feature, on)
+        suppressChange = true
+        defer { suppressChange = false }
+        reload()
+    }
+
+    private var scopedURLKey: String {
+        ProfileScopedDefaults.writeKey(Self.urlKey, feature: Self.feature, profileID)
+    }
+    private var scopedPayloadKey: String {
+        ProfileScopedDefaults.writeKey(Self.payloadKey, feature: Self.feature, profileID)
+    }
+
     init() {
-        sourceURL = UserDefaults.standard.string(forKey: Self.urlKey) ?? ""
-        if let payload = UserDefaults.standard.data(forKey: Self.payloadKey) {
+        reload()
+    }
+
+    private func reload() {
+        sourceURL = ProfileScopedDefaults.string(Self.urlKey, feature: Self.feature, profileID) ?? ""
+        if let payload = ProfileScopedDefaults.data(Self.payloadKey, feature: Self.feature, profileID),
+           !payload.isEmpty {
             compileFilters(from: payload)
+        } else {
+            compiled = []
+            cache = [:]
+            filterCount = 0
+        }
+        sizeRawUI = Self.sizeRaw
+        lastStatus = nil
+    }
+
+    /// Point the store at a profile — its own badge pack, or none.
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        suppressChange = true
+        defer { suppressChange = false }
+        reload()
+    }
+
+    /// Forget a deleted profile's badge config.
+    func forgetProfile(_ id: Int) {
+        ProfileScopedDefaults.forget(
+            [Self.urlKey, Self.payloadKey, Self.sizeKey, Self.preferredPlatformKey],
+            profile: id
+        )
+        if id == profileID {
+            suppressChange = true
+            reload()
+            suppressChange = false
         }
     }
 
@@ -155,8 +227,8 @@ final class StreamBadgeStore: ObservableObject {
                 lastStatus = "No usable filters in that config"
                 return lastStatus
             }
-            UserDefaults.standard.set(trimmed, forKey: Self.urlKey)
-            UserDefaults.standard.set(data, forKey: Self.payloadKey)
+            UserDefaults.standard.set(trimmed, forKey: scopedURLKey)
+            UserDefaults.standard.set(data, forKey: scopedPayloadKey)
             sourceURL = trimmed
             compileFilters(from: data)
             lastStatus = "Imported \(filterCount) badge filters"
@@ -190,8 +262,10 @@ final class StreamBadgeStore: ObservableObject {
     }
 
     func removeConfig() {
-        UserDefaults.standard.removeObject(forKey: Self.urlKey)
-        UserDefaults.standard.removeObject(forKey: Self.payloadKey)
+        // Empty markers, not removal: an absent scoped key falls back to the
+        // legacy seed, which would bring the removed pack straight back.
+        UserDefaults.standard.set("", forKey: scopedURLKey)
+        UserDefaults.standard.set(Data(), forKey: scopedPayloadKey)
         sourceURL = ""
         compiled = []
         cache = [:]
@@ -230,8 +304,8 @@ final class StreamBadgeStore: ObservableObject {
 
         guard let payload = try? JSONSerialization.data(withJSONObject: ["filters": filters]) else { return }
         suppressChange = true
-        UserDefaults.standard.set(remoteURL, forKey: Self.urlKey)
-        UserDefaults.standard.set(payload, forKey: Self.payloadKey)
+        UserDefaults.standard.set(remoteURL, forKey: scopedURLKey)
+        UserDefaults.standard.set(payload, forKey: scopedPayloadKey)
         sourceURL = remoteURL
         compileFilters(from: payload)
         lastStatus = "Synced \(filterCount) badge filters from your Orivio account"
@@ -243,7 +317,8 @@ final class StreamBadgeStore: ObservableObject {
     /// other devices clear too).
     func syncRulesJSON() -> String? {
         guard isConfigured,
-              let payload = UserDefaults.standard.data(forKey: Self.payloadKey),
+              let payload = ProfileScopedDefaults.data(Self.payloadKey, feature: Self.feature, profileID),
+              !payload.isEmpty,
               let root = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
               let filters = root["filters"] as? [[String: Any]]
         else {

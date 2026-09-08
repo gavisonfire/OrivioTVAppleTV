@@ -105,6 +105,16 @@ enum PerformanceProfile {
     /// pass tighter per-image budgets when they know their rendered size.
     static var maxImagePixelSize: CGFloat { isLowPower ? 1920 : 3840 }
 
+    /// Decode cap for FULL-BLEED backdrops (home hero, detail/sources/player
+    /// backgrounds), in pixels on the longest side. On the 3 GB 4K gen 1 a
+    /// backdrop decoded to the 3840 framebuffer cap is ~33 MB of RGBA per
+    /// image — four of them churn the whole decoded-pixel cache — while the
+    /// art sits under gradient scrims and dissolves. 2560 px (two thirds of
+    /// the panel, upscaled by the compositor) is ~15 MB and indistinguishable
+    /// under those scrims. The HD is already capped at its 1920 panel; the
+    /// 4 GB boxes keep the full framebuffer.
+    static var backdropPixelCap: CGFloat? { isMidPower ? 2560 : nil }
+
     /// Decoded-pixel memory-cache budget, sized to what the box can spare.
     /// Invisible — evicted images just re-decode from the disk cache.
     static var imageCacheBytes: Int {

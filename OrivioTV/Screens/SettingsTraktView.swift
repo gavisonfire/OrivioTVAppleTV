@@ -29,14 +29,16 @@ struct TraktDetail: View {
             // Shown above BOTH states: a profile that hasn't connected Trakt
             // sees the signed-out view, and this is how someone turns the
             // per-profile behaviour on (or back off) from there. Only worth
-            // showing once there is more than one profile.
+            // showing once there is more than one profile. ONE switch scopes
+            // both services — the stores share the UserDefaults key, and the
+            // setter writes both so each runs its own adopt/reload.
             if profiles.profiles.count > 1 {
                 SettingsToggleCard(
-                    title: "Separate Trakt per profile",
-                    subtitle: "Each profile connects its own Trakt account here. Profiles that haven't connected one simply have no Trakt — nothing is shared between them. Off: one Trakt account for the whole device.",
+                    title: "Separate Trakt & SIMKL per profile",
+                    subtitle: "Each profile connects its own Trakt and SIMKL accounts here. Profiles that haven't connected one simply have none — nothing is shared between them. Off: one login per service for the whole device.",
                     isOn: Binding(
                         get: { trakt.perProfileAccounts },
-                        set: { trakt.perProfileAccounts = $0 }
+                        set: { trakt.perProfileAccounts = $0; simkl.perProfileAccounts = $0 }
                     )
                 )
                 .padding(.bottom, OrivioSpacing.sm)
@@ -154,7 +156,7 @@ struct TraktDetail: View {
             // Said once, here, rather than leaving a viewer to wonder why the
             // Trakt section above has a Continue Watching switch and this one
             // does not.
-            Text("SIMKL has no playback-position API, so Continue Watching isn't synced with it. Finishing something still marks it watched.")
+            Text("SIMKL's API can't store a playback position, so partially-watched items don't sync — your Continue Watching row stays on this device. Once you finish a movie or episode, it's marked watched on SIMKL as usual.")
                 .font(.system(size: 20))
                 .foregroundStyle(theme.palette.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)

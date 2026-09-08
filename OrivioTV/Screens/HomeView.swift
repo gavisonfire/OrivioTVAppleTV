@@ -177,7 +177,8 @@ final class HomeViewModel: ObservableObject {
     func loadIfNeeded(
         addonManager: AddonManager,
         collections: CollectionsStore,
-        settings: HomeCatalogSettingsStore
+        settings: HomeCatalogSettingsStore,
+        providers: CollectionProviders
     ) async {
         // Fingerprint includes catalog counts (so rows refresh when the live
         // manifests replace the bundled seed) plus the layout customization
@@ -200,15 +201,25 @@ final class HomeViewModel: ObservableObject {
         fingerprint.append(collections.collections.map {
             "\($0.id)#\($0.folders.count)#\($0.title)#\($0.viewMode)#\($0.pinToTop)"
         }.joined(separator: ","))
+        // Collection rows no longer come and go with TMDB / Trakt, but keep
+        // the connections in the fingerprint anyway — cheap, and any future
+        // provider-dependent rendering rebuilds without a relaunch.
+        fingerprint.append("providers=\(providers.tmdb)/\(providers.trakt)")
         guard entries.isEmpty || fingerprint != loadedFingerprint else { return }
         loadedFingerprint = fingerprint
-        await load(addonManager: addonManager, collections: collections, settings: settings)
+        await load(addonManager: addonManager, collections: collections,
+                   settings: settings, providers: providers)
     }
 
     func load(
         addonManager: AddonManager,
         collections: CollectionsStore,
-        settings: HomeCatalogSettingsStore
+        settings: HomeCatalogSettingsStore,
+        /// TMDB / Trakt. Collections ALWAYS show on Home, whatever is
+        /// connected — a collection opened with nothing connected explains
+        /// inside (per folder) that TMDB or Trakt needs setting up. Hiding
+        /// them here just made the feature look broken with no pointer to why.
+        providers: CollectionProviders
     ) async {
         loadGeneration &+= 1
         let generation = loadGeneration
@@ -753,6 +764,15 @@ struct HomeView: View {
     @EnvironmentObject private var collections: CollectionsStore
     @EnvironmentObject private var homeCatalogSettings: HomeCatalogSettingsStore
     @EnvironmentObject private var watched: WatchedStore
+    @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
+    @EnvironmentObject private var trakt: TraktStore
+
+    /// The services collections can resolve from right now (see
+    /// `CollectionProviders`). Collection rows always render; this only tells
+    /// the loader what a collection opened from them will be able to fill.
+    private var collectionProviders: CollectionProviders {
+        CollectionProviders(tmdb: tmdbSettings.isEnabled, trakt: trakt.isSignedIn)
+    }
     // Owned by RootView so it PERSISTS across tab switches. If it were a local
     // @StateObject, switching away and back would rebuild HomeView with a fresh
     // (empty) model → a "Loading catalogs" spinner with no focusable element →
@@ -858,7 +878,8 @@ struct HomeView: View {
                 await viewModel.load(
                     addonManager: addonManager,
                     collections: collections,
-                    settings: homeCatalogSettings
+                    settings: homeCatalogSettings,
+                    providers: collectionProviders
                 )
             }
         }
@@ -869,6 +890,9 @@ struct HomeView: View {
         // a cold start ran the whole catalog sweep two to four times over.
         .onChange(of: addonManager.addons) { _, _ in scheduleReload() }
         .onChange(of: collections.collections) { _, _ in scheduleReload() }
+        // Collection rows render regardless, but a provider change still
+        // reloads Home so anything downstream of the connections is fresh.
+        .onChange(of: collectionProviders) { _, _ in scheduleReload() }
         .onChange(of: homeCatalogSettings.orderKeys) { _, _ in scheduleReload() }
         .onChange(of: homeCatalogSettings.disabledKeys) { _, _ in scheduleReload() }
         .onChange(of: homeCatalogSettings.customTitles) { _, _ in scheduleReload() }
@@ -960,7 +984,8 @@ struct HomeView: View {
         await viewModel.loadIfNeeded(
             addonManager: addonManager,
             collections: collections,
-            settings: homeCatalogSettings
+            settings: homeCatalogSettings,
+            providers: collectionProviders
         )
         // Usually already done from the cache above; this covers a cold launch
         // where there was nothing to seed from.
@@ -1002,8 +1027,10 @@ struct HomeView: View {
         }
 
         // §21: an inline hero bar between Continue Watching and the catalog
-        // rows, sourced from a different row than the top spotlight.
-        if perf.settings.heroBackdrop {
+        // rows, sourced from a different row than the top spotlight. Two
+        // gates: the performance switch (device) and the Layout pane's
+        // "Featured section" toggle (per profile).
+        if perf.settings.heroBackdrop && homeCatalogSettings.showFeaturedBar {
             let barItems = viewModel.heroBarItems(max: 6)
             if barItems.count >= 2 {
                 FusionHeroBar(
@@ -1574,7 +1601,11 @@ private struct ContinueWatchingRow: View {
             RowHeader(title: "Continue Watching")
             ScrollViewReader { proxy in
             ScrollView(.horizontal) {
-                LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
+                // Wider gap than the poster rows (.xl, not .lg): these cards
+                // are 380pt landscape stills, so the 1.05 focus lift adds
+                // ~9.5pt per side — at .lg the lifted card sat nearly flush
+                // against its unlifted neighbours.
+                LazyHStack(alignment: .top, spacing: OrivioSpacing.xl) {
                     ForEach(items) { progress in
                       // Equatable cell, same reasoning as HomePosterCell: focus
                       // steps write the row's @FocusState and re-run this body;
@@ -1887,7 +1918,7 @@ private struct FusionHeroHeader: View {
                     // RemoteImage overflows the frame it is clipped to and stays
                     // hit-testable, which swallows a neighbouring card's
                     // context-menu hit test.
-                    RemoteImage(url: art)
+                    RemoteImage(url: art, maxPixels: PerformanceProfile.backdropPixelCap)
                         .allowsHitTesting(false)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
@@ -1981,7 +2012,7 @@ private struct ATVHeroInfoView: View {
             // see FusionHeroHeader.)
             // Title treatment (logo) or big text fallback.
             if let logo = item.logo {
-                RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading)
+                RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading, maxDimension: 540)
                     .frame(width: 540, height: 180)
                     // Grounds a white logo on both a light frost and dark art.
                     .shadow(color: .black.opacity(scheme == .light ? 0.32 : 0.5),

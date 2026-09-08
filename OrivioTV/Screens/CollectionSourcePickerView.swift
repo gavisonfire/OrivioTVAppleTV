@@ -7,6 +7,7 @@ import SwiftUI
 struct CollectionSourcePickerView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
+    @EnvironmentObject private var trakt: TraktStore
     let onAdd: (CollectionSourceDTO) -> Void
     let onDone: () -> Void
 
@@ -21,6 +22,17 @@ struct CollectionSourcePickerView: View {
 
     @State private var tab: Tab = .presets
 
+    /// What this tab needs and doesn't have. TMDB tabs come first in the tab
+    /// bar because TMDB covers every source type a collection can hold.
+    private var connectionWarning: String? {
+        if tab == .trakt {
+            return trakt.isSignedIn ? nil
+                : "Sign in to Trakt in Settings → Trakt for a list added here to show anything."
+        }
+        return tmdbSettings.isEnabled ? nil
+            : "Add your TMDB API key in Settings → Integrations → TMDB for a source added here to show anything."
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             ATVBackground()
@@ -33,8 +45,10 @@ struct CollectionSourcePickerView: View {
                     Button("Done", action: onDone)
                         .font(.system(size: 22, weight: .semibold))
                 }
-                if !tmdbSettings.isEnabled && tab != .trakt {
-                    Text("Enable TMDB in Settings → Integrations to have this source render on Home.")
+                // Warn per TAB about the service that tab actually needs —
+                // a Trakt list doesn't care about TMDB, and vice versa.
+                if let warning = connectionWarning {
+                    Text(warning)
                         .font(.system(size: 18))
                         .foregroundStyle(OrivioPrimitives.error)
                 }

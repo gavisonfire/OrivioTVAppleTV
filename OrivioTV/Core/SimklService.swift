@@ -6,11 +6,12 @@ import Foundation
 /// public client id (no client secret), and the access token it returns does
 /// not expire, so there is no refresh token to keep or rotate.
 ///
-/// The login is DEVICE-WIDE, matching Trakt's default. Trakt grew a
-/// `perProfileAccounts` switch and the machinery behind it because its login
-/// predates profiles and had to be split retroactively; SIMKL starts fresh, so
-/// if per-profile SIMKL accounts are wanted later they should be built on that
-/// same switch rather than a second parallel one.
+/// Per-profile accounts ride Trakt's `perProfileAccounts` switch — the SAME
+/// UserDefaults key, so "Separate Trakt & SIMKL per profile" is one setting,
+/// not two that can disagree. The machinery here is a subset of TraktStore's:
+/// SIMKL logins never sync through the Orivio account, so there is no
+/// `applyRemote`, no explicit-login flag guarding it, and no pollution of
+/// other profiles' slots to clean up when the setting turns on.
 @MainActor
 final class SimklStore: ObservableObject {
     @Published private(set) var accessToken: String?
@@ -58,20 +59,102 @@ final class SimklStore: ObservableObject {
     private static let histKey = "orivio.simkl.synchistory.v1"
     private static let watchlistKey = "orivio.simkl.syncwatchlist.v1"
     private static let ratingsKey = "orivio.simkl.syncratings.v1"
+    /// Trakt's key, on purpose — one switch splits BOTH services per profile.
+    private static let perProfileKey = "orivio.trakt.perProfileAccounts.v1"
+    /// Same key ProfileStore uses, read directly so the scope is right from
+    /// launch (mirrors TraktStore).
+    private static let activeProfileKey = "orivio.profiles.active"
 
     init() {
         syncWatchHistory = UserDefaults.standard.object(forKey: Self.histKey) as? Bool ?? true
         syncWatchlist = UserDefaults.standard.object(forKey: Self.watchlistKey) as? Bool ?? true
         syncRatings = UserDefaults.standard.object(forKey: Self.ratingsKey) as? Bool ?? true
-        accessToken = UserDefaults.standard.string(forKey: Self.tokenKey)
-        username = UserDefaults.standard.string(forKey: Self.userKey)
+        perProfileAccounts = UserDefaults.standard.bool(forKey: Self.perProfileKey)
+        profileID = UserDefaults.standard.object(forKey: Self.activeProfileKey) as? Int ?? 1
+        let suffix = perProfileAccounts ? ".p\(profileID)" : ""
+        accessToken = UserDefaults.standard.string(forKey: Self.tokenKey + suffix)
+        username = UserDefaults.standard.string(forKey: Self.userKey + suffix)
+    }
+
+    /// Give every PROFILE its own SIMKL account. Shares Trakt's UserDefaults
+    /// key; the Settings toggle (and the dev launch args) set both stores, so
+    /// the two stay in step. As with Trakt, only the ACCOUNT is scoped — the
+    /// sync switches stay device-wide.
+    @Published var perProfileAccounts: Bool {
+        didSet {
+            guard perProfileAccounts != oldValue else { return }
+            UserDefaults.standard.set(perProfileAccounts, forKey: Self.perProfileKey)
+            if perProfileAccounts { adoptSharedLoginIntoPrimaryProfile() }
+            reloadAccount()
+        }
+    }
+
+    /// The profile whose SIMKL account is currently loaded.
+    private(set) var profileID: Int
+
+    private var scopeSuffix: String { perProfileAccounts ? ".p\(profileID)" : "" }
+    private var scopedTokenKey: String { Self.tokenKey + scopeSuffix }
+    private var scopedUserKey: String { Self.userKey + scopeSuffix }
+
+    /// Splitting accounts hands the existing device-wide login to PROFILE 1
+    /// (see TraktStore's version for why not the active profile), and only
+    /// when profile 1 has nothing of its own. The device-wide copy is never
+    /// touched, so turning the setting off always falls back to it. Unlike
+    /// Trakt there is no cleanup pass: nothing ever wrote SIMKL tokens into
+    /// other profiles' slots while the login was shared.
+    private func adoptSharedLoginIntoPrimaryProfile() {
+        guard let shared = UserDefaults.standard.string(forKey: Self.tokenKey),
+              UserDefaults.standard.string(forKey: Self.tokenKey + ".p1") == nil else { return }
+        UserDefaults.standard.set(shared, forKey: Self.tokenKey + ".p1")
+        UserDefaults.standard.set(UserDefaults.standard.string(forKey: Self.userKey),
+                                  forKey: Self.userKey + ".p1")
+    }
+
+    /// Forget a deleted profile's SIMKL account so a recycled profile id never
+    /// inherits it.
+    func forgetProfile(_ id: Int) {
+        UserDefaults.standard.removeObject(forKey: Self.tokenKey + ".p\(id)")
+        UserDefaults.standard.removeObject(forKey: Self.userKey + ".p\(id)")
+        if id == profileID { reloadAccount() }
+    }
+
+    /// Forget EVERY profile's SIMKL login plus the shared (unsuffixed) one.
+    /// For an Orivio account switch: SIMKL tokens are never pushed to the
+    /// account (unlike Trakt's), but the next user must not go on scrobbling
+    /// into the previous user's SIMKL history from any profile slot.
+    func forgetAllProfiles() {
+        didSignInInteractively = false
+        for key in [Self.tokenKey, Self.userKey] {
+            UserDefaults.standard.removeObject(forKey: key)
+            for id in 1...ProfileStore.maxProfiles {
+                UserDefaults.standard.removeObject(forKey: key + ".p\(id)")
+            }
+        }
+        reloadAccount()
+    }
+
+    /// Point the store at a profile. No-op unless per-profile accounts are on,
+    /// in which case the previous profile's login is swapped out for this
+    /// one's — which may be none at all, and that is the intended outcome.
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        guard perProfileAccounts else { return }
+        reloadAccount()
+    }
+
+    /// Load token + username from whichever scope is active now.
+    private func reloadAccount() {
+        accessToken = UserDefaults.standard.string(forKey: scopedTokenKey)
+        username = UserDefaults.standard.string(forKey: scopedUserKey)
+        lastSyncStatus = nil
     }
 
     var isSignedIn: Bool { accessToken != nil }
 
     func store(access: String) {
         accessToken = access
-        UserDefaults.standard.set(access, forKey: Self.tokenKey)
+        UserDefaults.standard.set(access, forKey: scopedTokenKey)
     }
 
     /// Called by the PIN flow when a login completes on this device.
@@ -79,7 +162,7 @@ final class SimklStore: ObservableObject {
 
     func setUsername(_ name: String?) {
         username = name
-        UserDefaults.standard.set(name, forKey: Self.userKey)
+        UserDefaults.standard.set(name, forKey: scopedUserKey)
     }
 
     func signOut() {
@@ -87,8 +170,8 @@ final class SimklStore: ObservableObject {
         lastSyncStatus = nil
         accessToken = nil
         username = nil
-        UserDefaults.standard.removeObject(forKey: Self.tokenKey)
-        UserDefaults.standard.removeObject(forKey: Self.userKey)
+        UserDefaults.standard.removeObject(forKey: scopedTokenKey)
+        UserDefaults.standard.removeObject(forKey: scopedUserKey)
     }
 }
 
@@ -270,6 +353,11 @@ extension SimklService {
         var episode: Int?
         var rating: Int?
         var watchedAt: Date?
+        /// SIMKL's list bucket for the row this item came from ("completed",
+        /// "plantowatch", "watching", "hold", …). Read-side only; the sync
+        /// manager needs it to tell a watched title from a planned one when
+        /// the whole library is fetched in one request.
+        var status: String?
     }
 
     /// SIMKL groups everything under `movies` / `shows`. The app says
@@ -380,8 +468,10 @@ extension SimklService {
     /// an empty library — an outage read as "SIMKL has nothing" would make the
     /// push phase re-upload the user's entire history.
     ///
-    /// `status` filters SIMKL's list buckets: "completed" is watch history,
-    /// "plantowatch" is the watchlist.
+    /// `status` filters SIMKL's list buckets ("completed", "plantowatch", …);
+    /// nil fetches EVERY bucket in one request, with each item carrying its
+    /// row's `status` — which is what the sync manager uses: it must see the
+    /// whole library, not just one bucket, to know what is safe to push.
     static func allItems(type: String, status: String?, accessToken: String) async -> [SyncItem]? {
         var path = "/sync/all-items/\(type)"
         if let status { path += "/\(status)" }
@@ -413,18 +503,19 @@ extension SimklService {
                 let rating = (row["user_rating"] as? Int)
                     ?? (row["user_rating"] as? Double).map(Int.init)
                 let watched = (row["last_watched_at"] as? String).flatMap(parseDate)
+                let listStatus = row["status"] as? String
 
                 guard appType == "series", let seasons = row["seasons"] as? [[String: Any]],
                       !seasons.isEmpty else {
                     out.append(SyncItem(imdb: imdb, tmdb: tmdb, type: appType, title: title,
-                                        rating: rating, watchedAt: watched))
+                                        rating: rating, watchedAt: watched, status: listStatus))
                     continue
                 }
                 // A show with a seasons tree expands to one item per watched
                 // episode; the show-level row is kept too so ratings and
                 // watchlist entries on the show itself survive.
                 out.append(SyncItem(imdb: imdb, tmdb: tmdb, type: appType, title: title,
-                                    rating: rating, watchedAt: watched))
+                                    rating: rating, watchedAt: watched, status: listStatus))
                 for season in seasons {
                     guard let number = season["number"] as? Int,
                           let episodes = season["episodes"] as? [[String: Any]] else { continue }
@@ -432,12 +523,28 @@ extension SimklService {
                         guard let epNumber = episode["number"] as? Int else { continue }
                         let at = (episode["watched_at"] as? String).flatMap(parseDate) ?? watched
                         out.append(SyncItem(imdb: imdb, tmdb: tmdb, type: appType, title: title,
-                                            season: number, episode: epNumber, watchedAt: at))
+                                            season: number, episode: epNumber, watchedAt: at,
+                                            status: listStatus))
                     }
                 }
             }
         }
         return out
+    }
+
+    /// GET /sync/activities — the tiny "what changed and when" endpoint SIMKL
+    /// asks clients to hit before pulling `all-items`, which is the viewer's
+    /// ENTIRE library. Returns the top-level "all" stamp as an OPAQUE token:
+    /// compared for equality only, never parsed as a date — doing clock math
+    /// against someone else's server invites timezone bugs for no benefit.
+    /// nil on any failure, which callers must treat as "unknown → do sync".
+    static func lastActivity(accessToken: String) async -> String? {
+        struct Response: Decodable { let all: String? }
+        guard let req = request("/sync/activities", bearer: accessToken) else { return nil }
+        guard let (data, response) = try? await session.data(for: req),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let r = try? JSONDecoder().decode(Response.self, from: data) else { return nil }
+        return r.all
     }
 
     /// What a token is worth right now.

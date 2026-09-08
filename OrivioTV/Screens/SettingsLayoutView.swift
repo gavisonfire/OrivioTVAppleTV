@@ -37,6 +37,12 @@ struct LayoutSettingsDetail: View {
                         isOn: $settings.landscapePosters
                     )
                 }
+
+                SettingsToggleCard(
+                    title: "Featured section",
+                    subtitle: "The rotating Featured banner between Continue Watching and your catalog rows. Off removes it from the home screen.",
+                    isOn: $settings.showFeaturedBar
+                )
             }
 
             SettingsGroupCard(title: "Posters", subtitle: "Card size and labels across the app") {
@@ -527,17 +533,56 @@ private struct RenameRowView: View {
 // MARK: - Collections pane
 
 /// Settings → Collections: create and edit collections (custom home rows of
-/// folders, each backed by addon catalog sources). Synced whole as a JSON
+/// folders, each backed by TMDB / Trakt sources). Synced whole as a JSON
 /// blob via `sync_push_collections`.
 struct CollectionsSettingsDetail: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var collections: CollectionsStore
+    @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
+    @EnvironmentObject private var trakt: TraktStore
+
+    private var providers: CollectionProviders {
+        CollectionProviders(tmdb: tmdbSettings.isEnabled, trakt: trakt.isSignedIn)
+    }
 
     @State private var editing: OrivioCollection?
     @State private var creating = false
 
     var body: some View {
-        DetailScaffold(title: "Collections", subtitle: "Group catalogs into custom home rows") {
+        DetailScaffold(title: "Collections", subtitle: "Group TMDB and Trakt sources into custom home rows") {
+            if !providers.any {
+                // Collections resolve from TMDB and Trakt and nothing else.
+                // They still show on Home with neither connected — every
+                // folder just opens empty with this same pointer — so say it
+                // here too, where the fix is one screen away. Either service
+                // is enough; when both are connected TMDB is the one used.
+                HStack(alignment: .top, spacing: OrivioSpacing.md) {
+                    Image(systemName: "link.badge.plus")
+                        .font(.system(size: 30))
+                        .foregroundStyle(theme.palette.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Connect TMDB or Trakt")
+                            .font(.system(size: 25, weight: .semibold))
+                            .foregroundStyle(theme.palette.textPrimary)
+                        Text("Collections need one of them to load anything — just one is enough. "
+                             + "Add your free TMDB API key in Settings → Integrations → TMDB for the "
+                             + "full range of sources, or sign in to Trakt in Settings → Trakt for your lists.")
+                            .font(.system(size: 20))
+                            .foregroundStyle(theme.palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: 1000, alignment: .leading)
+                    }
+                }
+                .padding(OrivioSpacing.lg)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
+                        .fill(theme.palette.backgroundCard.opacity(0.5))
+                )
+            }
+
+            CollectionLayoutModePicker()
+
             Button { creating = true } label: {
                 SettingsActionRow(
                     title: "New Collection",
@@ -596,11 +641,43 @@ struct CollectionsSettingsDetail: View {
     }
 }
 
+/// Settings → Collections: one account-wide layout for EVERY collection, or
+/// Custom to keep each collection's own. Sits above the list because it decides
+/// whether the per-collection Layout control inside each editor applies at all.
+private struct CollectionLayoutModePicker: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var collections: CollectionsStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OrivioSpacing.md) {
+            Text("Layout for all collections")
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundStyle(theme.palette.textPrimary)
+            HStack(spacing: OrivioSpacing.md) {
+                ForEach(CollectionLayoutMode.allCases) { mode in
+                    Button {
+                        collections.globalLayoutMode = mode
+                    } label: {
+                        FolderTabPill(label: mode.displayName,
+                                      selected: collections.globalLayoutMode == mode)
+                    }
+                    .buttonStyle(PlainCardButtonStyle())
+                }
+            }
+            Text(collections.globalLayoutMode.summary)
+                .font(.system(size: 20))
+                .foregroundStyle(theme.palette.textSecondary)
+                .frame(maxWidth: 900, alignment: .leading)
+        }
+    }
+}
+
 // MARK: - Collection editor
 
-/// Create/edit one collection: title, folders, and each folder's addon
-/// catalog sources (TMDB/Trakt sources need the #4 integrations; existing
-/// ones from other devices are preserved untouched).
+/// Create/edit one collection: title, folders, and each folder's TMDB / Trakt
+/// sources (both need their integration configured — TMDB wants the viewer's
+/// own API key. Add-on sources written by other devices are preserved
+/// untouched, but they no longer resolve here).
 struct CollectionEditorView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var collections: CollectionsStore
@@ -657,7 +734,22 @@ struct CollectionEditorView: View {
                         subtitle: "Show a combined tab alongside each folder's tab in the browser",
                         isOn: $showAllTab
                     )
-                    CollectionLayoutPicker(viewMode: $viewMode)
+                    // The per-collection layout only means anything while the
+                    // account-wide mode is Custom — otherwise every collection
+                    // is forced to one layout and this control would lie.
+                    if collections.globalLayoutMode == .custom {
+                        CollectionLayoutPicker(viewMode: $viewMode)
+                    } else {
+                        VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
+                            Text("Layout")
+                                .font(.system(size: 26, weight: .semibold))
+                                .foregroundStyle(theme.palette.textPrimary)
+                            Text("All collections are set to \(collections.globalLayoutMode.displayName) in Settings → Collections. Switch that to Custom to give this one its own layout.")
+                                .font(.system(size: 20))
+                                .foregroundStyle(theme.palette.textSecondary)
+                                .frame(maxWidth: 900, alignment: .leading)
+                        }
+                    }
 
                     Text("Folders")
                         .font(.system(size: 28, weight: .bold))
@@ -666,7 +758,7 @@ struct CollectionEditorView: View {
                     Button { addingFolder = true } label: {
                         SettingsActionRow(
                             title: "Add Folder",
-                            subtitle: "Pick catalogs to fill it",
+                            subtitle: "Pick TMDB or Trakt sources to fill it",
                             leadingIcon: "folder.badge.plus"
                         )
                     }
@@ -820,28 +912,34 @@ struct CollectionEditorView: View {
     }
 
     private func folderSubtitle(_ folder: OrivioCollectionFolder) -> String {
-        let addonCount = folder.addonSources.count
-        let otherCount = folder.effectiveSources.count - addonCount
-        var parts: [String] = ["\(addonCount) catalog\(addonCount == 1 ? "" : "s")"]
-        if otherCount > 0 { parts.append("\(otherCount) TMDB/Trakt") }
-        return parts.joined(separator: " · ")
+        let liveCount = folder.effectiveSources.count - folder.addonSources.count
+        guard liveCount > 0 else {
+            // Nothing this folder holds can resolve — say so here rather than
+            // letting it read as configured and open empty.
+            return folder.addonSources.isEmpty ? "No sources" : "No TMDB/Trakt sources"
+        }
+        return "\(liveCount) TMDB/Trakt source\(liveCount == 1 ? "" : "s")"
     }
 
 }
 
 // MARK: - Folder editor
 
-/// Edit one folder: name and which installed addon catalogs feed it.
+/// Edit one folder: name and which TMDB / Trakt sources feed it.
+///
+/// Categories are a TMDB/Trakt feature — there is no add-on catalog picker here
+/// any more. Add-on sources on a folder authored elsewhere are kept in storage
+/// (so this editor never rewrites the phone's copy) but they no longer resolve.
 private struct FolderEditorView: View {
     @EnvironmentObject private var theme: ThemeManager
-    @EnvironmentObject private var addonManager: AddonManager
 
     let folder: OrivioCollectionFolder?
     let onDone: (OrivioCollectionFolder?) -> Void
 
     @State private var title = ""
-    @State private var selectedSources: Set<String> = []
-    /// Non-addon sources carried through untouched (TMDB/Trakt from Android).
+    /// Add-on sources this folder already had, preserved verbatim across a save.
+    @State private var legacyAddonSources: [CollectionSourceDTO] = []
+    /// The TMDB / Trakt sources this editor actually manages.
     @State private var passthroughSources: [CollectionSourceDTO] = []
     @State private var tileShape = "SQUARE"
     @State private var coverURL = ""
@@ -849,31 +947,6 @@ private struct FolderEditorView: View {
 
     private static let shapes: [(id: String, label: String)] =
         [("SQUARE", "Square"), ("POSTER", "Poster"), ("LANDSCAPE", "Landscape")]
-
-    private struct CatalogChoice: Identifiable {
-        let source: CollectionSourceDTO
-        let label: String
-        let addonName: String
-        var id: String { "\(source.addonId ?? "")|\(source.type ?? "")|\(source.catalogId ?? "")" }
-    }
-
-    private var choices: [CatalogChoice] {
-        addonManager.catalogAddons.flatMap { addon in
-            (addon.manifest.catalogs ?? [])
-                .filter { !$0.requiresExtra }
-                .map { catalog in
-                    CatalogChoice(
-                        source: CollectionSourceDTO(
-                            addonId: addon.manifest.id,
-                            type: catalog.type,
-                            catalogId: catalog.id
-                        ),
-                        label: catalog.displayName,
-                        addonName: addon.manifest.name
-                    )
-                }
-        }
-    }
 
     var body: some View {
         ZStack {
@@ -887,45 +960,6 @@ private struct FolderEditorView: View {
                     TextField("Folder name", text: $title)
                         .font(.system(size: 26))
                         .frame(maxWidth: 700)
-
-                    Text("Catalog Sources")
-                        .font(.system(size: 28, weight: .bold))
-                        .foregroundStyle(theme.palette.textPrimary)
-
-                    ForEach(choices) { choice in
-                        Button {
-                            if selectedSources.contains(choice.id) {
-                                selectedSources.remove(choice.id)
-                            } else {
-                                selectedSources.insert(choice.id)
-                            }
-                        } label: {
-                            HStack(spacing: OrivioSpacing.lg) {
-                                Image(systemName: selectedSources.contains(choice.id)
-                                      ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 26))
-                                    .foregroundStyle(selectedSources.contains(choice.id)
-                                                     ? theme.palette.secondary : theme.palette.textTertiary)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(choice.label)
-                                        .font(.system(size: 24, weight: .medium))
-                                        .foregroundStyle(theme.palette.textPrimary)
-                                    Text(choice.addonName)
-                                        .font(.system(size: 18))
-                                        .foregroundStyle(theme.palette.textTertiary)
-                                }
-                                Spacer()
-                            }
-                            .padding(.horizontal, OrivioSpacing.lg)
-                            .frame(minHeight: 70)
-                            .frame(maxWidth: 900)
-                            .background(
-                                RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
-                                    .fill(theme.palette.backgroundCard.opacity(0.5))
-                            )
-                        }
-                        .buttonStyle(PlainCardButtonStyle())
-                    }
 
                     Text("TMDB / Trakt Sources")
                         .font(.system(size: 28, weight: .bold))
@@ -999,9 +1033,7 @@ private struct FolderEditorView: View {
             tileShape = folder.tileShape
             coverURL = folder.coverImageUrl ?? ""
             passthroughSources = folder.effectiveSources.filter { !$0.isAddonSource }
-            selectedSources = Set(folder.addonSources.map {
-                "\($0.addonId ?? "")|\($0.type ?? "")|\($0.catalogId ?? "")"
-            })
+            legacyAddonSources = folder.addonSources
         }
         // Same as Cancel — dismiss without saving.
         .onExitCommand { onDone(nil) }
@@ -1017,11 +1049,12 @@ private struct FolderEditorView: View {
     private func save() {
         let trimmed = title.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        let picked = choices.filter { selectedSources.contains($0.id) }.map(\.source)
         var result = folder ?? OrivioCollectionFolder(id: UUID().uuidString, title: trimmed, sources: [])
         result.title = trimmed
-        result.sources = picked + passthroughSources
-        result.catalogSources = picked
+        // Addon rows ride along untouched: they resolve to nothing here, but
+        // dropping them would sync that deletion to every other client.
+        result.sources = legacyAddonSources + passthroughSources
+        result.catalogSources = legacyAddonSources
         result.tileShape = tileShape
         let trimmedCover = coverURL.trimmingCharacters(in: .whitespaces)
         result.coverImageUrl = trimmedCover.isEmpty ? nil : trimmedCover

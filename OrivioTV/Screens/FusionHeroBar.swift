@@ -53,6 +53,12 @@ struct FusionHeroBar: View {
         .padding(.vertical, OrivioSpacing.sm)
         .onAppear { isVisible = true }
         .onDisappear { isVisible = false }
+        // The item list changes whenever Home reloads (cached → live rows, a
+        // layout change, a sync). An index past the new end rendered a blank
+        // card with a dead "Go to Movie" button until the next rotation.
+        .onChange(of: items.map(\.id)) { _, _ in
+            if !items.indices.contains(index) { index = 0 }
+        }
         .onReceive(tick) { _ in rotateIfIdle() }
         .contentRating(for: current, into: $contentRating)
     }
@@ -62,7 +68,7 @@ struct FusionHeroBar: View {
         ZStack(alignment: .bottomLeading) {
             // Panoramic artwork — the subject reads on the right, text on the left.
             if let art = current?.background ?? current?.poster {
-                RemoteImage(url: art, alignment: .trailing)
+                RemoteImage(url: art, alignment: .trailing, maxPixels: PerformanceProfile.backdropPixelCap)
                     .frame(width: width, height: height)
                     .clipped()
                     // §21.2 dim: unfocused bar sits slightly dark, lifting on
@@ -151,7 +157,7 @@ struct FusionHeroBar: View {
 
             // Title logo when available, else a bold text title.
             if let logo = current?.logo {
-                RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading)
+                RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading, maxDimension: 360)
                     .frame(width: 360, height: 96)
                     .shadow(color: .black.opacity(scheme == .light ? 0.25 : 0.45), radius: 10, y: 4)
             } else if let name = current?.name {
@@ -212,9 +218,12 @@ struct FusionHeroBar: View {
             Color.clear.frame(width: 1, height: 40)
                 .focusable()
                 .focused($stepFocus, equals: -1)
-            // One primary action, matching the reference — opens the title's page.
+            // One primary action, matching the reference — opens the title's
+            // page. Labelled by TYPE: "Go to Show" on a series read wrong as
+            // "Go to Movie". (The top hero keeps its own labelling.)
             Button { if let c = current { onPlay(c) } } label: {
-                Label("Go to Movie", systemImage: "play.fill")
+                Label(current?.isSeries == true ? "Go to Show" : "Go to Movie",
+                      systemImage: "play.fill")
             }
             .buttonStyle(FusionHeroBarButtonStyle(prominent: true))
             .focused($playButtonFocus)

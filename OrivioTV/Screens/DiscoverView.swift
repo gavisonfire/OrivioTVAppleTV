@@ -16,6 +16,14 @@ final class DiscoverViewModel: ObservableObject {
     private var replacingSelection = false
 
     func reset(addon: InstalledAddon, catalog: ManifestCatalog, genre: String?) async {
+        // `.task(id:)` re-runs on every re-appearance with the SAME key (a
+        // return from a poster's Detail page). Nothing changed: keep the pages
+        // and the focused cell instead of snapping back to page one.
+        if let current, current.addon.id == addon.id, current.catalog.id == catalog.id,
+           current.catalog.type == catalog.type,   // Cinemeta: {movie,"top"} vs {series,"top"}
+           self.genre == genre, !items.isEmpty {
+            return
+        }
         generation += 1
         current = (addon, catalog)
         self.genre = genre
@@ -57,7 +65,10 @@ final class DiscoverViewModel: ObservableObject {
             replacingSelection = false
             items = []
         }
-        let fresh = page.filter { seen.insert($0.id + $0.type).inserted }
+        // Keyed on `id` alone — the grid's `ForEach` identifies rows by
+        // `MetaItem.id`, and the same title typed `series` by one addon and
+        // `tv` by another would otherwise land twice under one identifier.
+        let fresh = page.filter { seen.insert($0.id).inserted }
         if fresh.isEmpty { reachedEnd = true } else { items.append(contentsOf: fresh) }
     }
 }

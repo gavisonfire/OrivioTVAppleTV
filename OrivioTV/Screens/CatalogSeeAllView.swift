@@ -62,9 +62,9 @@ struct CatalogSeeAllView: View {
         ZStack {
             ATVBackground()
             if viewModel.items.isEmpty && viewModel.isLoading {
-                OrivioLoadingView(label: "Loading \(title)")
+                OrivioLoadingView(label: "Loading \(title)", holdsFocus: true)
             } else if viewModel.items.isEmpty {
-                OrivioEmptyState(icon: "square.stack.3d.up.slash", title: title, message: "No titles in this catalog.")
+                OrivioEmptyState(icon: "square.stack.3d.up.slash", title: title, message: "No titles in this catalog.", holdsFocus: true)
             } else {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: OrivioSpacing.xl) {

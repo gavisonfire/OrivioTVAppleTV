@@ -35,19 +35,20 @@ enum OrivioRenameMigration {
         var reclaimed = 0
         for (key, value) in defaults.dictionaryRepresentation() where key.hasPrefix(legacyPrefix) {
             let newKey = currentPrefix + key.dropFirst(legacyPrefix.count)
-            if defaults.object(forKey: newKey) == nil {
-                defaults.set(value, forKey: newKey)
-                moved += 1
-            }
             // Small settings keys stay behind so a downgrade still finds them.
             // BIG ones cannot: this domain has already hit CFPreferences'
             // TOO_MUCH_DATA abort at around a megabyte (see CollectionsStore),
             // and keeping a second copy of the collections blob — ~900 KB on a
             // real account — parks the app permanently next to that limit for
-            // the sake of a downgrade nobody performs.
+            // the sake of a downgrade nobody performs. Removed BEFORE the copy
+            // is written, so the domain never transiently holds both.
             if Self.byteSize(of: value) > 65_536 {
                 defaults.removeObject(forKey: key)
                 reclaimed += 1
+            }
+            if defaults.object(forKey: newKey) == nil {
+                defaults.set(value, forKey: newKey)
+                moved += 1
             }
         }
         NSLog("[OrivioMigration] carried over %d preference keys, reclaimed %d oversized legacy ones",

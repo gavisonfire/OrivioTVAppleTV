@@ -350,7 +350,11 @@ final class ScrubThumbnailer: @unchecked Sendable {
                 // Don't chase a frame forever inside one seek window.
                 if reads > 240 { break }
                 guard packet.pointee.stream_index == Int32(videoIndex) else { continue }
-                guard avcodec_send_packet(codecCtx, packet) >= 0 else { break }
+                // EAGAIN from send means "drain output first", not a broken
+                // stream — fall through to receive instead of abandoning the
+                // whole seek slot (B-frame HEVC does this on the 2nd packet).
+                let sent = avcodec_send_packet(codecCtx, packet)
+                guard sent >= 0 || sent == -35 || sent == Int32(-EAGAIN) else { break }
                 let received = avcodec_receive_frame(codecCtx, frame)
                 if received < 0 {
                     // EAGAIN just means "feed me more packets".

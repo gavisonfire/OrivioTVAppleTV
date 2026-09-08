@@ -110,19 +110,78 @@ final class DebridStore: ObservableObject {
     private static let preferredKey = "orivio.debrid.preferred.v1"
     private static let rdRefreshKey = "orivio.debrid.rdrefresh.v1"
 
+    /// Debrid logins are PER PROFILE (upstream keeps `real_debrid_api_key`
+    /// etc. in its per-profile `debrid_settings`, and the provider-credentials
+    /// sync has always sent `p_profile_id`). The Real-Debrid refresh bundle
+    /// follows its key: it belongs to the same account the key does. The
+    /// legacy device-wide keys go to the PRIMARY profile; other profiles
+    /// start signed out and connect their own (Trakt-switch semantics).
+    private(set) var profileID: Int
+
+    /// Separate-vs-shared switch (Trakt-style). Shared = one set of debrid
+    /// logins for the whole device, the pre-split behaviour.
+    static let feature = "debrid"
+    var perProfileEnabled: Bool { ProfileScopedDefaults.isSeparate(Self.feature) }
+
+    func setPerProfile(_ on: Bool) {
+        guard on != perProfileEnabled else { return }
+        ProfileScopedDefaults.setSeparate(Self.feature, on)
+        reload()
+    }
+
     init() {
-        if let data = UserDefaults.standard.data(forKey: Self.keysKey),
+        profileID = ProfileScopedDefaults.activeProfileID
+        reload()
+    }
+
+    /// Load keys/preferred/refresh for whichever scope is active now.
+    private func reload() {
+        applyingRemote = true
+        defer { applyingRemote = false }
+        if let data = ProfileScopedDefaults.data(Self.keysKey, feature: Self.feature, profileID),
            let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
             keys = Dictionary(uniqueKeysWithValues: decoded.compactMap { raw in
                 DebridProvider(rawValue: raw.key).map { ($0, raw.value) }
             })
+        } else {
+            keys = [:]
         }
-        if let raw = UserDefaults.standard.string(forKey: Self.preferredKey) {
-            preferred = DebridProvider(rawValue: raw)
-        }
-        if let data = UserDefaults.standard.data(forKey: Self.rdRefreshKey) {
+        // "" is the explicit none-marker `saveMeta` writes — without it,
+        // clearing the preference would fall back to the legacy seed forever.
+        let raw = ProfileScopedDefaults.string(Self.preferredKey, feature: Self.feature, profileID)
+        preferred = raw.flatMap { DebridProvider(rawValue: $0) }
+        if let data = ProfileScopedDefaults.data(Self.rdRefreshKey, feature: Self.feature, profileID),
+           !data.isEmpty {
             rdRefresh = try? JSONDecoder().decode(RDRefresh.self, from: data)
+        } else {
+            rdRefresh = nil
         }
+    }
+
+    /// Point the store at a profile — its own debrid logins, or none.
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        reload()
+    }
+
+    /// Forget a deleted profile's debrid logins.
+    func forgetProfile(_ id: Int) {
+        ProfileScopedDefaults.forget([Self.keysKey, Self.preferredKey, Self.rdRefreshKey], profile: id)
+        if id == profileID { reload() }
+    }
+
+    /// Forget EVERY profile's debrid logins plus the legacy seed. For an
+    /// account switch: any surviving slot (or the seed a fresh profile would
+    /// copy) still carries the previous user's API keys, and the next profile
+    /// switch would push them into the new account's credentials.
+    func forgetAllProfiles() {
+        applyingRemote = true
+        defer { applyingRemote = false }
+        ProfileScopedDefaults.forgetAll([Self.keysKey, Self.preferredKey, Self.rdRefreshKey])
+        keys = [:]
+        preferred = nil
+        rdRefresh = nil
     }
 
     /// Save the result of a QR device login: the token as the provider's key,
@@ -171,10 +230,12 @@ final class DebridStore: ObservableObject {
     }
 
     private func saveRDRefresh() {
+        let target = ProfileScopedDefaults.writeKey(Self.rdRefreshKey, feature: Self.feature, profileID)
         if let refresh = rdRefresh, let data = try? JSONEncoder().encode(refresh) {
-            UserDefaults.standard.set(data, forKey: Self.rdRefreshKey)
+            UserDefaults.standard.set(data, forKey: target)
         } else {
-            UserDefaults.standard.removeObject(forKey: Self.rdRefreshKey)
+            // Empty marker, not removal — see `saveMeta`.
+            UserDefaults.standard.set(Data(), forKey: target)
         }
     }
 
@@ -251,12 +312,17 @@ final class DebridStore: ObservableObject {
     private func saveKeys() {
         let raw = Dictionary(uniqueKeysWithValues: keys.map { ($0.key.rawValue, $0.value) })
         if let data = try? JSONEncoder().encode(raw) {
-            UserDefaults.standard.set(data, forKey: Self.keysKey)
+            UserDefaults.standard.set(
+                data, forKey: ProfileScopedDefaults.writeKey(Self.keysKey, feature: Self.feature, profileID))
         }
     }
 
     private func saveMeta() {
-        UserDefaults.standard.set(preferred?.rawValue, forKey: Self.preferredKey)
+        // Write "" rather than removing: an absent scoped key falls back to
+        // the legacy seed, which would resurrect a cleared preference.
+        UserDefaults.standard.set(
+            preferred?.rawValue ?? "",
+            forKey: ProfileScopedDefaults.writeKey(Self.preferredKey, feature: Self.feature, profileID))
     }
 }
 

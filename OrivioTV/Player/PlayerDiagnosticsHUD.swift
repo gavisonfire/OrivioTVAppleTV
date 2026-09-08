@@ -14,6 +14,14 @@ struct PlayerDiagnosticsHUD: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
+            // The HUD names itself and its off-switch. Left on after a
+            // debugging session, an unlabeled stat block over the letterbox
+            // bar reads as rendering garbage, not as a tool ("top black
+            // border was showing some garbage").
+            Text("DIAGNOSTICS · Settings → Performance")
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.45))
+                .padding(.bottom, 2)
             row("Engine", snapshot.engine)
             if snapshot.fps > 0 {
                 row("FPS", String(format: "%.1f", snapshot.fps),

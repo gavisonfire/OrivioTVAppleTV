@@ -79,6 +79,16 @@ struct PlaybackSettingsDetail: View {
                 }
 
                 OrivioDropdown(
+                    title: "Source search patience",
+                    subtitle: "How long each addon gets to answer a stream search. Raise it for aggregators that query Usenet indexers behind the scenes (AIOStreams with NZBgeek) — their full results can outlast the standard deadline. Fast addons still show up the moment they answer.",
+                    icon: "clock.arrow.circlepath",
+                    selection: String(store.settings.sourceSearchTimeoutSeconds),
+                    options: [45, 60, 90, 120].map {
+                        OrivioDropdownOption(String($0), "\($0) seconds")
+                    }
+                ) { store.settings.sourceSearchTimeoutSeconds = Int($0) ?? 45 }
+
+                OrivioDropdown(
                     title: "Minimum resolution",
                     subtitle: "Hide links below this quality (links with no resolution tag are kept)",
                     icon: "arrow.up.right.video.fill",
@@ -200,11 +210,18 @@ struct PlaybackSettingsDetail: View {
 
                 OrivioDropdown(
                     title: "Buffer ahead",
-                    subtitle: "How much of the video to download ahead so a slow/bursty connection doesn't rebuffer. Auto sizes to the file. The MB/GB options pre-load roughly that much of the movie before it's needed. Capped to what your Apple TV's memory can hold (no disk cache on tvOS), so on a 3 GB model the big options top out ~600 MB.",
+                    subtitle: "How much of the video to download ahead so a slow/bursty connection doesn't rebuffer. Auto sizes to the file. The MB/GB options pre-load roughly that much of the movie before it's needed. Capped to what your Apple TV's memory can hold, so on a 3 GB model the big options top out ~600 MB — for more, see Hybrid disk cache below.",
                     icon: "gauge.with.dots.needle.50percent",
                     selection: store.settings.bufferProfile.rawValue,
                     options: BufferProfile.allCases.map { OrivioDropdownOption($0.rawValue, $0.label) }
                 ) { store.settings.bufferProfile = BufferProfile(rawValue: $0) ?? .auto }
+
+                PlaybackToggleRow(
+                    icon: "internaldrive.fill",
+                    title: "Hybrid disk cache (beta)",
+                    subtitle: "Download the whole file to the Apple TV's storage at full speed while playing, so seeking anywhere already-downloaded is instant — like Infuse. Needs free space for the file; direct-file streams only (HLS plays normally); the cache is deleted when playback ends.",
+                    isOn: s.hybridDiskCacheEnabled
+                )
 
                 // External engine: pick WHICH installed app receives streams.
                 // canOpenURL only sees apps actually on this Apple TV, so the
@@ -283,18 +300,6 @@ struct PlaybackSettingsDetail: View {
             }
 
             SettingsGroupCard(title: "On-screen display", subtitle: "Player overlays and status") {
-                PlaybackToggleRow(
-                    icon: "pause.rectangle.fill",
-                    title: "Pause overlay",
-                    subtitle: "Show the info overlay (title, artwork, progress) when playback is paused",
-                    isOn: s.pauseOverlayEnabled
-                )
-                PlaybackToggleRow(
-                    icon: "clock.fill",
-                    title: "Clock",
-                    subtitle: "Show a wall clock on the player controls",
-                    isOn: s.osdClockEnabled
-                )
                 PlaybackToggleRow(
                     icon: "photo.fill",
                     title: "Loading backdrop",
@@ -378,6 +383,14 @@ struct PlaybackSettingsDetail: View {
                         OrivioDropdownOption(String($0), sizeLabel($0))
                     }
                 ) { store.settings.subtitleSize = Int($0) ?? 36 }
+
+                OrivioDropdown(
+                    title: "Font",
+                    subtitle: "Also adjustable live from the Subtitles panel during playback.",
+                    icon: "textformat",
+                    selection: store.settings.subtitleFontName,
+                    options: PlayerSettings.subtitleFontOptions.map { OrivioDropdownOption($0.0, $0.1) }
+                ) { store.settings.subtitleFontName = $0 }
 
                 OrivioDropdown(
                     title: "Timing offset",

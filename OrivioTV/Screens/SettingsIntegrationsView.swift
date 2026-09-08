@@ -110,10 +110,18 @@ struct IntegrationsDetail: View {
 
     private var tmdbSection: some View {
         VStack(alignment: .leading, spacing: OrivioSpacing.md) {
+            // ABOVE the switch, and always visible: the key is the thing that
+            // turns TMDB on. Hiding it behind the switch meant the one control
+            // that matters was the one you couldn't reach.
+            TMDBKeyRow()
+
             SettingsToggleCard(
                 title: "Enable TMDB",
-                subtitle: "Powers TMDB collection sources (lists, collections, companies, networks, discover)",
-                isOn: Binding(get: { tmdb.settings.enabled }, set: { tmdb.settings.enabled = $0 })
+                subtitle: tmdb.hasAPIKey
+                    ? "Powers TMDB sources in every collection (lists, collections, companies, networks, discover)"
+                    : "Add your API key above to switch this on",
+                isOn: Binding(get: { tmdb.settings.enabled },
+                              set: { tmdb.settings.enabled = $0 && tmdb.hasAPIKey })
             )
 
             if tmdb.settings.enabled {
@@ -172,7 +180,7 @@ struct IntegrationsDetail: View {
                 )
             }
 
-            Text("Uses a shared, app-embedded TMDB API key — no sign-in required.")
+            Text("TMDB keys are free and personal: sign in at themoviedb.org, open Settings → API, and copy the API Key (v3 auth).")
                 .font(.system(size: 18))
                 .foregroundStyle(theme.palette.textTertiary)
                 .padding(.top, 2)
@@ -487,6 +495,226 @@ private struct DebridConnectPage: View {
 }
 
 // MARK: - MDBList rows
+
+/// TMDB API key row — the same shape as the MDBList and debrid key rows.
+private struct TMDBKeyRow: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var tmdb: TMDBSettingsStore
+    @State private var showEditor = false
+
+    var body: some View {
+        Button { showEditor = true } label: {
+            HStack(spacing: OrivioSpacing.lg) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("API Key")
+                        .font(.system(size: 25, weight: .medium))
+                        .foregroundStyle(theme.palette.textPrimary)
+                    Text(tmdb.hasAPIKey
+                         ? "Connected · key set"
+                         : "Scan a QR to send your key from your phone, or paste it here")
+                        .font(.system(size: 19))
+                        .foregroundStyle(tmdb.hasAPIKey ? OrivioPrimitives.success : theme.palette.textSecondary)
+                }
+                Spacer()
+                Image(systemName: tmdb.hasAPIKey ? "checkmark.circle.fill" : "plus.circle")
+                    .font(.system(size: 26))
+                    .foregroundStyle(tmdb.hasAPIKey ? OrivioPrimitives.success : theme.palette.textTertiary)
+            }
+            .integrationRowBackground(theme)
+        }
+        .buttonStyle(PlainCardButtonStyle())
+        .fullScreenCover(isPresented: $showEditor) {
+            TMDBKeyEditor { showEditor = false }
+                .environmentObject(theme)
+                .environmentObject(tmdb)
+        }
+    }
+}
+
+private struct TMDBKeyEditor: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var tmdb: TMDBSettingsStore
+    let onDone: () -> Void
+
+    @State private var key = ""
+    @State private var validating = false
+    @State private var status: String?
+    @State private var showQR = false
+
+    var body: some View {
+        ZStack {
+            ATVBackground()
+            VStack(spacing: OrivioSpacing.xl) {
+                Text("TMDB API Key")
+                    .font(.system(size: 40, weight: .bold))
+                    .foregroundStyle(theme.palette.textPrimary)
+                Text("Sign in at themoviedb.org → Settings → API and copy your API Key (v3 auth). It's free.")
+                    .font(.system(size: 22))
+                    .foregroundStyle(theme.palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 900)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // The key already lives in a browser tab on the phone. Scanning
+                // beats retyping 32 hex characters on a remote.
+                Button { showQR = true } label: {
+                    HStack(spacing: OrivioSpacing.sm) {
+                        Image(systemName: "qrcode")
+                        Text("Send from my phone")
+                    }
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(theme.palette.onSecondary)
+                    .padding(.horizontal, OrivioSpacing.xl)
+                    .padding(.vertical, OrivioSpacing.md)
+                    .background(Capsule().fill(theme.palette.secondary))
+                }
+                .buttonStyle(PlainCardButtonStyle())
+
+                Text("or type it here")
+                    .font(.system(size: 20))
+                    .foregroundStyle(theme.palette.textTertiary)
+
+                SecureField("Paste API key", text: $key)
+                    .font(.system(size: 24))
+                    .frame(maxWidth: 760)
+
+                if let status {
+                    Text(status)
+                        .font(.system(size: 20))
+                        .foregroundStyle(status.hasPrefix("Valid") ? OrivioPrimitives.success : OrivioPrimitives.error)
+                }
+
+                HStack(spacing: OrivioSpacing.lg) {
+                    Button(action: verifyAndSave) {
+                        if validating { ProgressView().tint(theme.palette.onSecondary) }
+                        else { Text("Verify & Save") }
+                    }
+                    .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty)
+                    if tmdb.hasAPIKey {
+                        Button("Remove", role: .destructive) {
+                            tmdb.setAPIKey("")
+                            onDone()
+                        }
+                    }
+                    Button("Cancel", role: .cancel, action: onDone)
+                }
+                .font(.system(size: 24, weight: .semibold))
+            }
+            .padding(OrivioSpacing.huge)
+        }
+        .onAppear { key = tmdb.settings.trimmedAPIKey }
+        // Same as Cancel — dismiss without saving.
+        .onExitCommand { onDone() }
+        .fullScreenCover(isPresented: $showQR) {
+            TMDBKeyHandoffPage { saved in
+                showQR = false
+                if saved { onDone() }
+            }
+            .environmentObject(theme)
+            .environmentObject(tmdb)
+        }
+    }
+
+    private func verifyAndSave() {
+        guard !validating else { return }
+        validating = true
+        status = nil
+        let trimmed = key.trimmingCharacters(in: .whitespaces)
+        Task {
+            let valid = await TMDBService.validate(apiKey: trimmed)
+            validating = false
+            if valid {
+                tmdb.setAPIKey(trimmed)
+                status = "Valid — saved."
+                onDone()
+            } else {
+                status = "Invalid key or network error."
+            }
+        }
+    }
+}
+
+/// Scan-to-enter for the TMDB key: this Apple TV serves a one-field page on the
+/// local network and shows its address as a QR. TMDB itself has no device/QR
+/// login — every v3 request is authenticated by the key, so there is no flow
+/// that hands one out — hence the hand-off happens between the phone and the
+/// TV rather than through TMDB.
+private struct TMDBKeyHandoffPage: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var tmdb: TMDBSettingsStore
+    /// `true` when a key was accepted and saved.
+    let onDone: (Bool) -> Void
+
+    @StateObject private var server = KeyHandoffServer(
+        title: "TMDB API key",
+        blurb: "Open <a href=\"https://www.themoviedb.org/settings/api\" target=\"_blank\" "
+             + "rel=\"noopener\">themoviedb.org/settings/api</a>, copy your "
+             + "<strong>API Key (v3 auth)</strong>, and paste it below.",
+        placeholder: "Paste your TMDB API key"
+    )
+
+    var body: some View {
+        ZStack {
+            ATVBackground()
+            VStack(spacing: OrivioSpacing.lg) {
+                Text("Send your TMDB key")
+                    .font(.system(size: 40, weight: .bold))
+                    .foregroundStyle(theme.palette.textPrimary)
+
+                if server.accepted {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 90))
+                        .foregroundStyle(OrivioPrimitives.success)
+                    Text("Key saved.")
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundStyle(theme.palette.textPrimary)
+                } else if let address = server.address {
+                    Text("Scan with your phone, or open \(address) in its browser. Both devices have to be on the same network.")
+                        .font(.system(size: 22))
+                        .foregroundStyle(theme.palette.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 900)
+                        .fixedSize(horizontal: false, vertical: true)
+                    QRCodeView(string: address, side: 360)
+                    Text(address)
+                        .font(.system(size: 24, weight: .medium, design: .monospaced))
+                        .foregroundStyle(theme.palette.secondary)
+                } else if let error = server.lastError {
+                    Text(error)
+                        .font(.system(size: 22))
+                        .foregroundStyle(OrivioPrimitives.error)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 900)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    OrivioLoadingView(label: "Starting")
+                        .frame(height: 360)
+                }
+
+                Button(server.accepted ? "Done" : "Cancel") { onDone(server.accepted) }
+                    .font(.system(size: 24, weight: .semibold))
+                    .padding(.top, OrivioSpacing.sm)
+            }
+            .padding(OrivioSpacing.huge)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .onAppear {
+            server.onSubmit = { value in
+                // Verified before saving, exactly like on-TV entry — a typo
+                // should say so on the phone, where it can be fixed, rather
+                // than quietly emptying every TMDB-backed row.
+                guard await TMDBService.validate(apiKey: value) else {
+                    return (false, "That key didn't work. Check you copied the v3 API key.")
+                }
+                tmdb.setAPIKey(value)
+                return (true, "Saved — you can put your phone down.")
+            }
+            server.start()
+        }
+        .onDisappear { server.stop() }
+        .onExitCommand { onDone(server.accepted) }
+    }
+}
 
 private struct MDBListKeyRow: View {
     @EnvironmentObject private var theme: ThemeManager

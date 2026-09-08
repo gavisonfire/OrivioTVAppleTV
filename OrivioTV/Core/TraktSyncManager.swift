@@ -54,7 +54,11 @@ final class TraktSyncManager: ObservableObject {
                 // Someone who just completed the device-code login is sitting
                 // there waiting for their history: sync immediately.
                 if self?.trakt.didSignInInteractively == true {
-                    self?.syncNow(force: true)
+                    // One main-actor turn later: `@Published` notifies from
+                    // `willSet`, so syncNow's own signed-in guard would still
+                    // see the PREVIOUS (signed-out) value and skip the very
+                    // sync this sign-in is waiting for.
+                    Task { @MainActor [weak self] in self?.syncNow(force: true) }
                     return
                 }
                 // A token restored at launch is deferred, like the Stremio and
@@ -85,38 +89,64 @@ final class TraktSyncManager: ObservableObject {
         if !force, Date().timeIntervalSince(lastFullSync) < 60 { return }
         lastFullSync = Date()
         // Don't cancel an in-flight sync — a rapid second trigger (sign-in +
-        // foreground) used to abort the first mid-way. Coalesce instead.
-        if let t = syncTask, !t.isCancelled { return }
+        // foreground) used to abort the first mid-way. Coalesce instead — but
+        // REMEMBER the request: a profile switch during a run must sync the
+        // newly selected profile once the run ends, not be dropped (there is
+        // no periodic Trakt timer to pick it up later).
+        if let t = syncTask, !t.isCancelled { rerunRequested = true; return }
         syncTask = Task { [weak self] in
             await self?.runSync()
             self?.syncTask = nil
+            if self?.rerunRequested == true {
+                self?.rerunRequested = false
+                self?.syncNow(force: true)
+            }
         }
     }
+
+    /// A sync was requested while one was running; run again when it ends.
+    private var rerunRequested = false
+
+    /// The run belongs to the profile that started it. With per-profile Trakt
+    /// accounts, a switch mid-run re-scopes every store AND the token — an
+    /// unpinned run merged profile A's history into profile B's stores and
+    /// pushed B's local-only rows to A's Trakt account. Every phase re-checks
+    /// this after each await before it touches a store or issues a write.
+    private func profileStillActive(_ profile: Int) -> Bool { trakt.profileID == profile }
 
     private func runSync() async {
         NSLog("[OrivioTrakt] runSync start (history=%d playback=%d watchlist=%d ratings=%d)",
               trakt.syncWatchHistory ? 1 : 0, trakt.syncPlayback ? 1 : 0,
               trakt.syncWatchlist ? 1 : 0, trakt.syncRatings ? 1 : 0)
+        let profile = trakt.profileID
         guard let token = await validToken() else {
             NSLog("[OrivioTrakt] runSync aborted — no valid token")
             trakt.setSyncStatus("Trakt session expired — sign in again")
             return
         }
+        guard profileStillActive(profile) else {
+            NSLog("[OrivioTrakt] runSync abandoned — profile switched during token check")
+            return
+        }
         var parts: [String] = []
         if trakt.syncWatchHistory {
-            let n = await syncWatchHistory(token: token)
+            let n = await syncWatchHistory(token: token, profile: profile)
             parts.append("\(n) history")
         }
         if trakt.syncPlayback {
-            let n = await pullPlayback(token: token)
+            let n = await pullPlayback(token: token, profile: profile)
             if n > 0 { parts.append("\(n) in-progress") }
+        }
+        guard profileStillActive(profile) else {
+            NSLog("[OrivioTrakt] runSync abandoned — profile switched mid-run")
+            return
         }
         // Watchlist and ratings touch different stores from each other and from
         // the two phases above (LibraryStore and RatingsStore respectively), so
         // they run together. History and playback stay sequential: both write
         // progress/watched state and the order between them is load-bearing.
-        async let watchlistCount: Int? = trakt.syncWatchlist ? await syncWatchlist(token: token) : nil
-        async let ratingsCount: Int? = trakt.syncRatings ? await syncRatings(token: token) : nil
+        async let watchlistCount: Int? = trakt.syncWatchlist ? await syncWatchlist(token: token, profile: profile) : nil
+        async let ratingsCount: Int? = trakt.syncRatings ? await syncRatings(token: token, profile: profile) : nil
         if let n = await watchlistCount { parts.append("\(n) watchlist") }
         if let n = await ratingsCount { parts.append("\(n) ratings") }
         NSLog("[OrivioTrakt] runSync done: %@", parts.joined(separator: ", "))
@@ -125,8 +155,9 @@ final class TraktSyncManager: ObservableObject {
 
     /// Two-way watch history. Pull Trakt → add missing locally; push local
     /// items Trakt doesn't have. Returns the count pulled.
-    private func syncWatchHistory(token: String) async -> Int {
+    private func syncWatchHistory(token: String, profile: Int) async -> Int {
         let remote = await TraktService.watchedHistory(accessToken: token)
+        guard profileStillActive(profile) else { return 0 }
         let clearedAt = WatchHistoryClearState.clearedAt
         let remoteItems = remote.compactMap(watchedItem(from:)).filter { item in
             guard let clearedAt else { return true }
@@ -150,12 +181,13 @@ final class TraktSyncManager: ObservableObject {
     /// with meta for artwork + runtime — then push LOCAL Continue Watching rows
     /// Trakt is missing (scrobble-pause sets their playback position there).
     /// Returns count pulled.
-    private func pullPlayback(token: String) async -> Int {
+    private func pullPlayback(token: String, profile: Int) async -> Int {
         // Keep anything genuinely in progress — dropping ≤1% hid barely-started
         // titles that Trakt showed. ≥95% still counts as finished, matching the
         // player's own auto-clear threshold. nil = the fetch FAILED — bail out
         // entirely rather than mistaking an outage for an empty list.
         guard let remote = await TraktService.playbackProgress(accessToken: token) else { return 0 }
+        guard profileStillActive(profile) else { return 0 }
         let clearedAt = WatchHistoryClearState.clearedAt
         let items = remote.filter { item in
             let progress = item.progress ?? 0
@@ -193,6 +225,8 @@ final class TraktSyncManager: ObservableObject {
                 positionSeconds: pos, durationSeconds: dur, streamURL: nil,
                 updatedAt: s.watchedAt ?? Date(), syncSource: "trakt"))
         }
+        // The meta enrichment above awaits per row.
+        guard profileStillActive(profile) else { return 0 }
         progress.mergeExternal(rows)
 
         // LOCAL → TRAKT: Continue Watching rows Trakt doesn't have (scrobble
@@ -339,8 +373,10 @@ final class TraktSyncManager: ObservableObject {
 
     private func pushPlaybackRemove(_ metaID: String) {
         guard trakt.isSignedIn, trakt.syncPlayback else { return }
+        let profile = trakt.profileID   // the profile whose store fired this
         Task { [weak self] in
-            guard let self, let token = await self.validToken() else { return }
+            guard let self, let token = await self.validToken(),
+                  self.profileStillActive(profile) else { return }
             guard let rows = await TraktService.playbackProgress(accessToken: token) else { return }
             for s in rows where self.localID(from: s) == metaID {
                 guard let pid = s.playbackID else { continue }
@@ -351,8 +387,9 @@ final class TraktSyncManager: ObservableObject {
 
     /// Two-way watchlist ↔ Library. Pull Trakt → add missing to Library
     /// (enriched); push local-only Library items to the watchlist.
-    private func syncWatchlist(token: String) async -> Int {
+    private func syncWatchlist(token: String, profile: Int) async -> Int {
         let remote = await TraktService.watchlist(accessToken: token)
+        guard profileStillActive(profile) else { return 0 }
         var added: [SavedLibraryItem] = []
         var enriched = 0
         for s in remote {
@@ -371,6 +408,7 @@ final class TraktSyncManager: ObservableObject {
             added.append(SavedLibraryItem(id: id, type: s.type, name: name,
                                           poster: poster, background: background))
         }
+        guard profileStillActive(profile) else { return 0 }
         if !added.isEmpty { library.mergeRemote(added, reconcile: false) }
 
         // Push local-only.
@@ -385,8 +423,9 @@ final class TraktSyncManager: ObservableObject {
     }
 
     /// Two-way ratings ↔ Trakt (additive pull + push local-only).
-    private func syncRatings(token: String) async -> Int {
+    private func syncRatings(token: String, profile: Int) async -> Int {
         let remote = await TraktService.ratings(accessToken: token)
+        guard profileStillActive(profile) else { return 0 }
         let mapped: [(metaID: String, type: String, rating: Int)] = remote.compactMap { s in
             guard let id = localID(from: s), let r = s.rating else { return nil }
             return (id, s.type, r)
@@ -406,32 +445,40 @@ final class TraktSyncManager: ObservableObject {
     private func pushWatchlistAdd(_ item: SavedLibraryItem) {
         guard trakt.isSignedIn, trakt.syncWatchlist,
               let s = syncItem(fromLibrary: item) else { return }
+        let profile = trakt.profileID   // the profile whose store fired this
         Task { [weak self] in
-            guard let self, let token = await self.validToken() else { return }
+            guard let self, let token = await self.validToken(),
+                  self.profileStillActive(profile) else { return }
             _ = await TraktService.addToWatchlist([s], accessToken: token)
         }
     }
     private func pushWatchlistRemove(_ item: SavedLibraryItem) {
         guard trakt.isSignedIn, trakt.syncWatchlist,
               let s = syncItem(fromLibrary: item) else { return }
+        let profile = trakt.profileID   // the profile whose store fired this
         Task { [weak self] in
-            guard let self, let token = await self.validToken() else { return }
+            guard let self, let token = await self.validToken(),
+                  self.profileStillActive(profile) else { return }
             _ = await TraktService.removeFromWatchlist([s], accessToken: token)
         }
     }
     private func pushRating(_ metaID: String, _ type: String, _ rating: Int) {
         guard trakt.isSignedIn, trakt.syncRatings,
               let s = syncItem(metaID: metaID, type: type, rating: rating) else { return }
+        let profile = trakt.profileID   // the profile whose store fired this
         Task { [weak self] in
-            guard let self, let token = await self.validToken() else { return }
+            guard let self, let token = await self.validToken(),
+                  self.profileStillActive(profile) else { return }
             _ = await TraktService.addRatings([s], accessToken: token)
         }
     }
     private func pushUnrate(_ metaID: String, _ type: String) {
         guard trakt.isSignedIn, trakt.syncRatings,
               let s = syncItem(metaID: metaID, type: type, rating: nil) else { return }
+        let profile = trakt.profileID   // the profile whose store fired this
         Task { [weak self] in
-            guard let self, let token = await self.validToken() else { return }
+            guard let self, let token = await self.validToken(),
+                  self.profileStillActive(profile) else { return }
             _ = await TraktService.removeRatings([s], accessToken: token)
         }
     }
@@ -441,8 +488,10 @@ final class TraktSyncManager: ObservableObject {
     private func pushMark(_ item: WatchedItem) {
         guard trakt.isSignedIn, trakt.syncWatchHistory,
               let s = syncItem(from: item) else { return }
+        let profile = trakt.profileID   // the profile whose store fired this
         Task { [weak self] in
-            guard let self, let token = await self.validToken() else { return }
+            guard let self, let token = await self.validToken(),
+                  self.profileStillActive(profile) else { return }
             _ = await TraktService.addToHistory([s], accessToken: token)
         }
     }
@@ -451,8 +500,10 @@ final class TraktSyncManager: ObservableObject {
         guard trakt.isSignedIn, trakt.syncWatchHistory else { return }
         let syncItems = items.compactMap(syncItem(from:))
         guard !syncItems.isEmpty else { return }
+        let profile = trakt.profileID   // the profile whose store fired this
         Task { [weak self] in
-            guard let self, let token = await self.validToken() else { return }
+            guard let self, let token = await self.validToken(),
+                  self.profileStillActive(profile) else { return }
             _ = await TraktService.removeFromHistory(syncItems, accessToken: token)
         }
     }

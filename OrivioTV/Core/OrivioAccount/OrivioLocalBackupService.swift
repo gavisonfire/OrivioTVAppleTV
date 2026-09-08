@@ -98,7 +98,14 @@ enum OrivioLocalBackupService {
             pluginInstalled += 1
         }
 
-        for item in backup.library { library.add(item) }
+        // One merge, not N adds: `add` fires the tracker hooks per item, and
+        // each Trakt/SIMKL hook spawned its own health check plus watchlist
+        // POST — hundreds of concurrent calls for a big backup, straight into
+        // Trakt's 1 req/s POST limit. The merge is silent; the single local-
+        // change ping below queues the account push, and the trackers' next
+        // full sync batches whatever they are missing.
+        library.importItems(backup.library)
+        if !backup.library.isEmpty { library.onLocalChange?() }
         progress.importEntries(backup.progress)
         watched.importItems(backup.watched)
 

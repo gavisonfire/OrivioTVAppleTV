@@ -737,7 +737,19 @@ struct ProfileEditView: View {
                 .foregroundStyle(theme.palette.textSecondary)
                 .frame(maxWidth: 820, alignment: .leading)
 
-            Toggle("Auto Link Selector", isOn: autoBind(\.enabled))
+            Toggle("Auto Link Selector", isOn: Binding(
+                get: { current.autoLinkPrefs.enabled },
+                set: { on in
+                    var prefs = current.autoLinkPrefs
+                    // Turning the selector ON starts with DV allowed — the old
+                    // avoid-by-default survives in profiles saved back then,
+                    // and re-enabling is the natural moment to shed it. While
+                    // the selector stays on, the toggle below is authoritative.
+                    if on, !prefs.enabled { prefs.avoidDolbyVision = false }
+                    prefs.enabled = on
+                    profiles.setAutoLink(id: profile.id, prefs)
+                }
+            ))
                 .font(.system(size: 24, weight: .medium))
                 .tint(theme.palette.secondary)
                 .frame(maxWidth: 560)

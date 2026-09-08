@@ -87,7 +87,13 @@ struct LibraryView: View {
                             .frame(height: 460)
                     } else {
                         LazyVGrid(columns: columns, alignment: .leading, spacing: OrivioSpacing.xl) {
-                            ForEach(visibleItems) { item in
+                            // Identified by the store's own type|id key: one
+                            // title saved under two types (`series`/`tv`, or a
+                            // `tmdb:<n>` that names a movie AND a show) would
+                            // otherwise be a duplicate `ForEach` identifier —
+                            // undefined in SwiftUI, and it crashes the tvOS
+                            // focus engine.
+                            ForEach(visibleItems, id: \.key) { item in
                                 GridPosterCell(
                                     item: item.metaItem,
                                     captionWidth: posterLayout.posterSize.posterWidth,

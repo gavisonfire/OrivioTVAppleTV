@@ -33,12 +33,17 @@ final class TopShelfProvider: TVTopShelfContentProvider {
     private static func content() -> TVTopShelfContent? {
         // AppGroupResolver is shared with the app target (see project.yml) so
         // both sides resolve the SAME signer-assigned group at runtime.
-        guard let dir = AppGroupResolver.containerURL else { return nil }
-        let file = dir.appendingPathComponent("topshelf.json")
+        guard let file = AppGroupResolver.sharedFile("topshelf.json") else { return nil }
         guard let data = try? Data(contentsOf: file),
               let entries = try? JSONDecoder().decode([Entry].self, from: data),
               !entries.isEmpty
         else { return nil }
+
+        // Written by the app beside the snapshot — see TopShelfExporter.
+        let scheme = AppGroupResolver.sharedFile("topshelf-scheme.txt")
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty ?? "orivio"
 
         let items = entries.map { entry -> TVTopShelfSectionedItem in
             let item = TVTopShelfSectionedItem(identifier: entry.id)
@@ -51,7 +56,7 @@ final class TopShelfProvider: TVTopShelfContentProvider {
                 item.setImageURL(url, for: [.screenScale1x, .screenScale2x])
             }
             var comps = URLComponents()
-            comps.scheme = "orivio"
+            comps.scheme = scheme
             comps.host = "meta"
             comps.queryItems = [
                 URLQueryItem(name: "type", value: entry.type),
@@ -68,4 +73,9 @@ final class TopShelfProvider: TVTopShelfContentProvider {
         section.title = "Continue Watching"
         return TVTopShelfSectionedContent(sections: [section])
     }
+}
+
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

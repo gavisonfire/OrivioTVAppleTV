@@ -377,6 +377,23 @@ final class OrivioAccountManager: ObservableObject {
                   shouldRetryFallback(error) else {
                 throw error
             }
+            // A refresh token is ONE-TIME: Supabase rotates it on use. If the
+            // first attempt timed out after the origin had already consumed
+            // it, replaying the same token on the fallback host answers 400 —
+            // which `performRefresh` reads as a dead session and signs the
+            // user out. Only replay a refresh when the request provably never
+            // reached the origin.
+            if endpoint == Endpoint.refresh {
+                if let urlError = error as? URLError,
+                   urlError.code == .timedOut || urlError.code == .networkConnectionLost {
+                    throw error
+                }
+                // An edge timeout / gateway timeout answers AFTER the origin
+                // took the request — the token is spent there too.
+                if case OrivioAuthError.http(let code, _) = error, [408, 504, 524].contains(code) {
+                    throw error
+                }
+            }
             return try await postAttempt(base: OrivioConfig.supabaseFallbackURL, endpoint: endpoint, body: body)
         }
     }

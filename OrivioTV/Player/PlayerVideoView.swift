@@ -14,6 +14,15 @@ import UIKit
 struct PlayerVideoView: UIViewRepresentable {
     let viewModel: PlayerViewModel
     let refreshID: UUID
+    /// Zoom / aspect-ratio scale and vertical shift, applied as a UIKit
+    /// transform on the CONTAINER. At the identity this is exactly no
+    /// transform — the Metal video layer keeps its direct scan-out path and
+    /// its colour handling — unlike a SwiftUI `scaleEffect`, which wraps the
+    /// layer in a compositing transform even at 1.0 (washed-out HDR on the
+    /// FFmpeg engine). And because the engine's view is never re-parented,
+    /// returning to Normal never leaves a black picture.
+    var scale: CGSize = CGSize(width: 1, height: 1)
+    var shiftY: CGFloat = 0
 
     func makeUIView(context: Context) -> UIView {
         let container = UIView()
@@ -24,13 +33,24 @@ struct PlayerVideoView: UIViewRepresentable {
 
     func updateUIView(_ container: UIView, context: Context) {
         attach(to: container)
+        applyTransform(to: container)
+    }
+
+    private func applyTransform(to container: UIView) {
+        let wanted = scale.width == 1 && scale.height == 1 && shiftY == 0
+            ? CGAffineTransform.identity
+            : CGAffineTransform(translationX: 0, y: shiftY).scaledBy(x: scale.width, y: scale.height)
+        guard container.transform != wanted else { return }
+        UIView.animate(withDuration: 0.25, delay: 0, options: [.curveEaseInOut]) {
+            container.transform = wanted
+        }
     }
 
     private func attach(to container: UIView) {
         // Point PiP at whatever the engine ended up rendering into. Done here
         // rather than at load time because the render view only exists once
         // the engine has actually started, and it CHANGES on an engine swap.
-        viewModel.pictureInPicture.attach(viewModel.pictureInPictureSource)
+        viewModel.refreshPictureInPictureSource()
         // The active engine's render view (KSPlayer's player view or VLC's
         // drawable) — bumped via videoRefreshID when the engine changes.
         guard let videoView = viewModel.activeVideoView else {
@@ -100,6 +120,20 @@ struct SubtitleOverlayView: View {
     private var textColor: Color { Color(badgeHex: settings.subtitleTextColorHex) ?? .white }
     private var outlineColor: Color { Color(badgeHex: settings.subtitleOutlineColorHex) ?? .black }
 
+    /// The configured caption face at the configured size. A family name that
+    /// doesn't resolve on this box falls back to the system font (UIFont is
+    /// the check — `Font.custom` itself falls back silently, but through a
+    /// body-text metric rather than the caption size).
+    private var captionFont: Font {
+        let size = CGFloat(settings.subtitleSize)
+        let name = settings.subtitleFontName
+        if !name.isEmpty, UIFont(name: name, size: size) != nil {
+            let custom = Font.custom(name, fixedSize: size)
+            return settings.subtitleBold ? custom.bold() : custom
+        }
+        return .system(size: size, weight: settings.subtitleBold ? .bold : .medium)
+    }
+
     /// One caption line with the configured color and (optionally) a real
     /// outline — SwiftUI has no text stroke, so the outline is the same text
     /// rendered in 8 directions behind the fill. Falls back to a soft double
@@ -107,7 +141,7 @@ struct SubtitleOverlayView: View {
     @ViewBuilder
     private func styledCaption(_ text: NSAttributedString) -> some View {
         let base = Text(AttributedString(text))
-            .font(.system(size: CGFloat(settings.subtitleSize), weight: settings.subtitleBold ? .bold : .medium))
+            .font(captionFont)
             .multilineTextAlignment(.center)
             .lineSpacing(4)
         if settings.subtitleOutlineEnabled {

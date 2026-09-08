@@ -30,7 +30,18 @@ final class DetailViewModel: ObservableObject {
         meta = item
     }
 
+    /// The `.task` that calls this re-runs on every return from Sources or
+    /// the player (the cover hides this view); reloading six endpoints and
+    /// republishing every row each time was pure churn with a visible flash.
+    private var hasLoaded = false
+
     func load(addonManager: AddonManager, mdbSettings: MDBListSettings = .default, tmdb: TMDBSettings = .default, parentalGuideEnabled: Bool = false) async {
+        guard !hasLoaded else { return }
+        hasLoaded = true
+        // The `.task` is cancelled by `onDisappear` (Play is focusable from
+        // the first frame), and a cancelled load leaves the stub meta — with
+        // no episodes. Un-latch so the next appearance loads for real.
+        defer { if Task.isCancelled { hasLoaded = false } }
         useEpisodeExtras = tmdb.useEpisodes
         // Canonicalize the identity FIRST: TMDB-sourced items arrive as
         // `tmdb:<n>`, but progress / watched / library are keyed by id — the
@@ -48,7 +59,11 @@ final class DetailViewModel: ObservableObject {
             )
         }
         // Kick off TMDB enrichment + Trakt comments in parallel with the meta fetch.
-        let enrichTask = Task { await TMDBService.detail(imdbID: meta.id, type: meta.type) }
+        // No key, no enrichment: TMDB now runs on the viewer's own key, and
+        // without one every one of these requests is a guaranteed 401.
+        let enrichTask = TMDBService.hasAPIKey
+            ? Task { await TMDBService.detail(imdbID: meta.id, type: meta.type) }
+            : nil
         let commentsTask = Task { await TraktService.comments(imdbID: meta.id, type: meta.type) }
         let ratingsTask = Task { await loadMDBRatings(settings: mdbSettings) }
 
@@ -69,7 +84,7 @@ final class DetailViewModel: ObservableObject {
         // just made "episodes" wait even longer for no reason.
         isLoading = false
 
-        if let detail = await enrichTask.value {
+        if let detail = await enrichTask?.value ?? nil {
             // Granular TMDB toggles gate which enriched sections appear.
             if tmdb.useCredits {
                 cast = detail.cast
@@ -315,7 +330,8 @@ struct DetailView: View {
             // someone is still deciding.
             try? await Task.sleep(for: .seconds(6))
             guard !Task.isCancelled, backdropTrailerPlaying, !trailerFullscreen,
-                  !fullscreenCooldown, activeTrailer == nil, !showRatingPicker else { return }
+                  !fullscreenCooldown, activeTrailer == nil, !showRatingPicker,
+                  !PiPHandoff.shared.isActive else { return }
             // Un-muting needs a live audio session — the muted backdrop
             // deliberately runs without one (a raw AVPlayer can stall on tvOS
             // otherwise), so without this the full-screen trailer was SILENT.
@@ -368,6 +384,12 @@ struct DetailView: View {
             await startBackdropTrailerIfEnabled()
         }
         .onDisappear { teardownBackdropTrailer() }
+        // The player just handed its picture to the PiP window and dismissed
+        // onto this page: a trailer already rolling underneath must go, for
+        // the same reasons the auto-start above declines to begin one.
+        .onReceive(NotificationCenter.default.publisher(for: PiPHandoff.didBeginNotification)) { _ in
+            teardownBackdropTrailer()
+        }
         // Opening the full-screen trailer or navigating to play: stop the
         // muted backdrop so two players don't fight over audio.
         .onChange(of: activeTrailer?.id) { _, newValue in
@@ -396,7 +418,8 @@ struct DetailView: View {
                 // Decorative backdrop — kept out of hit testing so it cannot
                 // swallow the action row's context-menu hit test (the same bug
                 // the home Featured bar caused for Continue Watching).
-                RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster)
+                RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster,
+                            maxPixels: PerformanceProfile.backdropPixelCap)
                     .allowsHitTesting(false)
                     .frame(width: geo.size.width, height: geo.size.height)
                 if showBackdropTrailer, let player = backdropPlayer {
@@ -432,6 +455,10 @@ struct DetailView: View {
         async let resolved = TrailerResolver.backdropItem(youtubeKey: trailer.youtubeKey)
         try? await Task.sleep(for: .seconds(delay))
         guard !Task.isCancelled else { return }
+        // The title is playing in the Picture in Picture window (the player
+        // dismissed onto this page): a second decoder and a full-screen
+        // trailer that grabs and then drops the audio session would stall it.
+        guard !PiPHandoff.shared.isActive else { return }
         guard let item = await resolved else {
             NSLog("[OrivioTrailer] backdrop resolve failed for %@", trailer.youtubeKey)
             return
@@ -472,8 +499,11 @@ struct DetailView: View {
         UIApplication.shared.isIdleTimerDisabled = false
         backdropPlayer?.isMuted = true
         // Give interrupted audio (another app's music) its shouldResume back —
-        // full-screen mode activated the session to un-mute.
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // full-screen mode activated the session to un-mute. Never while a
+        // PiP session owns the session: deactivating it stops that audio.
+        if !PiPHandoff.shared.isActive {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
         withAnimation(.easeInOut(duration: 0.35)) { trailerFullscreen = false }
         // AFTER the capture button leaves the tree and the focus engine's own
         // re-resolve has settled — set too early it gets overridden by the
@@ -499,7 +529,9 @@ struct DetailView: View {
     private func teardownBackdropTrailer() {
         if trailerFullscreen {
             UIApplication.shared.isIdleTimerDisabled = false
-            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            if !PiPHandoff.shared.isActive {
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            }
         }
         trailerFullscreen = false
         backdropStatusObserver?.invalidate()
@@ -533,7 +565,7 @@ struct DetailView: View {
             // and a two-line title sharing a baseline.
             Group {
                 if let logo = viewModel.meta.logo {
-                    RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading)
+                    RemoteImage(url: logo, contentMode: .fit, alignment: .bottomLeading, maxDimension: 520)
                         // Grounds a white logo on both a light frost and dark art.
                         .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
                         .frame(width: 520)

@@ -52,4 +52,43 @@ enum AppGroupResolver {
     /// error, for a result that can never change during the process's life.
     static let containerURL: URL? =
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
+
+    /// A file BOTH sides can actually write inside the shared container.
+    ///
+    /// On tvOS the group container's ROOT is not writable — the system creates
+    /// `Library/Caches` and `Library/Preferences` inside it and nothing else
+    /// may be created alongside them. The Top Shelf snapshot used to be
+    /// written straight to the root, where the write failed every time (it was
+    /// a `try?`, so silently) and the shelf could never have any content, no
+    /// matter how the entitlements were signed. Caches is the documented place
+    /// for this on tvOS: the system may purge it, and the app rewrites the
+    /// snapshot on every launch and every progress save.
+    ///
+    /// Namespaced by the OWNING app's bundle id: the release group is a TEAM
+    /// group that every sideload signed by that team shares, so with fixed
+    /// file names install B's shelf rendered install A's Continue Watching
+    /// (and deep-linked into A, under A's PIN gate rather than B's).
+    static func sharedFile(_ name: String) -> URL? {
+        guard let container = containerURL else { return nil }
+        let dir = container
+            .appendingPathComponent("Library/Caches", isDirectory: true)
+            .appendingPathComponent(ownerBundleID, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent(name)
+    }
+
+    /// The app that owns this process's slice of the group: the app itself,
+    /// or — inside the Top Shelf extension (`…/App.app/PlugIns/X.appex`) —
+    /// the host app two levels up, whose id the extension cannot otherwise
+    /// know (its own id is not what the app registered).
+    static let ownerBundleID: String = {
+        let main = Bundle.main
+        if main.bundleURL.pathExtension == "appex" {
+            let host = main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+            if let id = Bundle(url: host)?.bundleIdentifier, !id.isEmpty { return id }
+        }
+        return main.bundleIdentifier ?? "orivio"
+    }()
 }

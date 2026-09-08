@@ -162,17 +162,33 @@ final class StreamsViewModel: ObservableObject {
     }
 
     /// Merge streams produced by plugin scrapers into the pool (they arrive
-    /// after the addon sweep, so re-curate). Deduped by URL.
+    /// after the addon sweep, so re-curate). Deduped by URL, or by info hash
+    /// for torrent results — a magnet result has no URL, and keying on the
+    /// URL alone silently dropped every one of them.
     func addPluginStreams(_ entries: [StreamEntry]) {
         guard !entries.isEmpty else { return }
-        let existing = Set(pool.compactMap { $0.stream.url })
+        func identity(_ stream: Stream) -> String? {
+            if let url = stream.url { return url }
+            if let hash = stream.infoHash { return "hash:" + hash.lowercased() }
+            return nil
+        }
+        let existing = Set(pool.compactMap { identity($0.stream) })
         let fresh = entries.filter { entry in
-            guard let url = entry.stream.url else { return false }
-            return !existing.contains(url)
+            // Same admission rule as the addon sweep: playable, a torrent
+            // (which the debrid / TorrServer path can resolve), or external.
+            guard entry.stream.isPlayable || entry.stream.isTorrent || entry.stream.isExternal,
+                  let key = identity(entry.stream) else { return false }
+            return !existing.contains(key)
         }
         guard !fresh.isEmpty else { return }
         pool.append(contentsOf: fresh)
         rebuildGroups()
+        // Plugin scrapers are part of the early Auto-Link race too. Addon
+        // batches trigger an evaluation as they answer; scraper batches never
+        // did — so on a plugins-only setup (qink and friends: direct links,
+        // no debrid, no stream addons) the selector could only ever act via
+        // the end-of-sweep path, which used to race this very task.
+        if let prefs = autoLinkPrefs { evaluateEarlyAutoLink(prefs) }
     }
 
     /// Best source for a profile's Auto Link Selector. Entries are already
@@ -187,6 +203,12 @@ final class StreamsViewModel: ObservableObject {
     /// Set by the view while the Auto Link Selector is armed, so the sweep can
     /// hand back a pick without waiting for every addon.
     var autoLinkPrefs: AutoLinkPreferences?
+    /// Enabled plugin scrapers still being swept — so a PREFERRED addon that
+    /// is actually a scraper (qink and friends) counts as outstanding during
+    /// the patience window instead of the early pick firing an addon link
+    /// past it. Set by the view when the plugin task starts, cleared when it
+    /// finishes either way.
+    var pendingPluginNames: [String] = []
     var onEarlyAutoLink: ((StreamEntry) -> Void)?
     private var earlyPickFired = false
     /// Longest we will hold out for a preferred addon that hasn't answered.
@@ -218,10 +240,12 @@ final class StreamsViewModel: ObservableObject {
             && Date().timeIntervalSince(sweepStarted) < Self.preferredAddonWait
 
         /// Whether an addon can still change the answer: it has to be one we
-        /// queried at all, and not yet returned.
+        /// queried at all (a Stremio addon OR a plugin scraper), and not yet
+        /// returned.
         func outstanding(_ name: String) -> Bool {
             let q = name.trimmingCharacters(in: .whitespaces).lowercased()
             guard !q.isEmpty else { return false }
+            if pendingPluginNames.contains(where: { $0.lowercased().contains(q) }) { return true }
             guard queriedAddonNames.contains(where: { $0.lowercased().contains(q) }) else { return false }
             return !finishedAddonNames.contains { $0.lowercased().contains(q) }
         }
@@ -257,6 +281,54 @@ final class StreamsViewModel: ObservableObject {
         onEarlyAutoLink?(pick)
     }
 
+    /// Cached title verdicts, keyed by entry id. `evaluateEarlyAutoLink` runs
+    /// once per addon batch and re-walks the whole pool each time, so the regex
+    /// work behind a verdict is done once per link per sweep, not once per pass.
+    private var titleVerdicts: [UUID: StreamTitleVerdict] = [:]
+
+    /// Is this link really the title (and episode) that was asked for?
+    /// See `StreamTitleMatcher` — only positive evidence of a MISMATCH rejects.
+    func titleVerdict(_ entry: StreamEntry) -> StreamTitleVerdict {
+        if let cached = titleVerdicts[entry.id] { return cached }
+        let verdict = StreamTitleMatcher.verdict(
+            text: StreamTitleMatcher.haystack(
+                displayName: entry.displayName,
+                displayDetail: entry.displayDetail,
+                filename: entry.stream.behaviorHints?.filename
+            ),
+            title: meta.name,
+            year: StreamTitleMatcher.year(fromReleaseInfo: meta.releaseInfo),
+            season: video?.season,
+            episode: video?.episode,
+            ignoring: entry.addonName
+        )
+        titleVerdicts[entry.id] = verdict
+        return verdict
+    }
+
+    /// Drop links that name a DIFFERENT title/episode, then float the ones that
+    /// positively name the right one above the ones that say nothing either way.
+    /// Order within each band is preserved, so every existing rank (resolution,
+    /// size, cached, addon preference) still decides between equals.
+    ///
+    /// Never returns empty when given a non-empty list: if every link looks
+    /// wrong, the matcher is more likely to be misreading an unusual naming
+    /// convention than the entire source list is to be junk, and refusing to
+    /// play anything is the worse failure.
+    private func titleFiltered(_ entries: [StreamEntry]) -> [StreamEntry] {
+        var confirmed: [StreamEntry] = []
+        var unknown: [StreamEntry] = []
+        for entry in entries {
+            switch titleVerdict(entry) {
+            case .confirmed: confirmed.append(entry)
+            case .unknown: unknown.append(entry)
+            case .rejected: break
+            }
+        }
+        let kept = confirmed + unknown
+        return kept.isEmpty ? entries : kept
+    }
+
     /// The entries a profile's Auto Link prefs allow, best-first.
     private func autoLinkPool(_ prefs: AutoLinkPreferences) -> [StreamEntry] {
         let minTier = prefs.minResolution.isEmpty ? nil
@@ -264,6 +336,12 @@ final class StreamsViewModel: ObservableObject {
         let maxSizeGB = AutoLinkPreferences.sanitizedMaxSizeGB(prefs.maxSizeGB)
         let maxBytes = maxSizeGB > 0 ? Int64(maxSizeGB * 1_073_741_824) : nil
         let pool = allEntries.filter { entry in
+            // Never auto-pick an external hand-off (a DMM "cast" entry): the
+            // Apple TV can't open it, so the pick died on an alert — with
+            // playable links sitting right there. `bestResumeMatch` has
+            // always excluded these; the selector and the global auto-play
+            // (below) must too. Manual taps still offer them.
+            if entry.stream.isExternal { return false }
             if prefs.cachedOnly && !entry.stream.isCached { return false }
             if prefs.avoidDolbyVision && entry.stream.isDolbyVision { return false }
             if let minTier, let label = entry.resolutionLabel,
@@ -274,15 +352,18 @@ final class StreamsViewModel: ObservableObject {
         // Skip links a recent session walked straight back out of, so pressing
         // Play again moves on instead of re-serving the one that just failed.
         let rejected = RejectedLinks.rejected(for: ProgressStore.key(metaID: meta.id, video: video))
-        guard !rejected.isEmpty else { return pool }
+        guard !rejected.isEmpty else { return titleFiltered(pool) }
         let survivors = pool.filter { !rejected.contains($0.rejectionKey) }
         // If avoiding them leaves nothing, the grudge is worse than the link:
         // play the best match rather than dropping to the manual list.
-        return survivors.isEmpty ? pool : survivors
+        return titleFiltered(survivors.isEmpty ? pool : survivors)
     }
 
-    func autoLinkPick(_ prefs: AutoLinkPreferences) -> StreamEntry? {
-        let pool = autoLinkPool(prefs)
+    /// `excluding`: rejection keys of links an auto-pick already tried and
+    /// failed to resolve this visit, so the retry moves ON instead of
+    /// re-serving the same dead link.
+    func autoLinkPick(_ prefs: AutoLinkPreferences, excluding: Set<String> = []) -> StreamEntry? {
+        let pool = autoLinkPool(prefs).filter { !excluding.contains($0.rejectionKey) }
         guard !pool.isEmpty else { return nil }
         func firstFromAddon(_ name: String) -> StreamEntry? {
             let q = name.trimmingCharacters(in: .whitespaces).lowercased()
@@ -296,11 +377,15 @@ final class StreamsViewModel: ObservableObject {
 
     /// First source to auto-play (entries are already sorted best-first),
     /// honoring cached-only and an optional case-insensitive title regex.
-    func autoPlayPick(cachedOnly: Bool, regex: String) -> StreamEntry? {
+    func autoPlayPick(cachedOnly: Bool, regex: String, excluding: Set<String> = []) -> StreamEntry? {
         let trimmed = regex.trimmingCharacters(in: .whitespaces)
         let re = trimmed.isEmpty ? nil
             : try? NSRegularExpression(pattern: trimmed, options: [.caseInsensitive])
-        return allEntries.first { entry in
+        // Same name check the Auto Link Selector uses: an auto-play that
+        // starts the wrong episode is worse than one that starts nothing.
+        return titleFiltered(allEntries).first { entry in
+            if entry.stream.isExternal { return false }   // see autoLinkPool
+            if excluding.contains(entry.rejectionKey) { return false }
             if cachedOnly && !entry.stream.isCached { return false }
             if let re {
                 let hay = "\(entry.addonName) \(entry.displayName) \(entry.displayDetail)"
@@ -319,7 +404,7 @@ final class StreamsViewModel: ObservableObject {
     func bestResumeMatch(signature: StreamSignature?) -> StreamEntry? {
         // Never auto-resume into an external hand-off (a "cast to DMM" style
         // entry opens another app) — resume must play a real stream here.
-        let candidates = allEntries.filter { !$0.stream.isExternal }
+        let candidates = titleFiltered(allEntries.filter { !$0.stream.isExternal })
         guard !candidates.isEmpty else { return nil }
         guard let sig = signature else { return candidates.first }
         func matchScore(_ e: StreamEntry) -> Int {
@@ -345,6 +430,9 @@ final class StreamsViewModel: ObservableObject {
     func reload(addonManager: AddonManager, debridEnabled: Bool, perTier: Int, filtersEnabled: Bool = true) async {
         groups = []
         pool = []
+        // Entry ids are regenerated by the sweep below, so the cache would
+        // otherwise grow a dead entry per link on every retry.
+        titleVerdicts = [:]
         addonNames = []
         selectedAddon = nil
         finishedAddons = 0
@@ -364,7 +452,7 @@ final class StreamsViewModel: ObservableObject {
     /// the list is short and useful instead of the 150+ near-identical rips
     /// Torrentio alone returns, which is what made scrolling (and selecting
     /// during load) choke.
-    func load(addonManager: AddonManager, debridEnabled: Bool, perTier: Int, filtersEnabled: Bool = true, forceRefresh: Bool = false) async {
+    func load(addonManager: AddonManager, debridEnabled: Bool, perTier: Int, filtersEnabled: Bool = true, forceRefresh: Bool = false, streamTimeout: TimeInterval = 45) async {
         let fetchID = await effectiveStreamID()
         stage("stream id ready (\(fetchID))")
         // Self-heal: an addon installed by account sync while its manifest
@@ -410,6 +498,11 @@ final class StreamsViewModel: ObservableObject {
            !cached.isEmpty {
             pool = cached.map { StreamEntry(addonName: $0.addonName, stream: $0.stream) }
             finishedAddons = totalAddons
+            failedAddons = [:]   // stale "Not working" diagnostics from a previous sweep
+            // Every queried addon is done on this path — the ones with no
+            // links otherwise showed "Searching…" forever, since that label
+            // keys off this set.
+            finishedAddonNames = Set(queriedAddonNames)
             rebuildGroups()
             isLoading = false
             return
@@ -444,7 +537,7 @@ final class StreamsViewModel: ObservableObject {
                 next += 1
                 group.addTask { [meta] in
                     do {
-                        let streams = try await StremioAPI.streams(addon: addon, type: meta.type, id: fetchID)
+                        let streams = try await StremioAPI.streams(addon: addon, type: meta.type, id: fetchID, timeout: streamTimeout)
                         let entries = streams
                             .filter { $0.isPlayable || (debridEnabled && $0.isTorrent) || $0.isExternal }
                             .map { StreamEntry(addonName: addon.manifest.name, stream: $0) }
@@ -567,6 +660,10 @@ struct StreamsView: View {
 
     @State private var resolving = false
     @State private var resolveError: String?
+    /// Links an auto-pick already tried and failed to RESOLVE this visit —
+    /// the retry pool excludes them so a failed pick moves on to the next
+    /// candidate instead of alerting and dropping to the manual list.
+    @State private var autoTriedKeys: Set<String> = []
     // Sources load asynchronously; when the first ones arrive, move focus onto
     // the top source so the trackpad can navigate immediately instead of the
     // user having to swipe to "find" focus.
@@ -584,6 +681,7 @@ struct StreamsView: View {
     /// isn't enough: the debrid/P2P resolve runs in its OWN unstructured Task
     /// that Back never cancels, so it needs an explicit view-level flag.
     @State private var isGone = false
+    @State private var pluginsSwept = false
     /// The in-flight source sweeps, cancelled when the page pops.
     @State private var sweepTasks: [Task<Void, Never>] = []
 
@@ -661,9 +759,23 @@ struct StreamsView: View {
             viewModel.streamFilters = s.streamFilterOptions
             // Auto Link Selector on (and not forced manual): show the loading
             // screen instead of the source list from the very first frame.
-            autoLinkResolving = (profiles.activeAutoLink.enabled || resumeAutoPlay) && !forceManual
+            //
+            // A RESUME only qualifies when some automatic selection is actually
+            // switched on. It used to qualify unconditionally, so a Continue
+            // Watching row opened onto "Finding the best source…" and then
+            // played something the viewer never picked, with both auto-select
+            // settings off.
+            let autoSelects = profiles.activeAutoLink.enabled || s.autoPlaySourceEnabled
+            // Not after an automatic pick already fired: this task re-runs when
+            // the player cover comes down (`onDisappear`/`onAppear` on the view
+            // beneath it), and re-raising the loading screen then left the
+            // page stuck on "Finding the best source…" — nothing picks again
+            // (`didAutoAct` is @State) and the safety net below cannot clear it.
+            autoLinkResolving = (profiles.activeAutoLink.enabled
+                                 || (resumeAutoPlay && autoSelects)) && !forceManual && !didAutoAct
             viewModel.openedAt = Date()
             viewModel.stage("sources page opened")
+            autoTriedKeys = []   // fresh visit, fresh failover budget
 
             // Arm the early pick BEFORE the sweep starts, so the selector can
             // act as soon as the preferred addon answers instead of waiting for
@@ -703,13 +815,22 @@ struct StreamsView: View {
                     addonManager: addonManager,
                     debridEnabled: debrid.hasAnyConfigured || torrent.settings.isConfigured,
                     perTier: s.sourcesPerSizeTier,
-                    filtersEnabled: s.sourceFiltersEnabled
+                    filtersEnabled: s.sourceFiltersEnabled,
+                    streamTimeout: TimeInterval(s.sourceSearchTimeoutSeconds)
                 )
             }
             sweepTasks.append(loadTask)
             // Plugin scrapers run alongside the addon sweep (they want a TMDB id).
-            if !plugins.enabledScrapers.isEmpty {
-                let pluginTask = Task {
+            // Once per page: the re-run after the player cover comes down must
+            // not stand the whole JS scraper fleet up again. Held in a local
+            // too — the auto-select decision below must be able to WAIT for it.
+            var pluginTask: Task<Void, Never>?
+            if !plugins.enabledScrapers.isEmpty, !pluginsSwept {
+                viewModel.pendingPluginNames = plugins.enabledScrapers.map(\.name)
+                let task = Task {
+                    // However this sweep ends, the scrapers are no longer
+                    // outstanding for the early pick's patience window.
+                    defer { viewModel.pendingPluginNames = [] }
                     guard let (tmdbID, isMovie) = await TMDBService.resolveTMDBID(
                         from: viewModel.meta.id, type: viewModel.meta.type
                     ) else { return }
@@ -719,8 +840,10 @@ struct StreamsView: View {
                     )
                     guard !Task.isCancelled, !isGone else { return }
                     viewModel.addPluginStreams(entries)
+                    pluginsSwept = true
                 }
-                sweepTasks.append(pluginTask)
+                pluginTask = task
+                sweepTasks.append(task)
             }
             // Reuse-last-link replays the remembered URL — skip it entirely when
             // resuming, since the whole point of a resume is to re-connect fresh.
@@ -755,15 +878,36 @@ struct StreamsView: View {
             // Back-during-load guard (see above): bail before any auto-act.
             guard !Task.isCancelled, !isGone else { return }
 
+            // Plugin scrapers are sources like any other, but their sweep is a
+            // SEPARATE task the auto-select decision used to race: on a
+            // plugins-only setup (qink and friends — direct links, no debrid,
+            // no stream addons) the addon sweep finished first with nothing,
+            // the pick came up empty, and the loading screen dropped to the
+            // manual list while the scraper was still working. Only reached
+            // when nothing has acted yet — an addon match good enough for the
+            // early pick has already fired and skips this wait entirely.
+            if !didAutoAct, autoSelects { await pluginTask?.value }
+            guard !Task.isCancelled, !isGone else { return }
+
             // Resume from Continue Watching: re-scrape done, now auto-play the
             // link that best matches the format last watched (fresh connection,
-            // so expired debrid/Comet links don't fail). Takes precedence over
-            // the profile Auto Link Selector / global auto-play below.
-            // Continue Watching resume. With the Auto Link Selector OFF this is
-            // unchanged: re-pick the link closest to the format last watched.
-            // With it ON, the selector's preferences win and this is skipped —
-            // the selector block below handles the resume as an ordinary play.
-            if !didAutoAct, !forceManual, resumeAutoPlay, !armedAutoLink.enabled {
+            // so expired debrid/Comet links don't fail).
+            //
+            // GATED ON THE AUTO-SELECT SETTINGS, which it never used to be.
+            // This block ran whenever the Auto Link Selector was OFF, so
+            // turning the selector off did not stop links being chosen for you
+            // on a resume — it only changed which algorithm chose them, which
+            // is the opposite of what the switch says. The global "Auto-play
+            // best source" was ignored here as well.
+            //
+            // The three ways a link can now be picked without asking, and only
+            // these: the Auto Link Selector (its own block below, which also
+            // covers resumes), the global auto-play (further below), and this
+            // format match — which is the better answer of the three for a
+            // resume, so it stays first when either switch is on. With both
+            // off nothing is picked and the source list appears, for a resume
+            // exactly as for any other play.
+            if !didAutoAct, !forceManual, resumeAutoPlay, autoSelects, !armedAutoLink.enabled {
                 if let pick = viewModel.bestResumeMatch(signature: resumeSignature) {
                     didAutoAct = true
                     handleSelection(pick, viewModel.allEntries)
@@ -806,6 +950,11 @@ struct StreamsView: View {
             // drop the loading screen so the user isn't stuck on it.
             if autoLinkResolving && !didAutoAct { autoLinkResolving = false }
         }
+        // The player cover triggers `onDisappear` on this view too, so the
+        // latch below must be RESET on every appearance — without it every
+        // selection after backing out of the player was a silent no-op for
+        // the rest of the session (CloudLibraryView carries the same fix).
+        .onAppear { isGone = false }
         // Back popped this page: block every pending async completion from
         // presenting the player / touching navigation on a torn-down view,
         // and stop the sweeps themselves (their awaits return promptly).
@@ -922,6 +1071,34 @@ struct StreamsView: View {
         .focusSection()
     }
 
+    /// After an AUTO-picked link fails to resolve, move on to the next
+    /// candidate instead of surfacing the alert — "couldn't resolve" over the
+    /// 'Finding the best source' screen, with playable alternates in hand,
+    /// was the selector giving up one link too early (and dismissing the
+    /// alert then dumped the viewer onto the manual list). Returns true when
+    /// another candidate was dispatched; false → let the caller alert as a
+    /// last resort. Capped so a title whose links are ALL dead still fails
+    /// fast rather than grinding through dozens of resolves.
+    private func autoAdvance(after entry: StreamEntry, _ all: [StreamEntry]) -> Bool {
+        // Only while an automatic flow is in charge; a manually tapped link
+        // keeps its error alert.
+        guard autoLinkResolving else { return false }
+        autoTriedKeys.insert(entry.rejectionKey)
+        guard autoTriedKeys.count < 4 else { return false }
+        let prefs = profiles.activeAutoLink
+        let next = prefs.enabled
+            ? viewModel.autoLinkPick(prefs, excluding: autoTriedKeys)
+            : viewModel.autoPlayPick(
+                cachedOnly: playerSettings.settings.autoPlaySourceCachedOnly,
+                regex: playerSettings.settings.autoPlaySourceRegex,
+                excluding: autoTriedKeys
+            )
+        guard let next else { return false }
+        viewModel.stage("auto-pick failed to resolve — trying \(next.addonName) instead")
+        handleSelection(next, all)
+        return true
+    }
+
     /// Torrent entries resolve through the preferred debrid provider before
     /// playback; direct streams pass straight through.
     private func handleSelection(_ entry: StreamEntry, _ all: [StreamEntry]) {
@@ -993,12 +1170,15 @@ struct StreamsView: View {
                 viewModel.stage("resolved — handing to player")
                 onSelect(resolvedEntry, all)
             case .missingKey:
+                if autoAdvance(after: entry, all) { return }
                 resolveError = "\(provider.displayName) API key is missing."
             case .notCached:
+                if autoAdvance(after: entry, all) { return }
                 resolveError = debrid.orderedResolvers.count > 1
                     ? "This torrent isn't cached on any of your debrid services. Try another source."
                     : "This torrent isn't cached on \(provider.displayName). Try another source."
             case .failed(let message):
+                if autoAdvance(after: entry, all) { return }
                 resolveError = "\(provider.displayName): \(message)"
             }
         }
@@ -1039,8 +1219,10 @@ struct StreamsView: View {
                 viewModel.stage("resolved — handing to player")
                 onSelect(resolvedEntry, all)
             case .notConfigured:
+                if autoAdvance(after: entry, all) { return }
                 resolveError = "Turn on P2P and set a TorrServer URL in Settings → Integrations."
             case .failed(let message):
+                if autoAdvance(after: entry, all) { return }
                 resolveError = message
             }
         }
@@ -1054,7 +1236,8 @@ struct StreamsView: View {
     private var backdrop: some View {
         GeometryReader { geo in
             ZStack {
-                RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster)
+                RemoteImage(url: viewModel.meta.background ?? viewModel.meta.poster,
+                            maxPixels: PerformanceProfile.backdropPixelCap)
                     .frame(width: geo.size.width, height: geo.size.height)
                     .opacity(0.5)
                 HeroGradient(background: theme.palette.background, fullBleed: true)
@@ -1366,7 +1549,8 @@ private struct AutoLinkLoadingScreen: View {
             // to tvOS and suspends the app — the same reason OrivioLoadingView
             // takes `holdsFocus`.
             FocusAnchor()
-            RemoteImage(url: meta.background ?? meta.poster)
+            RemoteImage(url: meta.background ?? meta.poster,
+                        maxPixels: PerformanceProfile.backdropPixelCap)
                 .ignoresSafeArea()
             LinearGradient(
                 stops: [
@@ -1382,7 +1566,7 @@ private struct AutoLinkLoadingScreen: View {
             VStack(spacing: OrivioSpacing.xxl) {
                 Group {
                     if hasLogo {
-                        RemoteImage(url: meta.logo, contentMode: .fit)
+                        RemoteImage(url: meta.logo, contentMode: .fit, maxDimension: 480)
                             .frame(width: 480, height: 270)
                     } else {
                         Text(meta.name)

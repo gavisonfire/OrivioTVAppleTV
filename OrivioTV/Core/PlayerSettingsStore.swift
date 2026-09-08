@@ -138,6 +138,11 @@ struct PlayerSettings: Codable, Equatable {
     var subtitleSize: Int = 36
     var subtitleBackground: Bool = true
     var subtitleBold: Bool = false
+    /// Caption typeface family; "" = the system font. Only families tvOS
+    /// ships are offered (see `subtitleFontOptions`) — a name that fails to
+    /// resolve at render time falls back to the system font rather than
+    /// blanking the caption.
+    var subtitleFontName: String = ""
     /// Turn subtitles on automatically when a stream loads. When a track in
     /// `preferredSubtitleLanguage` exists it's chosen; otherwise the first
     /// available subtitle.
@@ -212,6 +217,19 @@ struct PlayerSettings: Codable, Equatable {
     /// returned them (cached still first), capped per addon so a Torrentio
     /// flood can't drown the UI.
     var sourceFiltersEnabled: Bool = true
+    /// Per-addon stream-request deadline (seconds). 45 covers most live
+    /// scrapers, but aggregators that fan out to Usenet indexers (AIOStreams
+    /// with NZBgeek behind it) legitimately need longer — under a too-short
+    /// deadline the whole aggregator response is dropped and only its fast
+    /// upstreams ever "work". The sweep reveals per-addon results as they
+    /// land, so extra patience costs nothing when addons are fast.
+    var sourceSearchTimeoutSeconds: Int = 45
+    /// Hybrid disk cache (Infuse-style): download the whole file to the Apple
+    /// TV's storage at full line speed while playing, and serve seeks from
+    /// disk — the RAM read-ahead tops out at a few hundred MB, so deep seeks
+    /// otherwise always stall on the network. Direct-file streams only (HLS
+    /// bypasses); anything unexpected falls back to direct playback.
+    var hybridDiskCacheEnabled: Bool = false
     /// Links shown per size tier (250 MB–4 GB / 4–10 / 10–20 / 20–30 / 30+).
     var sourcesPerSizeTier: Int = 6
     // --- Stream filters (applied before curation) ---
@@ -289,6 +307,20 @@ struct PlayerSettings: Codable, Equatable {
 
     /// Selectable subtitle sizes.
     static let subtitleSizeValues: [Int] = [28, 32, 36, 42, 48, 56]
+
+    /// Caption typeface choices (family name, label). "" = system font. All
+    /// families tvOS actually ships, so `Font.custom` always resolves.
+    static let subtitleFontOptions: [(String, String)] = [
+        ("", "System"),
+        ("Helvetica Neue", "Helvetica Neue"),
+        ("Avenir Next", "Avenir Next"),
+        ("Gill Sans", "Gill Sans"),
+        ("Georgia", "Georgia"),
+        ("Times New Roman", "Times New Roman"),
+        ("American Typewriter", "Typewriter"),
+        ("Menlo", "Menlo (mono)"),
+        ("Verdana", "Verdana"),
+    ]
     /// Preferred-audio-language choices (code, label).
     static let audioLanguageOptions: [(String, String)] = [
         ("", "Stream default"), ("en", "English"), ("es", "Spanish"),
@@ -374,6 +406,7 @@ struct PlayerSettings: Codable, Equatable {
         subtitleSize = (try? c.decode(Int.self, forKey: .subtitleSize)) ?? d.subtitleSize
         subtitleBackground = (try? c.decode(Bool.self, forKey: .subtitleBackground)) ?? d.subtitleBackground
         subtitleBold = (try? c.decode(Bool.self, forKey: .subtitleBold)) ?? d.subtitleBold
+        subtitleFontName = (try? c.decode(String.self, forKey: .subtitleFontName)) ?? d.subtitleFontName
         subtitlesOnByDefault = (try? c.decode(Bool.self, forKey: .subtitlesOnByDefault)) ?? d.subtitlesOnByDefault
         preferredSubtitleLanguage = (try? c.decode(String.self, forKey: .preferredSubtitleLanguage)) ?? d.preferredSubtitleLanguage
         subtitleSecondaryLanguage = (try? c.decode(String.self, forKey: .subtitleSecondaryLanguage)) ?? d.subtitleSecondaryLanguage
@@ -404,6 +437,8 @@ struct PlayerSettings: Codable, Equatable {
         showPlayerLoadingStatus = (try? c.decode(Bool.self, forKey: .showPlayerLoadingStatus)) ?? d.showPlayerLoadingStatus
         parentalGuideEnabled = (try? c.decode(Bool.self, forKey: .parentalGuideEnabled)) ?? d.parentalGuideEnabled
         sourceFiltersEnabled = (try? c.decode(Bool.self, forKey: .sourceFiltersEnabled)) ?? d.sourceFiltersEnabled
+        sourceSearchTimeoutSeconds = (try? c.decode(Int.self, forKey: .sourceSearchTimeoutSeconds)) ?? d.sourceSearchTimeoutSeconds
+        hybridDiskCacheEnabled = (try? c.decode(Bool.self, forKey: .hybridDiskCacheEnabled)) ?? d.hybridDiskCacheEnabled
         sourcesPerSizeTier = (try? c.decode(Int.self, forKey: .sourcesPerSizeTier)) ?? d.sourcesPerSizeTier
         streamMinResolution = (try? c.decode(String.self, forKey: .streamMinResolution)) ?? d.streamMinResolution
         streamExcludeAV1 = (try? c.decode(Bool.self, forKey: .streamExcludeAV1)) ?? d.streamExcludeAV1
@@ -441,12 +476,56 @@ final class PlayerSettingsStore: ObservableObject {
 
     private static let key = "orivio.player.settings.v1"
 
+    /// Player + subtitle settings are PER PROFILE (upstream scopes its whole
+    /// `player_settings` store this way). The legacy device-wide blob goes to
+    /// the PRIMARY profile; other profiles start at the hardware-tuned
+    /// defaults (Trakt-switch semantics).
+    private(set) var profileID: Int
+
+    /// Separate-vs-shared switch (Trakt-style). Shared = one set of player +
+    /// subtitle settings for the whole device, the pre-split behaviour.
+    static let feature = "player"
+    var perProfileEnabled: Bool { ProfileScopedDefaults.isSeparate(Self.feature) }
+
+    func setPerProfile(_ on: Bool) {
+        guard on != perProfileEnabled else { return }
+        ProfileScopedDefaults.setSeparate(Self.feature, on)
+        applyingRemote = true
+        settings = Self.load(profile: profileID)
+        applyingRemote = false
+    }
+
     init() {
-        if let data = UserDefaults.standard.data(forKey: Self.key),
+        profileID = ProfileScopedDefaults.activeProfileID
+        settings = Self.load(profile: profileID)
+    }
+
+    private static func load(profile: Int) -> PlayerSettings {
+        if let data = ProfileScopedDefaults.data(key, feature: feature, profile),
            let decoded = try? JSONDecoder().decode(PlayerSettings.self, from: data) {
-            settings = decoded
-        } else {
-            settings = .default
+            return decoded
+        }
+        return .default
+    }
+
+    /// Point the store at a profile: swap the previous profile's settings out
+    /// for this one's. Suppressed as a "remote" apply so the swap can't arm a
+    /// sync push of settings that didn't change.
+    func setProfile(_ id: Int) {
+        guard id != profileID else { return }
+        profileID = id
+        applyingRemote = true
+        settings = Self.load(profile: id)
+        applyingRemote = false
+    }
+
+    /// Forget a deleted profile's settings so a recycled id starts from the seed.
+    func forgetProfile(_ id: Int) {
+        ProfileScopedDefaults.forget([Self.key], profile: id)
+        if id == profileID {
+            applyingRemote = true
+            settings = Self.load(profile: id)
+            applyingRemote = false
         }
     }
 
@@ -473,6 +552,7 @@ final class PlayerSettingsStore: ObservableObject {
 
     private func save() {
         guard let data = try? JSONEncoder().encode(settings) else { return }
-        UserDefaults.standard.set(data, forKey: Self.key)
+        UserDefaults.standard.set(
+            data, forKey: ProfileScopedDefaults.writeKey(Self.key, feature: Self.feature, profileID))
     }
 }

@@ -12,6 +12,7 @@ struct CloudLibraryView: View {
 
     @State private var provider: DebridProvider?
     @State private var files: [CloudFile] = []
+    @State private var loadedProvider: String?
     @State private var isLoading = false
     @State private var resolving = false
     /// Set when this page is popped. Same guard as StreamsView: presenting the
@@ -30,7 +31,8 @@ struct CloudLibraryView: View {
                 OrivioEmptyState(
                     icon: "externaldrive.badge.xmark",
                     title: "No debrid provider configured",
-                    message: "Add a Real-Debrid, Premiumize, TorBox or AllDebrid API key in Settings → Integrations to browse your cloud files."
+                    message: "Add a Real-Debrid, Premiumize, TorBox or AllDebrid API key in Settings → Integrations to browse your cloud files.",
+                    holdsFocus: true
                 )
                 .frame(maxWidth: .infinity, minHeight: 300)
             } else {
@@ -72,13 +74,14 @@ struct CloudLibraryView: View {
     @ViewBuilder
     private var content: some View {
         if isLoading {
-            OrivioLoadingView(label: "Loading cloud files")
+            OrivioLoadingView(label: "Loading cloud files", holdsFocus: availableProviders.count <= 1)
                 .frame(maxWidth: .infinity, minHeight: 300)
         } else if files.isEmpty {
             OrivioEmptyState(
                 icon: "tray",
                 title: "No video files found",
-                message: "Nothing playable is in this provider's cloud yet."
+                message: "Nothing playable is in this provider's cloud yet.",
+                holdsFocus: availableProviders.count <= 1
             )
             .frame(maxWidth: .infinity, minHeight: 300)
         } else {
@@ -110,10 +113,14 @@ struct CloudLibraryView: View {
     }
 
     private func load() async {
-        guard let provider, !debrid.key(for: provider).isEmpty else { files = []; return }
+        guard let provider, !debrid.key(for: provider).isEmpty else { files = []; loadedProvider = nil; return }
+        // The player cover re-appears this view; a listing already on screen
+        // for this provider stays put instead of being replaced by a spinner.
+        guard files.isEmpty || loadedProvider != provider.rawValue else { return }
         isLoading = true
         let all = await CloudLibraryService.list(provider: provider, apiKey: debrid.key(for: provider))
         files = all.filter(\.isVideo).sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        loadedProvider = provider.rawValue
         isLoading = false
     }
 

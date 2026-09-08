@@ -68,15 +68,63 @@ enum TopShelfExporter {
         return rows.first { $0.id == active }?.pinEnabled ?? false
     }
 
+    /// Monotonic ticket for shelf writes, taken on the main actor at each
+    /// call site so the ORDER the app decided on is the order the file sees.
+    /// Three writers used to race unordered (the periodic persister, the
+    /// profile-switch reload and the PIN refresh), and a profile switch could
+    /// have the previous profile's queued write land last — its titles on the
+    /// home screen under the new profile.
+    @MainActor private static var sequence: UInt64 = 0
+    @MainActor static func nextSequence() -> UInt64 {
+        sequence += 1
+        return sequence
+    }
+
+    /// Ordered write: a ticket older than the last one written is dropped.
+    static func writeOrdered(_ entries: [Entry], sequence: UInt64) async {
+        await TopShelfWriter.shared.write(entries, sequence: sequence)
+    }
+
     /// Persist to the shared container. Safe to call from any thread.
     static func write(_ entries: [Entry]) {
-        guard let dir = AppGroupResolver.containerURL else { return }
-        let file = dir.appendingPathComponent("topshelf.json")
+        guard let file = AppGroupResolver.sharedFile("topshelf.json") else {
+            NSLog("[TopShelf] no shared container — app group unavailable")
+            return
+        }
         // A locked profile writes an EMPTY shelf rather than skipping the
         // write. Skipping would leave whatever the previous profile exported
         // sitting on the home screen, which is the leak being closed.
         let payload = activeProfileIsLocked ? [] : entries
         guard let data = try? JSONEncoder().encode(payload) else { return }
-        try? data.write(to: file, options: .atomic)
+        // Reported, not swallowed: a `try?` here is what let the unwritable
+        // container root go unnoticed for as long as it did.
+        do {
+            try data.write(to: file, options: .atomic)
+        } catch {
+            NSLog("[TopShelf] snapshot write failed at %@: %@",
+                  file.path, String(describing: error))
+        }
+        // The scheme the extension must deep-link on, published by the ONE
+        // side that knows it for certain: `orivio` is claimed by every other
+        // sideload of this app on the box, so a card opened on the shelf could
+        // land in one of those instead of here (the same collision that sent
+        // Infuse's callback to NuvioTVOS). The extension cannot derive it —
+        // its own bundle id is not what the app registered — so it is written
+        // next to the snapshot.
+        if let schemeFile = AppGroupResolver.sharedFile("topshelf-scheme.txt") {
+            try? Data(AppCallbackScheme.value.utf8).write(to: schemeFile, options: .atomic)
+        }
+    }
+}
+
+/// Serialises Top Shelf snapshot writes and enforces their ticket order.
+private actor TopShelfWriter {
+    static let shared = TopShelfWriter()
+    private var lastSequence: UInt64 = 0
+
+    func write(_ entries: [TopShelfExporter.Entry], sequence: UInt64) {
+        guard sequence > lastSequence else { return }
+        lastSequence = sequence
+        TopShelfExporter.write(entries)
     }
 }

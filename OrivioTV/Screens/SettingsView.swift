@@ -732,6 +732,9 @@ struct AccountSettingsDetail: View {
     @EnvironmentObject private var trakt: TraktStore
     @EnvironmentObject private var debrid: DebridStore
     @EnvironmentObject private var plugins: PluginStore
+    @EnvironmentObject private var playerSettings: PlayerSettingsStore
+    @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
+    @EnvironmentObject private var streamBadges: StreamBadgeStore
     @State private var showAccount = false
     @State private var showProfiles = false
 
@@ -759,6 +762,22 @@ struct AccountSettingsDetail: View {
                 }
                 .buttonStyle(PlainCardButtonStyle())
 
+            }
+
+            // Which pieces each profile keeps for itself vs. shares — the same
+            // choice the Trakt pane's "Separate Trakt per profile" switch
+            // offers, one switch per category. Only meaningful with 2+
+            // profiles. Watch data (progress, library, watched, collections,
+            // home layout) is ALWAYS per profile — profiles would be
+            // meaningless otherwise — and the Trakt & SIMKL switch stays in
+            // its own pane next to the logins it governs.
+            if profiles.profiles.count > 1 {
+                SettingsGroupCard(
+                    title: "Separate per profile",
+                    subtitle: "On: each profile keeps its own. Off: one shared copy for the whole device. Turning one off falls back to the shared copy; turning it back on finds each profile's own state where it was."
+                ) {
+                    separationToggles
+                }
             }
         }
         .fullScreenCover(isPresented: $showAccount) {
@@ -795,6 +814,72 @@ struct AccountSettingsDetail: View {
             return stremio.isSignedIn ? (stremio.email ?? "Stremio connected") : ""
         }
     }
+
+    /// One switch per split category. Add-ons/plugins/debrid also resync so
+    /// the account converges on the new scope (shared = profile 1's rows).
+    @ViewBuilder
+    private var separationToggles: some View {
+        SettingsToggleCard(
+            title: "Add-ons",
+            subtitle: "Each profile installs and orders its own add-ons",
+            isOn: Binding(
+                get: { addonManager.perProfileEnabled },
+                set: { addonManager.setPerProfile($0); resyncAfterScopeChange() }
+            )
+        )
+        SettingsToggleCard(
+            title: "Plugins",
+            subtitle: "Each profile keeps its own plugin repositories and scrapers",
+            isOn: Binding(
+                get: { plugins.perProfileEnabled },
+                set: { plugins.setPerProfile($0); resyncAfterScopeChange() }
+            )
+        )
+        SettingsToggleCard(
+            title: "Debrid logins",
+            subtitle: "Each profile connects its own Real-Debrid / Premiumize / TorBox and picks its own preferred service",
+            isOn: Binding(
+                get: { debrid.perProfileEnabled },
+                set: { debrid.setPerProfile($0); resyncAfterScopeChange() }
+            )
+        )
+        SettingsToggleCard(
+            title: "Player & subtitles",
+            subtitle: "Each profile keeps its own playback and caption settings",
+            isOn: Binding(
+                get: { playerSettings.perProfileEnabled },
+                set: { playerSettings.setPerProfile($0) }
+            )
+        )
+        SettingsToggleCard(
+            title: "TMDB",
+            subtitle: "Each profile brings its own TMDB key, language and enrichment choices",
+            isOn: Binding(
+                get: { tmdbSettings.perProfileEnabled },
+                set: { tmdbSettings.setPerProfile($0) }
+            )
+        )
+        SettingsToggleCard(
+            title: "Theme & appearance",
+            subtitle: "Each profile keeps its own accent, font and settings style",
+            isOn: Binding(
+                get: { theme.perProfileEnabled },
+                set: { theme.setPerProfile($0) }
+            )
+        )
+        SettingsToggleCard(
+            title: "Stream badges",
+            subtitle: "Each profile keeps its own badge pack and size",
+            isOn: Binding(
+                get: { streamBadges.perProfileEnabled },
+                set: { streamBadges.setPerProfile($0) }
+            )
+        )
+    }
+
+    private func resyncAfterScopeChange() {
+        SyncCoordinator.shared.requestFullSync("per-profile scope changed")
+    }
 }
 
 /// Content & Discovery — the APK folds add-ons, catalogs and collections into
@@ -810,6 +895,10 @@ struct ContentDiscoveryDetail: View {
     @State private var showAddons = false
     @State private var badgeURLInput = ""
     @State private var badgeImporting = false
+    @State private var iptvURLInput = ""
+    @State private var iptvImporting = false
+    @State private var iptvStatus: String?
+    @State private var showIPTVPhoneAdd = false
 
     var body: some View {
         DetailScaffold(title: SettingsCategory.contentDiscovery.title, subtitle: SettingsCategory.contentDiscovery.subtitle) {
@@ -837,7 +926,7 @@ struct ContentDiscoveryDetail: View {
                     ]
                 ) { homeCatalogSettings.autoRefreshMinutes = Int($0) ?? 0 }
             }
-            SettingsGroupCard(title: "Live TV", subtitle: "The Live TV tab, and which channels its built-in IPTV list shows") {
+            SettingsGroupCard(title: "Live TV", subtitle: "The Live TV tab, and where its channels come from") {
                 SettingsToggleCard(
                     title: "Live TV tab",
                     subtitle: "Show the Live TV tab in the sidebar. Off: it's hidden until you turn this back on.",
@@ -845,21 +934,28 @@ struct ContentDiscoveryDetail: View {
                 )
 
                 if liveTV.enabled {
-                    OrivioDropdown(
-                        title: "Location",
-                        subtitle: "Load channels for this country. All countries = the full global list.",
-                        icon: "globe",
-                        selection: liveTV.countryCode,
-                        options: LiveTVSettingsStore.countries.map { OrivioDropdownOption($0.code, $0.name) }
-                    ) { liveTV.countryCode = $0 }
+                    iptvPlaylistControls
 
-                    OrivioDropdown(
-                        title: "Preferred language",
-                        subtitle: "Only show channels in this language, wherever they're from. Location is used only when no language is set.",
-                        icon: "character.bubble",
-                        selection: liveTV.languageCode,
-                        options: LiveTVSettingsStore.languages.map { OrivioDropdownOption($0.code, $0.name) }
-                    ) { liveTV.languageCode = $0 }
+                    // Location/language are paths into iptv-org's playlist
+                    // tree — meaningless against a custom playlist, so they
+                    // hide rather than sit there doing nothing.
+                    if !liveTV.usesCustomPlaylist {
+                        OrivioDropdown(
+                            title: "Location",
+                            subtitle: "Load channels for this country. All countries = the full global list.",
+                            icon: "globe",
+                            selection: liveTV.countryCode,
+                            options: LiveTVSettingsStore.countries.map { OrivioDropdownOption($0.code, $0.name) }
+                        ) { liveTV.countryCode = $0 }
+
+                        OrivioDropdown(
+                            title: "Preferred language",
+                            subtitle: "Only show channels in this language, wherever they're from. Location is used only when no language is set.",
+                            icon: "character.bubble",
+                            selection: liveTV.languageCode,
+                            options: LiveTVSettingsStore.languages.map { OrivioDropdownOption($0.code, $0.name) }
+                        ) { liveTV.languageCode = $0 }
+                    }
                 }
             }
             SettingsGroupCard(title: "Badges", subtitle: "Badge packs from Badger (nintle.github.io/Badger) shown on source rows") {
@@ -876,6 +972,96 @@ struct ContentDiscoveryDetail: View {
             .environmentObject(collections)
             .environmentObject(homeCatalogSettings)
             .onExitCommand { showAddons = false }
+        }
+    }
+
+    /// Custom IPTV playlist: paste an M3U/M3U8 URL, validate it by actually
+    /// fetching and parsing it (a URL that yields zero channels is refused —
+    /// storing it would just blank the Live TV tab), then it REPLACES the
+    /// built-in iptv-org list until removed. Same shape as the badge import
+    /// below.
+    @ViewBuilder
+    private var iptvPlaylistControls: some View {
+        if liveTV.usesCustomPlaylist {
+            HStack(spacing: OrivioSpacing.md) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(theme.palette.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Custom playlist active")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(theme.palette.textPrimary)
+                    Text(liveTV.customPlaylistURL)
+                        .font(.system(size: 17))
+                        .foregroundStyle(theme.palette.textTertiary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Button("Remove") {
+                    liveTV.customPlaylistURL = ""
+                    iptvStatus = nil
+                }
+                .font(.system(size: 22, weight: .semibold))
+            }
+            .padding(.vertical, 4)
+            Text("Live TV shows the channels from your playlist instead of the built-in list. Remove it to bring the built-in list back.")
+                .font(.system(size: 18))
+                .foregroundStyle(theme.palette.textTertiary)
+        } else {
+            // Playlist URLs are long; the QR page (the add-ons phone-paste
+            // server, re-worded) is the comfortable way in. The field below
+            // stays for short URLs and boxes with no phone handy.
+            Button { showIPTVPhoneAdd = true } label: {
+                SettingsActionRow(
+                    title: "Add from Phone",
+                    subtitle: "Scan a QR code and paste your playlist URL from your phone's browser",
+                    leadingIcon: "qrcode"
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
+            .fullScreenCover(isPresented: $showIPTVPhoneAdd) {
+                IPTVPhoneAddView { showIPTVPhoneAdd = false }
+                    .environmentObject(theme)
+            }
+
+            HStack(spacing: OrivioSpacing.md) {
+                TextField("Custom M3U playlist URL", text: $iptvURLInput)
+                    .font(.system(size: 22))
+                Button {
+                    guard !iptvImporting else { return }
+                    var url = iptvURLInput.trimmingCharacters(in: .whitespaces)
+                    guard !url.isEmpty else { return }
+                    if !url.contains("://") { url = "https://" + url }
+                    iptvImporting = true
+                    iptvStatus = nil
+                    Task {
+                        let channels = await M3UService.channels(from: url)
+                        if channels.isEmpty {
+                            iptvStatus = "No channels found at that URL — check it points to an M3U/M3U8 playlist."
+                        } else {
+                            liveTV.customPlaylistURL = url
+                            iptvStatus = nil
+                            iptvURLInput = ""
+                        }
+                        iptvImporting = false
+                    }
+                } label: {
+                    if iptvImporting {
+                        ProgressView()
+                    } else {
+                        Text("Add")
+                            .font(.system(size: 22, weight: .semibold))
+                    }
+                }
+            }
+            if let iptvStatus {
+                Text(iptvStatus)
+                    .font(.system(size: 19))
+                    .foregroundStyle(theme.palette.textSecondary)
+            }
+            Text("Paste the URL of your own IPTV playlist (M3U/M3U8) to use it instead of the built-in channel list. The location and language filters below apply only to the built-in list.")
+                .font(.system(size: 18))
+                .foregroundStyle(theme.palette.textTertiary)
         }
     }
 

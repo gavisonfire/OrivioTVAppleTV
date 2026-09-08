@@ -54,8 +54,11 @@ final class SearchViewModel: ObservableObject {
             var merged: [MetaItem] = []
             var seen = Set<String>()
             for index in targets.indices {
-                for item in byTarget[index] ?? [] where !seen.contains(item.id + item.type) {
-                    seen.insert(item.id + item.type)
+                // Keyed on `id` alone: the grids' `ForEach` identify rows by
+                // `MetaItem.id`, so "tt123" as `series` from one addon and
+                // as `tv` from another must not both survive.
+                for item in byTarget[index] ?? [] where !seen.contains(item.id) {
+                    seen.insert(item.id)
                     merged.append(item)
                 }
             }
@@ -157,7 +160,11 @@ struct SearchView: View {
         ZStack {
             ATVBackground()
             VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
+                // Above the grid in z as well as in layout: the scroller below
+                // is deliberately unclipped (see `scrollClipDisabled`), so a
+                // row riding up used to draw straight over the field.
                 searchBar
+                    .zIndex(1)
                 ScrollView(.vertical) {
                     if viewModel.isSearching && viewModel.results.isEmpty {
                         OrivioLoadingView(label: "Searching").frame(height: 480)
@@ -194,7 +201,28 @@ struct SearchView: View {
                         .frame(height: 480)
                     }
                 }
+                // Unclipped so a focused poster's platter and lift are not
+                // sheared off at the left and right ends of the grid.
                 .scrollClipDisabled()
+                // …but that let rows travel straight up the page and over the
+                // search field. This mask puts the ceiling back WITHOUT
+                // restoring the side clipping: black (keep) everywhere the
+                // scroller draws, extended far past its left, right and bottom
+                // edges, and faded out across the top so a row scrolling away
+                // dissolves just under the field instead of being cut. The
+                // headroom above the fade is the focus lift of the first row,
+                // which has to stay whole.
+                .mask(alignment: .top) {
+                    VStack(spacing: 0) {
+                        LinearGradient(colors: [.clear, .black],
+                                       startPoint: .top, endPoint: .bottom)
+                            .frame(height: 34)
+                        Color.black
+                    }
+                    .padding(.top, -18)
+                    .padding(.horizontal, -600)
+                    .padding(.bottom, -600)
+                }
             }
             .padding(.top, OrivioSpacing.xl)
         }

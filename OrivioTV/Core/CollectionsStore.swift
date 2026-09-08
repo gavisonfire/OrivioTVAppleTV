@@ -224,6 +224,40 @@ struct OrivioCollectionFolder: Codable, Identifiable, Hashable {
     }
 }
 
+/// How EVERY collection is laid out on Home. `.custom` leaves each collection
+/// on its own `viewMode` (edited inside that collection); the other three are
+/// an account-wide override that forces one layout on all of them, so the
+/// whole Home reads consistently without editing collections one by one.
+enum CollectionLayoutMode: String, CaseIterable, Identifiable {
+    case custom = "CUSTOM"
+    case folders = "TABBED_GRID"
+    case rows = "ROWS"
+    case combined = "COMBINED"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .custom: return "Custom"
+        case .folders: return "Folders"
+        case .rows: return "Rows"
+        case .combined: return "Combined"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .custom: return "Each collection keeps the layout set inside it."
+        case .folders: return "Every collection browses one folder at a time, with tabs across the top."
+        case .rows: return "Every collection becomes its own row of folders on Home."
+        case .combined: return "Every collection's titles spread out together in one row."
+        }
+    }
+
+    /// The `viewMode` to force on every collection, or nil for `.custom`.
+    var forcedViewMode: String? { self == .custom ? nil : rawValue }
+}
+
 struct OrivioCollection: Codable, Identifiable, Hashable {
     var id: String
     var title: String
@@ -308,6 +342,20 @@ final class CollectionsStore: ObservableObject {
     /// set and let individual profiles trim it further.
     @Published private(set) var globalHiddenFolderIDs: Set<String> = []
 
+    /// Account-wide Home layout for collections. `.custom` honours each
+    /// collection's own `viewMode`; anything else overrides all of them (see
+    /// `recomputeVisible`, which stamps the forced mode onto the visible
+    /// copies so every reader — Home, the browser, the fingerprint — sees it).
+    /// Device-local: it isn't part of the collections blob, so it never
+    /// rewrites what other clients stored per collection.
+    @Published var globalLayoutMode: CollectionLayoutMode = CollectionsStore.loadGlobalLayoutMode() {
+        didSet {
+            guard globalLayoutMode != oldValue else { return }
+            UserDefaults.standard.set(globalLayoutMode.rawValue, forKey: Self.globalLayoutModeKey)
+            recomputeVisible()
+        }
+    }
+
     /// Fired after a user-initiated change so account sync can push. Not
     /// fired while applying remote data (guarded by `suppressChange`).
     var onLocalChange: (() -> Void)?
@@ -383,14 +431,16 @@ final class CollectionsStore: ObservableObject {
         return nil
     }
 
-    /// Legacy per-profile key, still read once during migration.
-    private var legacyStorageKey: String {
-        profileID == 1 ? Self.baseKey : "\(Self.baseKey).p\(profileID)"
-    }
     private var hiddenKey: String { "orivio.collections.hidden.p\(profileID)" }
     private var hiddenFoldersKey: String { "orivio.collections.hiddenFolders.p\(profileID)" }
     private static let globalHiddenFoldersKey = "orivio.collections.hiddenFolders.global.v1"
     private static let globalHiddenCollectionsKey = "orivio.collections.hidden.global.v1"
+    private static let globalLayoutModeKey = "orivio.collections.layoutMode.v1"
+
+    private static func loadGlobalLayoutMode() -> CollectionLayoutMode {
+        UserDefaults.standard.string(forKey: globalLayoutModeKey)
+            .flatMap(CollectionLayoutMode.init(rawValue:)) ?? .custom
+    }
 
     /// Collections the user deleted from the account.
     ///
@@ -687,11 +737,15 @@ final class CollectionsStore: ObservableObject {
 
     private func recomputeVisible() {
         let hiddenFolders = effectiveHiddenFolders
+        // One layout for everything, unless the mode is Custom — stamped here
+        // so the whole app reads the effective layout off the visible copy.
+        let forcedViewMode = globalLayoutMode.forcedViewMode
         let next: [OrivioCollection] = library.compactMap { collection in
             guard !hiddenIDs.contains(collection.id),
                   !globalHiddenIDs.contains(collection.id) else { return nil }
-            guard !hiddenFolders.isEmpty else { return collection }
             var trimmed = collection
+            if let forcedViewMode { trimmed.viewMode = forcedViewMode }
+            guard !hiddenFolders.isEmpty else { return trimmed }
             trimmed.folders = collection.folders.filter { !hiddenFolders.contains($0.id) }
             // A collection whose folders are all switched off has nothing to
             // show — drop the empty row rather than render a dead tile.
@@ -729,19 +783,58 @@ final class CollectionsStore: ObservableObject {
         // it could draw anything or accept a sign-in. Decode off-thread and
         // publish when it lands; the UI simply has no collections for the first
         // moment, which is how every other store behaves anyway.
+        // The legacy per-profile migration is ONE-SHOT. It used to re-run
+        // whenever the library file was absent — which an emptied library
+        // (every collection removed, or an account switch) made true, since
+        // `clear` deleted the file — and re-adopted every legacy blob,
+        // resurrecting exactly what the user had deleted (and pushing it to
+        // the account). Now: an empty library is written as `[]`, the
+        // migration runs at most once, and its output honours the removal
+        // tombstones.
+        let legacyMigrated = UserDefaults.standard.bool(forKey: Self.legacyMigratedKey)
         Task.detached(priority: .userInitiated) {
             let persisted = Self.readPersistedLibrary()
-            let decoded = persisted ?? Self.migrateLegacyProfileCollections()
+            let migrated = (persisted == nil && !legacyMigrated) ? Self.migrateLegacyProfileCollections() : nil
             await MainActor.run { [weak self] in
                 guard let self, self.library.isEmpty else { return }
+                let decoded = persisted ?? (migrated ?? []).filter { self.removedAt[$0.id] == nil }
                 self.library = decoded
                 self.recomputeVisible()
                 // Persist only if this came from the legacy per-profile
                 // migration (readPersistedLibrary already wrote the file for
-                // the defaults-key migration).
-                if persisted == nil, !decoded.isEmpty { self.saveLibrary() }
+                // the defaults-key migration), then retire the legacy blobs so
+                // they can neither be re-adopted nor keep ~900 KB parked in
+                // the NSUserDefaults domain.
+                if persisted == nil {
+                    if !decoded.isEmpty {
+                        // Retire the legacy blobs only once THIS write has
+                        // landed (the persister does it after a successful
+                        // write) — deleting them first and then losing the
+                        // file (a failed write, a purged Caches directory)
+                        // would have lost the collections outright.
+                        self.saveLibrary(retireLegacyProfiles: true)
+                    } else if migrated != nil {
+                        // Nothing survived the tombstones: the blobs held only
+                        // deleted collections.
+                        Self.retireLegacyProfileCollections()
+                    }
+                } else if !legacyMigrated {
+                    // A library already exists (file or carried-over key), so
+                    // the legacy blobs were never going to be adopted — they
+                    // are the ~900 KB parked in the defaults domain for nothing.
+                    Self.retireLegacyProfileCollections()
+                }
             }
         }
+    }
+
+    private static let legacyMigratedKey = "orivio.collections.legacyProfilesMigrated.v1"
+
+    nonisolated static func retireLegacyProfileCollections() {
+        for pid in 1...12 {
+            UserDefaults.standard.removeObject(forKey: pid == 1 ? baseKey : "\(baseKey).p\(pid)")
+        }
+        UserDefaults.standard.set(true, forKey: legacyMigratedKey)
     }
 
     /// One-time union of the legacy per-profile collection stores into a single
@@ -793,7 +886,7 @@ final class CollectionsStore: ObservableObject {
     /// Monotonic stamp for library writes — see CollectionsLibraryPersister.
     private var saveSequence: UInt64 = 0
 
-    private func saveLibrary() {
+    private func saveLibrary(retireLegacyProfiles: Bool = false) {
         // Encode + write OFF the main thread. The merged library is ~700 KB of
         // nested JSON (493 folders); encoding it synchronously on the
         // @MainActor store stalled the UI on an A10X every time anything
@@ -820,7 +913,8 @@ final class CollectionsStore: ObservableObject {
         let snapshot = library
         Task.detached(priority: .utility) {
             await CollectionsLibraryPersister.shared
-                .write(snapshot, to: url, legacyKey: legacyKey, sequence: sequence)
+                .write(snapshot, to: url, legacyKey: legacyKey, sequence: sequence,
+                       retireLegacyProfiles: retireLegacyProfiles)
         }
     }
 
@@ -889,20 +983,29 @@ private actor CollectionsLibraryPersister {
     private var lastSequence: UInt64 = 0
 
     func write(_ snapshot: [OrivioCollection], to url: URL,
-               legacyKey: String, sequence: UInt64) {
+               legacyKey: String, sequence: UInt64,
+               retireLegacyProfiles: Bool = false) {
         guard sequence > lastSequence else { return }
         lastSequence = sequence
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        try? data.write(to: url, options: .atomic)
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            NSLog("[OrivioCollections] library write FAILED: %@", String(describing: error))
+            return   // never retire the legacy blobs over a write that did not land
+        }
         // Make sure the old oversized key can never come back.
         UserDefaults.standard.removeObject(forKey: legacyKey)
+        if retireLegacyProfiles { CollectionsStore.retireLegacyProfileCollections() }
     }
 
-    /// The empty-library case: a delete, ordered against the writes above.
+    /// The empty-library case, ordered against the writes above. Written as
+    /// an empty array rather than deleting the file: a MISSING file reads as
+    /// "never migrated" to `load()`, an empty one as "the library is empty".
     func clear(url: URL, legacyKey: String, sequence: UInt64) {
         guard sequence > lastSequence else { return }
         lastSequence = sequence
         UserDefaults.standard.removeObject(forKey: legacyKey)
-        try? FileManager.default.removeItem(at: url)
+        try? Data("[]".utf8).write(to: url, options: .atomic)
     }
 }

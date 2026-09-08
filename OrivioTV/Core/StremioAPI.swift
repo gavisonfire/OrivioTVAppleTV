@@ -91,11 +91,27 @@ enum StremioAPI {
 
     /// `ttl` = how long a cached body stays fresh (0 disables caching for this
     /// request — used for streams, whose links can be short-lived).
+    /// `bypassCache` skips the cache READ (and the coalescer, so a health
+    /// check times its own request rather than joining one in flight) but
+    /// still stores the response for later callers.
     private static func get<T: Decodable>(
-        _ urlString: String, ttl: TimeInterval = 0, timeout: TimeInterval = 0
+        _ urlString: String, ttl: TimeInterval = 0, timeout: TimeInterval = 0,
+        bypassCache: Bool = false
     ) async throws -> T {
-        if ttl > 0, let cached = cache.data(for: urlString, ttl: ttl) {
+        if !bypassCache, ttl > 0, let cached = cache.data(for: urlString, ttl: ttl) {
             return try JSONDecoder().decode(T.self, from: cached)
+        }
+        if bypassCache {
+            guard let url = URL(string: urlString) else { throw StremioAPIError.badURL(urlString) }
+            var request = URLRequest(url: url)
+            if timeout > 0 { request.timeoutInterval = timeout }
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            let (data, response) = try await session.data(for: request)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                throw StremioAPIError.badResponse(http.statusCode)
+            }
+            if ttl > 0 { cache.store(data, for: urlString) }
+            return try JSONDecoder().decode(T.self, from: data)
         }
         // Coalesce concurrent identical fetches into ONE network round-trip —
         // overlapping requests for the same URL (Home rows, prefetch, back-nav)
@@ -121,8 +137,27 @@ enum StremioAPI {
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
 
-    static func manifest(url: String) async throws -> AddonManifest {
-        try await get(url, ttl: 300)
+    /// Catalog "extra" VALUES. The addon splits the extras segment with a
+    /// query-string parser, so `&`, `=` and `+` are structural there —
+    /// `urlPathAllowed` keeps all three, which turned "Law & Order" into
+    /// `search=Law ` plus a bogus ` Order` prop, and every "… & …" genre
+    /// ("Action & Adventure", "Sci-Fi & Fantasy") into an empty row.
+    /// Unreserved characters only, as the query-value encoders elsewhere do.
+    private static let extraValueAllowed: CharacterSet = {
+        var set = CharacterSet.alphanumerics
+        set.insert(charactersIn: "-._~")
+        return set
+    }()
+
+    private static func encodeExtraValue(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: extraValueAllowed) ?? value
+    }
+
+    /// `bypassCache` skips the 5-minute response cache — the health check
+    /// must time the NETWORK, not a cached manifest (which reported "OK, 0 ms"
+    /// for a host that had just gone down, and could never report "slow").
+    static func manifest(url: String, bypassCache: Bool = false) async throws -> AddonManifest {
+        try await get(url, ttl: 300, bypassCache: bypassCache)
     }
 
     static func catalog(
@@ -139,9 +174,9 @@ enum StremioAPI {
         // are joined with `&` (e.g. `/genre=Action&skip=100.json`).
         var extras: [String] = []
         if let search, !search.isEmpty {
-            extras.append("search=\(encodePathComponent(search))")
+            extras.append("search=\(encodeExtraValue(search))")
         } else {
-            if let genre, !genre.isEmpty { extras.append("genre=\(encodePathComponent(genre))") }
+            if let genre, !genre.isEmpty { extras.append("genre=\(encodeExtraValue(genre))") }
             if let skip, skip > 0 { extras.append("skip=\(skip)") }
         }
         if !extras.isEmpty { path += "/" + extras.joined(separator: "&") }
@@ -171,7 +206,8 @@ enum StremioAPI {
         return meta
     }
 
-    static func streams(addon: InstalledAddon, type: String, id: String) async throws -> [Stream] {
+    static func streams(addon: InstalledAddon, type: String, id: String,
+                        timeout: TimeInterval = 45) async throws -> [Stream] {
         // Via `resourceURL` so a configured addon's manifest query (its
         // token) rides along after `.json` instead of being dropped.
         let url = addon.resourceURL("/stream/\(encodePathComponent(type))/\(encodePathComponent(id)).json")
@@ -184,7 +220,9 @@ enum StremioAPI {
         // most sources, while fast addons masked the problem. The sources
         // sweep is parallel and reveals results per addon as they land, so a
         // slow scraper arriving late costs nothing but its own lateness.
-        let response: StreamsResponse = try await get(url, timeout: 45)
+        // User-adjustable (Settings → Playback → Source search patience) for
+        // aggregators that fan out to Usenet indexers and outlast even 45s.
+        let response: StreamsResponse = try await get(url, timeout: max(timeout, 20))
         return response.streams ?? []
     }
 

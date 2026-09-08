@@ -53,12 +53,13 @@ struct TMDBBrowseView: View {
         ZStack {
             ATVBackground()
             if viewModel.isLoading {
-                OrivioLoadingView(label: "Loading titles")
+                OrivioLoadingView(label: "Loading titles", holdsFocus: true)
             } else if viewModel.items.isEmpty {
                 OrivioEmptyState(
                     icon: "building.2.fill",
                     title: viewModel.title,
-                    message: "No titles available for this studio."
+                    message: "No titles available for this studio.",
+                    holdsFocus: true
                 )
             } else {
                 ScrollView(.vertical) {

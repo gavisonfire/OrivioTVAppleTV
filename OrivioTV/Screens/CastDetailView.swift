@@ -42,12 +42,13 @@ struct CastDetailView: View {
         ZStack {
             ATVBackground()
             if viewModel.isLoading {
-                OrivioLoadingView(label: "Loading filmography")
+                OrivioLoadingView(label: "Loading filmography", holdsFocus: true)
             } else if viewModel.items.isEmpty {
                 OrivioEmptyState(
                     icon: "person.fill.questionmark",
                     title: viewModel.personName,
-                    message: "No filmography available for this person."
+                    message: "No filmography available for this person.",
+                    holdsFocus: true
                 )
             } else {
                 ScrollView(.vertical) {

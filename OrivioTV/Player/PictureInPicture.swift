@@ -1,28 +1,37 @@
 import AVKit
 import KSPlayer
+import ObjectiveC
+import OSLog
 import UIKit
 
 /// Picture in Picture for the player.
 ///
-/// AVKit will only drive PiP from a layer it can take over: an `AVPlayerLayer`,
-/// or an `AVSampleBufferDisplayLayer` paired with a playback delegate. Three of
-/// this app's four engines qualify:
+/// On tvOS, AVKit will only drive PiP from an `AVPlayerLayer`. The
+/// sample-buffer content source (`AVSampleBufferDisplayLayer` plus a playback
+/// delegate) exists in the tvOS SDK, but the platform adapter behind
+/// `AVPictureInPictureController` refuses it: its `isContentSourceSupported`
+/// accepts player-layer, video-call and generic-view sources and masks out the
+/// sample-buffer kind, so the controller's status never leaves "prohibited",
+/// `isPictureInPicturePossible` never turns true, and `startPictureInPicture`
+/// logs "failed; status = 0". Verified on tvOS 26.5 and 26.6 both by
+/// disassembling AVKit and by probing a live session on an Apple TV 4K
+/// (`-pipProbe`): the same session arms within seconds on the native engine
+/// and never arms on FFmpeg. So of this app's engines:
 ///
-/// * **KSAVPlayer** — an `AVPlayer` behind an `AVPlayerLayer`. The mp4/HLS path.
-/// * **KSMEPlayer** (FFmpeg) — draws into an `AVSampleBufferDisplayLayer`
-///   whenever `KSOptions.isUseDisplayLayer()` holds, which is `display ==
-///   .plane` — the default this app never changes. KSPlayer already conforms
-///   KSMEPlayer to `AVPictureInPictureSampleBufferPlaybackDelegate`, so the
-///   transport comes for free. This is the engine Auto picks for mkv and
-///   extensionless debrid links, i.e. most of what actually gets played.
-/// * **DVSampleEngine** — feeds its own `AVSampleBufferDisplayLayer`; the
-///   delegate is implemented alongside the engine.
-/// * **VLC** — renders into its own drawable with no CALayer AVKit can adopt.
-///   This one genuinely cannot, and is the only exclusion.
+/// * **KSAVPlayer** (native, mp4/HLS and the DV remux tier) — `AVPlayerLayer`.
+///   The only one that can.
+/// * **KSMEPlayer** (FFmpeg) — draws into an `AVSampleBufferDisplayLayer`.
+///   Blocked by the platform, not by anything here.
+/// * **DVSampleEngine** — its own `AVSampleBufferDisplayLayer`. Same.
+/// * **VLC** — its own drawable, no CALayer AVKit could adopt anyway.
 ///
 /// Availability is still decided per SESSION rather than assumed: the control
-/// is hidden unless the engine that actually loaded produced a usable source
-/// and AVKit reports PiP possible for it.
+/// is hidden unless the engine that actually loaded produced a player layer
+/// and AVKit reports PiP possible for it. On a title the native engine could
+/// play but that is running elsewhere (mp4/HLS on FFmpeg or VLC), the options
+/// menu offers the row anyway and one press switches engines and starts PiP
+/// once armed — see `PlayerViewModel.enterPictureInPictureViaNativeEngine`.
+/// On mkv and the other FFmpeg-only containers there is no row at all.
 @MainActor
 final class PictureInPictureController: NSObject, ObservableObject {
     /// Can PiP start right now? False until the attached layer has content,
@@ -41,67 +50,334 @@ final class PictureInPictureController: NSObject, ObservableObject {
     /// completion — AVKit holds the PiP window up until it is called.
     var onRestore: ((@escaping (Bool) -> Void) -> Void)?
 
-    private var controller: AVPictureInPictureController?
-    private var possibleObservation: NSKeyValueObservation?
-    private weak var attachedLayer: CALayer?
+    /// One "why is there no PiP" line per session, not one per clock tick.
+    private var loggedUnavailable = false
 
-    /// Where the picture comes from. Built by `PlayerViewModel` from whichever
-    /// engine is live, because only it knows which one that is.
-    enum Source {
-        case playerLayer(AVPlayerLayer)
-        case sampleBuffer(AVSampleBufferDisplayLayer, AVPictureInPictureSampleBufferPlaybackDelegate)
-
-        /// Identity used to decide whether the attached source actually
-        /// changed. Comparing the LAYER (not the enum, which can't be
-        /// Equatable with a delegate in it) is what makes `attach` idempotent.
-        var layer: CALayer {
-            switch self {
-            case .playerLayer(let l): return l
-            case .sampleBuffer(let l, _): return l
+    /// Diagnostics ring buffer, persisted so it can be read back from the app
+    /// container after the fact — a console session cannot be attached to a
+    /// player the viewer drives themselves. Read with the `dev.pipTrail` key.
+    private static let trailKey = "dev.pipTrail"
+    /// Appends go to an in-memory ring and are flushed to UserDefaults on a
+    /// utility queue at most once a second. The first version rewrote the
+    /// whole 800-line array synchronously on every call, on whichever thread
+    /// called — the player's clock tick included — which showed up as a
+    /// periodic hitch in full-screen playback whenever the probe was on.
+    nonisolated static func trail(_ line: String) {
+        NSLog("[OrivioPiP] %@", line)
+        let stamped = "\(Date().formatted(date: .omitted, time: .standard)) \(line)"
+        trailQueue.async {
+            trailBuffer.append(stamped)
+            if trailBuffer.count > 800 { trailBuffer.removeFirst(trailBuffer.count - 800) }
+            guard !trailFlushScheduled else { return }
+            trailFlushScheduled = true
+            trailQueue.asyncAfter(deadline: .now() + 1) {
+                trailFlushScheduled = false
+                UserDefaults.standard.set(trailBuffer, forKey: trailKey)
             }
         }
     }
+    private static let trailQueue = DispatchQueue(label: "orivio.pip.trail", qos: .utility)
+    nonisolated(unsafe) private static var trailBuffer: [String] =
+        UserDefaults.standard.stringArray(forKey: "dev.pipTrail") ?? []
+    nonisolated(unsafe) private static var trailFlushScheduled = false
+    private var controller: AVPictureInPictureController?
+    private var possibleObservation: NSKeyValueObservation?
+    private weak var attachedLayer: AVPlayerLayer?
+
+    /// Generic-view path (FFmpeg, VLC, the DV engine): the view AVKit hosts,
+    /// the private content view controller it lives in while PiP is up, and
+    /// the bridge that answers for playback state. See PictureInPictureBridge.
+    private weak var attachedGenericView: UIView?
+    private var contentViewController: UIViewController?
+    private(set) var bridge: PiPPlaybackBridge?
+    /// Where the video view came from, so `stop`/restore can put it back
+    /// before the player screen rebuilds its container.
+    private weak var genericViewHome: UIView?
 
     /// Point at whatever the engine renders into.
     ///
-    /// Idempotent on purpose: `PlayerVideoView.updateUIView` calls this on
-    /// every SwiftUI update, so rebuilding the controller each time would churn
-    /// AVKit state (and drop an active PiP session) many times a second.
-    func attach(_ source: Source?) {
+    /// Idempotent on purpose: `PlayerVideoView.updateUIView` and the clock
+    /// ticks both call this, so rebuilding the controller each time would
+    /// churn AVKit state (and drop an active PiP session) many times a second.
+    func attach(_ layer: AVPlayerLayer?) {
         guard AVPictureInPictureController.isPictureInPictureSupported(),
-              let source else {
-            // VLC, or a device/simulator without PiP. Don't tear down an ACTIVE
-            // session: during the handoff the render view is going away by
-            // design, and resetting here would kill the window just opened.
+              let layer else {
+            if !loggedUnavailable {
+                loggedUnavailable = true
+                Self.trail("unavailable — supported=\(AVPictureInPictureController.isPictureInPictureSupported()) layer=\(layer == nil ? "nil" : "yes")")
+            }
+            // A non-native engine, or a device/simulator without PiP. Don't
+            // tear down an ACTIVE session: during the handoff the render view
+            // is going away by design, and resetting here would kill the
+            // window just opened.
             if !isActive { reset() }
             return
         }
-        guard source.layer !== attachedLayer else { return }
+        guard layer !== attachedLayer else { return }
+        // Same rule as the nil-source path above: a source that CHANGES while
+        // PiP is up (an engine failover under a running window) must not
+        // deallocate the live controller — that takes the window down with no
+        // `didStop` callback, so `isActive` stays true, the parked view model
+        // is never released and the player can never be re-presented. The
+        // next tick after PiP ends attaches the new source.
+        guard !isActive else { return }
+        Self.trail("attach AVPlayerLayer \(Unmanaged.passUnretained(layer).toOpaque())")
         reset()
-        attachedLayer = source.layer
-        let pip: AVPictureInPictureController?
-        switch source {
-        case .playerLayer(let layer):
-            pip = AVPictureInPictureController(playerLayer: layer)
-        case .sampleBuffer(let layer, let delegate):
-            pip = AVPictureInPictureController(contentSource: .init(
-                sampleBufferDisplayLayer: layer, playbackDelegate: delegate))
-        }
+        attachedLayer = layer
+        let pip: AVPictureInPictureController? = AVPictureInPictureController(playerLayer: layer)
         pip?.delegate = self
         controller = pip
         possibleObservation = pip?.observe(\.isPictureInPicturePossible,
                                            options: [.initial, .new]) { [weak self] pip, _ in
             let possible = pip.isPictureInPicturePossible
-            Task { @MainActor in self?.isPossible = possible }
+            Task { @MainActor in
+                guard let self, self.isPossible != possible else { return }
+                Self.trail("isPictureInPicturePossible=\(possible)")
+                self.isPossible = possible
+                if possible { self.consumePendingStart() }
+            }
         }
+    }
+
+    /// Point at a render view no `AVPlayerLayer` backs. Same idempotence
+    /// contract as `attach(_:)`; the bridge is created once per view.
+    func attach(genericView view: UIView?, bridge makeBridge: () -> PiPPlaybackBridge) {
+        KSOptions.hostPictureInPictureActive = { PiPHandoff.shared.isActive }
+        if ProcessInfo.processInfo.arguments.contains("-pipProbe") {
+            KSOptions.hostTrail = { PictureInPictureController.trail($0) }
+        }
+        guard AVPictureInPictureController.isPictureInPictureSupported(),
+              GenericPictureInPicture.isAvailable, let view else {
+            if !loggedUnavailable {
+                loggedUnavailable = true
+                Self.trail("generic unavailable — supported=\(AVPictureInPictureController.isPictureInPictureSupported()) private=\(GenericPictureInPicture.isAvailable) view=\(view == nil ? "nil" : "yes")")
+            }
+            if !isActive { reset() }
+            return
+        }
+        guard view !== attachedGenericView else { return }
+        guard !isActive else { return }   // see attach(_:)
+        Self.trail("attach generic \(type(of: view)) \(Unmanaged.passUnretained(view).toOpaque())")
+        reset()
+        // Recorded BEFORE the fallible steps: a failed attach is otherwise
+        // retried on every clock tick for the whole film — an allocation, a
+        // bridge and a synchronous NSLog several times a second.
+        attachedGenericView = view
+        guard let contentVC = GenericPictureInPicture.makeContentViewController() else {
+            Self.trail("generic: no content view controller class")
+            return
+        }
+        let bridge = makeBridge()
+        guard let source = GenericPictureInPicture.makeContentSource(
+            sourceView: view, contentViewController: contentVC, playerController: bridge) else {
+            Self.trail("generic: content source init returned nil")
+            return
+        }
+        Self.trail("generic: content source \(type(of: source)) built, source=\(String(describing: source.value(forKey: "source")).prefix(80))")
+        attachedGenericView = view
+        contentViewController = contentVC
+        self.bridge = bridge
+        let pip = AVPictureInPictureController(contentSource: source)
+        pip.delegate = self
+        controller = pip
+        possibleObservation = pip.observe(\.isPictureInPicturePossible,
+                                          options: [.initial, .new]) { [weak self] pip, _ in
+            let possible = pip.isPictureInPicturePossible
+            Task { @MainActor in
+                guard let self, self.isPossible != possible else { return }
+                Self.trail("isPictureInPicturePossible=\(possible) (generic)")
+                self.isPossible = possible
+                if possible { self.consumePendingStart() }
+            }
+        }
+    }
+
+    /// The system window is about to take the picture: move the render view
+    /// into the hosted content view controller. Its old superview is the
+    /// player screen's container, which is being dismissed anyway.
+    private func routeGenericViewIntoPiP() {
+        guard let view = attachedGenericView, let contentVC = contentViewController else { return }
+        genericViewHome = view.superview
+        let host = contentVC.view!
+        host.backgroundColor = .black
+        view.removeFromSuperview()
+        view.translatesAutoresizingMaskIntoConstraints = true
+        view.frame = host.bounds
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        host.addSubview(view)
+        Self.trail("generic: routed \(type(of: view)) into content VC, host bounds=\(Int(host.bounds.width))x\(Int(host.bounds.height)) inWindow=\(host.window != nil)")
+    }
+
+    /// PiP is over: hand the view back to whatever container is live (the
+    /// re-presented player screen re-parents it itself on its next update).
+    private func routeGenericViewHome() {
+        guard let view = attachedGenericView, view.superview === contentViewController?.view else { return }
+        view.removeFromSuperview()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        Self.trail("generic: view returned from content VC")
     }
 
     func detach() { reset() }
 
+    /// Start PiP the moment AVKit arms it, if that happens within a minute.
+    /// Used by the options menu's switch-to-Native path: the switch tears the
+    /// engine down and rebuilds it, so the request has to outlive `reset()` —
+    /// which is why it is a deadline here rather than state on the layer.
+    private var pendingStartDeadline: Date?
+    func startWhenPossible() {
+        pendingStartDeadline = Date().addingTimeInterval(60)
+        if isPossible { consumePendingStart() }
+    }
+
+    /// Called on every clock tick as well as when `isPossible` flips, so a
+    /// request made while the app was still activating (AVKit refuses to
+    /// start unless the scene is foreground-active) is retried rather than
+    /// lost.
+    func consumePendingStart() {
+        guard let deadline = pendingStartDeadline else { return }
+        guard Date() < deadline else { pendingStartDeadline = nil; return }
+        guard isPossible, !isActive,
+              UIApplication.shared.applicationState == .active else { return }
+        pendingStartDeadline = nil
+        Self.trail("pending start → startPictureInPicture()")
+        start()
+    }
+
+    /// Dev diagnostic (`-pipProbe`): what AVKit thinks of the attached layer,
+    /// at most every few seconds. `isPictureInPicturePossible` alone does not
+    /// say WHY, so the layer's own readiness goes in the same line, and AVKit's
+    /// own log lines for this process are copied into the trail: they are the
+    /// only place the framework states its reason.
+    private var lastProbeAt = Date.distantPast
+    private var forcedStart = false
+    private var dumpedRuntime = false
+    private var interestingRuntimeNames: [String] = []
+    private var probeTimer: Timer?
+    private let probeStartedAt = Date()
+    func probe() {
+        guard ProcessInfo.processInfo.arguments.contains("-pipProbe"),
+              let controller else { return }
+        if probeTimer == nil {
+            // Keep probing even when the engine's clock stops ticking.
+            probeTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] timer in
+                guard self != nil else { timer.invalidate(); return }
+                Task { @MainActor in self?.probe() }
+            }
+        }
+        guard Date().timeIntervalSince(lastProbeAt) > 3.5 else { return }
+        lastProbeAt = Date()
+        var detail = "possible=\(controller.isPictureInPicturePossible) active=\(controller.isPictureInPictureActive)"
+        if let layer = attachedLayer {
+            detail += " ready=\(layer.isReadyForDisplay) item=\(layer.player?.currentItem != nil)"
+            var root: CALayer = layer
+            while let up = root.superlayer { root = up }
+            detail += " bounds=\(Int(layer.bounds.width))x\(Int(layer.bounds.height))"
+            detail += " hidden=\(layer.isHidden) rootIsWindow=\(root.delegate is UIWindow)"
+        }
+        if let metal = attachedGenericView as? MetalPlayView {
+            detail += " metal ticks=\(metal.diagDisplayLinkTicks) enq=\(metal.diagFramesEnqueued) nil=\(metal.diagFramesReturnedNil) notReady=\(metal.diagLayerNotReady) dlPaused=\(metal.diagDisplayLinkPaused) status=\(metal.displayLayer.status.rawValue)"
+        }
+        if let view = attachedGenericView {
+            detail += " generic bounds=\(Int(view.bounds.width))x\(Int(view.bounds.height))"
+            detail += " inWindow=\(view.window != nil) hidden=\(view.isHidden) super=\(view.superview.map { String(describing: type(of: $0)) } ?? "nil")"
+            if let content = controller.contentSource {
+                detail += " src=\(String(describing: content.value(forKey: "source")).prefix(60))"
+            }
+        }
+        let session = AVAudioSession.sharedInstance()
+        detail += " app=\(UIApplication.shared.applicationState.rawValue)"
+        detail += " audio=\(session.category.rawValue)/\(session.mode.rawValue)"
+        Self.trail(detail)
+        // Private state, read by name only: whatever AVKit keeps that mentions
+        // possibility or a reason. Names are dumped once, values every probe.
+        if !dumpedRuntime {
+            dumpedRuntime = true
+            var cls: AnyClass? = AVPictureInPictureController.self
+            var names: [String] = []
+            while let c = cls, c != NSObject.self {
+                var count: UInt32 = 0
+                if let list = class_copyPropertyList(c, &count) {
+                    for i in 0..<Int(count) { names.append(String(cString: property_getName(list[i]))) }
+                    free(list)
+                }
+                if let list = class_copyIvarList(c, &count) {
+                    for i in 0..<Int(count) {
+                        if let n = ivar_getName(list[i]) { names.append(String(cString: n)) }
+                    }
+                    free(list)
+                }
+                cls = class_getSuperclass(c)
+            }
+            interestingRuntimeNames = names.filter {
+                let l = $0.lowercased()
+                return l.contains("possib") || l.contains("reason") || l.contains("eligib") || l.contains("prohibit")
+            }.sorted()
+            Self.trail("runtime names: \(interestingRuntimeNames.joined(separator: ","))")
+        }
+        for name in interestingRuntimeNames {
+            let key = name.hasPrefix("_") ? String(name.dropFirst()) : name
+            let value = controller.value(forKey: key).map { String(describing: $0) } ?? "nil"
+            if value != "0", value != "nil", value != "false" {
+                Self.trail("  \(name)=\(value.prefix(200))")
+            }
+        }
+        // AVKit's own words, from this process's log store. Read on a utility
+        // queue: the store query walks every persisted entry since `from` and
+        // takes longer the longer the session runs — on the main thread that
+        // was a visible hitch every four seconds.
+        Self.collectLogs(since: probeStartedAt.addingTimeInterval(-30))
+        // `-pipForce`: start it even though AVKit says impossible, purely to
+        // capture the error it answers with.
+        if ProcessInfo.processInfo.arguments.contains("-pipForce"), !forcedStart, !isActive {
+            forcedStart = true
+            Self.trail("forcing start as soon as possible")
+            startWhenPossible()
+        }
+    }
+
+    private static let logQueue = DispatchQueue(label: "orivio.pip.logs", qos: .utility)
+    nonisolated(unsafe) private static var seenLogLines = Set<String>()
+    nonisolated(unsafe) private static var logCollecting = false
+    nonisolated(unsafe) private static var logPosition: OSLogPosition?
+    nonisolated private static func collectLogs(since from: Date) {
+        logQueue.async {
+            guard !logCollecting else { return }
+            logCollecting = true
+            defer { logCollecting = false }
+            guard let store = try? OSLogStore(scope: .currentProcessIdentifier) else { return }
+            let position = logPosition ?? store.position(date: from)
+            let predicate = NSPredicate(format: "subsystem CONTAINS[c] 'avkit' OR subsystem CONTAINS[c] 'pictureinpicture' OR composedMessage CONTAINS[c] 'pictureinpicture' OR composedMessage CONTAINS[c] 'PiP' OR composedMessage CONTAINS '[Orivio' OR composedMessage CONTAINS '[video]' OR composedMessage CONTAINS '[audio]' OR category CONTAINS[c] 'AVAudioSession' OR subsystem CONTAINS[c] 'coreaudio'")
+            guard let entries = try? store.getEntries(at: position, matching: predicate) else { return }
+            var n = 0
+            var newest: Date?
+            let clock = Date.FormatStyle(date: .omitted, time: .standard)
+            for entry in entries {
+                guard let log = entry as? OSLogEntryLog, log.date > from else { continue }
+                if log.composedMessage.hasPrefix("[OrivioPiP]") { continue }
+                let msg = log.composedMessage.replacingOccurrences(of: "\n", with: " ")
+                let line = "  log@\(log.date.formatted(clock)) \(log.category) \(msg.prefix(400))"
+                guard seenLogLines.insert(line).inserted else { continue }
+                newest = log.date
+                n += 1
+                if n > 80 { break }
+                trail(line)
+            }
+            // Resume a few seconds behind the newest entry next time rather
+            // than from the session start: entries can land in the store late.
+            if let newest { logPosition = store.position(date: newest.addingTimeInterval(-5)) }
+            if seenLogLines.count > 4000 { seenLogLines.removeAll() }
+        }
+    }
+
     private func reset() {
+        probeTimer?.invalidate()
+        probeTimer = nil
         possibleObservation = nil
         controller = nil
         attachedLayer = nil
+        attachedGenericView = nil
+        contentViewController = nil
+        bridge = nil
         isPossible = false
     }
 
@@ -122,6 +398,7 @@ extension PictureInPictureController: AVPictureInPictureControllerDelegate {
     ) {
         Task { @MainActor in
             self.isActive = true
+            self.routeGenericViewIntoPiP()
             self.onWillStart?()
         }
     }
@@ -130,7 +407,7 @@ extension PictureInPictureController: AVPictureInPictureControllerDelegate {
         _ controller: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: Error
     ) {
-        NSLog("[OrivioPiP] failed to start: %@", error.localizedDescription)
+        PictureInPictureController.trail("failed to start: \(error)")
         Task { @MainActor in
             // Never leave `isActive` set on a failure: the host would keep the
             // player dismissed for a PiP window that never appeared.
@@ -142,6 +419,7 @@ extension PictureInPictureController: AVPictureInPictureControllerDelegate {
         _ controller: AVPictureInPictureController
     ) {
         Task { @MainActor in
+            self.routeGenericViewHome()
             guard self.isActive else { return }
             self.isActive = false
             self.onDidStop?()
@@ -159,6 +437,7 @@ extension PictureInPictureController: AVPictureInPictureControllerDelegate {
             // guard sees the restore already handled it and doesn't also fire
             // onDidStop — which would tear down the session we are restoring.
             self.isActive = false
+            self.routeGenericViewHome()
             restore(completionHandler)
         }
     }
@@ -196,9 +475,15 @@ final class PiPHandoff {
         self.request?.id == request.id ? viewModel : nil
     }
 
+    /// Posted when a session is parked here, so screens the player dismisses
+    /// onto can stop anything that would compete with it (DetailView's
+    /// backdrop trailer).
+    static let didBeginNotification = Notification.Name("OrivioPiPHandoffDidBegin")
+
     func begin(viewModel: PlayerViewModel, request: PlaybackRequest) {
         self.viewModel = viewModel
         self.request = request
+        NotificationCenter.default.post(name: Self.didBeginNotification, object: nil)
     }
 
     /// PiP ended for good. Tear the session down properly — this is the
@@ -222,6 +507,7 @@ final class PiPHandoff {
     }
 
     /// The re-presented screen adopted the parked model — stop holding it.
+    /// 
     func releaseAfterRestore() {
         viewModel = nil
         request = nil

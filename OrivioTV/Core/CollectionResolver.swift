@@ -1,28 +1,84 @@
 import Foundation
 
-/// Resolves a collection folder's catalog sources (addon / TMDB / Trakt) into
-/// `MetaItem`s. Shared by the collection BROWSE page (full depth) and HOME
-/// rows (first TMDB page only, via `maxTmdbPages`, so rendering a Rows/Combined
-/// collection doesn't fire hundreds of TMDB requests per folder on every load).
+/// Resolves a collection folder's TMDB / Trakt sources into `MetaItem`s. Shared
+/// by the collection BROWSE page (full depth) and HOME rows (first TMDB page
+/// only, via `maxTmdbPages`, so rendering a Rows/Combined collection doesn't
+/// fire hundreds of TMDB requests per folder on every load).
+///
+/// Categories are a TMDB/Trakt feature. Add-on catalog sources are NOT resolved
+/// here: a folder pointing at an installed add-on's catalog used to fill itself
+/// with no TMDB key at all, which made "categories" look like they worked while
+/// every TMDB-backed folder sat empty. Existing addon rows are left in storage
+/// untouched (so a folder authored on the phone round-trips unchanged) — they
+/// simply resolve to nothing, and `blocker(for:providers:)` says so.
+/// The services a collection can draw on right now.
+///
+/// Collections are built entirely out of TMDB and Trakt sources, so with
+/// neither connected there is nothing for one to resolve — every folder would
+/// open empty. `any` is the switch the whole feature hangs off.
+struct CollectionProviders: Equatable {
+    /// TMDB has the viewer's API key and is switched on.
+    let tmdb: Bool
+    /// The viewer is signed in to Trakt.
+    let trakt: Bool
+
+    var any: Bool { tmdb || trakt }
+
+    /// TMDB is the one to recommend and the one to prefer when both are live:
+    /// it resolves every source type collections can hold (lists, collections,
+    /// companies, networks, people, discover queries), and it returns artwork,
+    /// descriptions and ids directly. A Trakt list carries titles and ids only
+    /// — its posters have to be borrowed from a meta add-on, one lookup per
+    /// title, for the first thirty entries and no further.
+    var preferredName: String? { tmdb ? "TMDB" : (trakt ? "Trakt" : nil) }
+
+    static let none = CollectionProviders(tmdb: false, trakt: false)
+}
+
 enum CollectionResolver {
 
-    /// True when a folder carries sources tvOS can't resolve here — a non-addon,
-    /// non-TMDB, non-Trakt source, or a TMDB source while TMDB is disabled.
-    static func hasUnsupportedSources(_ folder: OrivioCollectionFolder, tmdbEnabled: Bool) -> Bool {
-        let tmdbSources = folder.effectiveSources.filter { $0.provider.lowercased() == "tmdb" }
-        let other = folder.effectiveSources.filter {
-            !$0.isAddonSource && $0.provider.lowercased() != "tmdb" && !$0.isTraktSource
-        }
-        return !other.isEmpty || (!tmdbSources.isEmpty && !tmdbEnabled)
+    /// Why a folder can't fill itself, if it can't.
+    ///
+    /// This is asked per FOLDER and only when the folder has nothing that can
+    /// resolve. A folder holding both a TMDB source and a Trakt list is NOT
+    /// blocked when only TMDB is connected — it just quietly uses TMDB, which
+    /// is the whole point of favouring TMDB. Reporting "sign in to Trakt"
+    /// there (or worse, across the whole collection because one folder
+    /// somewhere had a Trakt list) was noise about a source the folder didn't
+    /// need.
+    enum FolderBlocker: Equatable {
+        /// Something in this folder can resolve.
+        case none
+        case needsTMDB
+        case needsTrakt
+        /// Has both kinds, and neither service is connected.
+        case needsEither
+        /// Add-on catalogs only — collections are TMDB/Trakt now.
+        case unsupportedSources
+        /// The folder has no sources at all.
+        case empty
+    }
+
+    static func blocker(for folder: OrivioCollectionFolder,
+                        providers: CollectionProviders) -> FolderBlocker {
+        let sources = folder.effectiveSources
+        guard !sources.isEmpty else { return .empty }
+        let tmdb = sources.contains(where: \.isTMDBSource)
+        let trakt = sources.contains(where: \.isTraktSource)
+        // Anything at all that can run right now means the folder is fine.
+        if (tmdb && providers.tmdb) || (trakt && providers.trakt) { return .none }
+        if tmdb && trakt { return .needsEither }
+        if tmdb { return .needsTMDB }
+        if trakt { return .needsTrakt }
+        return .unsupportedSources
     }
 
     /// Resolve ONE folder's items, de-duplicated by id (addon order, then TMDB,
     /// then Trakt). Returns empty when the folder has nothing resolvable.
     static func resolveFolder(
         _ folder: OrivioCollectionFolder,
-        addons: [InstalledAddon],
         addonManager: AddonManager,
-        tmdbEnabled: Bool,
+        providers: CollectionProviders,
         tmdbLanguage: String,
         maxTmdbPages: Int = Int.max,
         /// First TMDB page of this window (see TMDBService.resolve). >1 means
@@ -32,23 +88,27 @@ enum CollectionResolver {
         tmdbStartPage: Int = 1,
         hideUnreleased: Bool = false
     ) async -> [MetaItem] {
-        let tmdbSources = folder.effectiveSources.filter { $0.provider.lowercased() == "tmdb" }
-        let traktSources = folder.effectiveSources.filter { $0.isTraktSource }
-        let addonSources = folder.addonSources
-        let resolvableTmdb = tmdbEnabled ? tmdbSources : []
-        guard !addonSources.isEmpty || !resolvableTmdb.isEmpty || !traktSources.isEmpty else { return [] }
+        // Only a CONNECTED service resolves, and TMDB wins OUTRIGHT: when TMDB
+        // can serve this folder, its Trakt sources aren't consulted at all —
+        // TMDB returns artwork, descriptions and resolved ids directly, while
+        // a Trakt list needs a per-title meta lookup just to get posters.
+        // Trakt resolves only when it is the folder's sole workable service
+        // (TMDB disconnected, or a Trakt-only folder).
+        let resolvableTmdb = providers.tmdb ? folder.effectiveSources.filter(\.isTMDBSource) : []
+        let traktSources = (providers.trakt && resolvableTmdb.isEmpty)
+            ? folder.effectiveSources.filter(\.isTraktSource) : []
+        guard !resolvableTmdb.isEmpty || !traktSources.isEmpty else { return [] }
 
         let isContinuation = tmdbStartPage > 1
 
         // Every source in the folder is fetched CONCURRENTLY. They used to run
-        // one after another — each addon catalog, then each TMDB source, then
-        // each Trakt list, every one a full network round-trip — so a folder
-        // built from four sources took four round-trips end to end even though
-        // none of them depends on the others. Folders were already parallel;
-        // the wait was inside each one.
+        // one after another — each TMDB source, then each Trakt list, every one
+        // a full network round-trip — so a folder built from four sources took
+        // four round-trips end to end even though none of them depends on the
+        // others. Folders were already parallel; the wait was inside each one.
         //
         // Order is preserved by INDEX, not by arrival: the merge below still
-        // goes addon → TMDB → Trakt, in each group's own source order, so the
+        // goes TMDB → Trakt, in each group's own source order, so the
         // de-duplication keeps giving the same winner it always did (first
         // source to claim an id owns it). Concurrency changes when things
         // arrive, never what the folder resolves to.
@@ -63,17 +123,6 @@ enum CollectionResolver {
             return out
         }
 
-        async let addonResults: [[MetaItem]] = isContinuation ? [] : gather(addonSources.count) { i in
-            let source = addonSources[i]
-            guard let addonID = source.addonId,
-                  let type = source.type,
-                  let catalogID = source.catalogId,
-                  let addon = addons.first(where: { $0.manifest.id == addonID }),
-                  let catalog = (addon.manifest.catalogs ?? [])
-                    .first(where: { $0.type == type && $0.id == catalogID })
-            else { return [] }
-            return (try? await StremioAPI.catalog(addon: addon, catalog: catalog)) ?? []
-        }
         async let tmdbResults: [[MetaItem]] = gather(resolvableTmdb.count) { i in
             await TMDBService.resolve(source: resolvableTmdb[i], language: tmdbLanguage,
                                       maxPages: maxTmdbPages, startPage: tmdbStartPage)
@@ -84,7 +133,7 @@ enum CollectionResolver {
 
         var items: [MetaItem] = []
         var seen = Set<String>()
-        for batch in await addonResults + tmdbResults + traktResults {
+        for batch in await tmdbResults + traktResults {
             for item in batch where seen.insert(item.id).inserted { items.append(item) }
         }
         return hideUnreleased ? items.filter { !$0.isUnreleased } : items

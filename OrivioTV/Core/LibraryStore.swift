@@ -159,11 +159,23 @@ final class LibraryStore: ObservableObject {
 
     func setProfile(_ id: Int) {
         guard id != profileID else { return }
+        // Tombstones belong to the profile being left — but they are its ONLY
+        // protection against the Trakt/SIMKL/Stremio merges (which have no
+        // delete queue) re-adding what it removed, so park them per profile
+        // rather than dropping them.
+        tombstonesByProfile[profileID] = tombstones
         profileID = id
         suppressChange = true
         items = [:]
+        tombstones = tombstonesByProfile[id] ?? [:]
         load()
         suppressChange = false
+    }
+    private var tombstonesByProfile: [Int: [String: Date]] = [:]
+
+    /// The saved row for an id/type pair, if any.
+    func item(id: String, type: String) -> SavedLibraryItem? {
+        items["\(type)|\(id)"]
     }
 
     /// Saved items, newest first — the order the Library grid renders in.
@@ -239,6 +251,26 @@ final class LibraryStore: ObservableObject {
 
     func allForSync() -> [SavedLibraryItem] { Array(items.values) }
 
+    /// A local backup restore: every row is adopted, INCLUDING titles the user
+    /// had removed since (their tombstones are cleared, as `add` does) — the
+    /// backup is the user's explicit word. Silent: no per-item tracker hooks
+    /// (a big restore fanned out one Trakt/SIMKL POST per title); the caller
+    /// pings `onLocalChange` once so the account push runs.
+    func importItems(_ imported: [SavedLibraryItem]) {
+        guard !imported.isEmpty else { return }
+        suppressChange = true
+        defer { suppressChange = false }
+        for item in imported {
+            tombstones.removeValue(forKey: item.key)
+            if let local = items[item.key] {
+                items[item.key] = local.withFallbackMetadata(item.metaItem)
+            } else {
+                items[item.key] = item
+            }
+        }
+        save()
+    }
+
     /// Merge a FULL remote snapshot. Two-way, mirroring Progress/Watched: rows
     /// from the account are added AND (when `reconcile`) local rows the server
     /// no longer has are removed — otherwise a removal made on another device
@@ -294,8 +326,11 @@ final class LibraryStore: ObservableObject {
     // MARK: - Persistence
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([String: SavedLibraryItem].self, from: data) else { return }
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else { return }
+        guard let decoded = try? JSONDecoder().decode([String: SavedLibraryItem].self, from: data) else {
+            UnreadableBlobGuard.preserve(data, key: storageKey)   // see ProgressStore
+            return
+        }
         items = decoded
     }
 

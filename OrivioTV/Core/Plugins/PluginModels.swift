@@ -108,10 +108,12 @@ struct ScraperResult: Decodable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         // `url` is a string OR an object { url, headers }.
+        var objectHeaders: [String: String]?
         if let s = try? c.decode(String.self, forKey: .url) {
             url = s
         } else if let obj = try? c.decode(URLObject.self, forKey: .url) {
             url = obj.url
+            objectHeaders = obj.headers
         } else {
             throw DecodingError.dataCorruptedError(forKey: .url, in: c, debugDescription: "missing url")
         }
@@ -124,10 +126,22 @@ struct ScraperResult: Decodable {
         type = try? c.decodeIfPresent(String.self, forKey: .type)
         seeders = try? c.decodeIfPresent(Int.self, forKey: .seeders)
         infoHash = try? c.decodeIfPresent(String.self, forKey: .infoHash)
-        headers = try? c.decodeIfPresent([String: String].self, forKey: .headers)
+        // The object form `{url: {url, headers}}` carries the CDN's required
+        // Referer/User-Agent INSIDE the url object; a top-level `headers` key
+        // wins when both are present.
+        headers = ((try? c.decodeIfPresent([String: String].self, forKey: .headers)) ?? nil) ?? objectHeaders
     }
 
-    private struct URLObject: Decodable { let url: String }
+    private struct URLObject: Decodable {
+        let url: String
+        let headers: [String: String]?
+        private enum CodingKeys: String, CodingKey { case url, headers }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            url = try c.decode(String.self, forKey: .url)
+            headers = (try? c.decodeIfPresent([String: String].self, forKey: .headers)) ?? nil
+        }
+    }
     private static func looseString(_ c: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> String? {
         if let s = try? c.decodeIfPresent(String.self, forKey: key) { return s }
         if let n = try? c.decodeIfPresent(Double.self, forKey: key) { return String(n) }

@@ -248,7 +248,8 @@ struct CollectionTileCard: View, Equatable {
                     // fill the tile edge to edge. Drawing them .fit with padding
                     // left the grey `surface` fill showing as bars around every
                     // tile. Only SQUARE is a logo mark that wants a margin.
-                    RemoteImage(url: cover, contentMode: isLogoMark ? .fit : .fill)
+                    RemoteImage(url: cover, contentMode: isLogoMark ? .fit : .fill,
+                                maxDimension: max(cardSize.width, cardSize.height))
                         .padding(OrivioSpacing.sm)
                         .clipShape(RoundedRectangle(cornerRadius: OrivioRadius.md))
                 } else if let emoji, !emoji.isEmpty {
@@ -461,65 +462,18 @@ struct CollectionFolderCard: View, Equatable {
 
 /// Full collection browser: folder tabs across the top (with an "All" tab when
 /// enabled) and a poster grid below — the APK's TABBED_GRID view mode.
-/// One-time notice, shown the first time collections are opened, explaining
-/// that focus animations are off on this hardware and where to change it.
-/// Collection packs carry hundreds of multi-megabyte focus GIFs and they were
-/// heavy enough to lock up a 4K gen 1, so the default is conservative — but the
-/// user should be told rather than left wondering why nothing animates.
-struct CollectionGifNotice: View {
-    @EnvironmentObject private var theme: ThemeManager
-    let quality: CollectionGifQuality
-    let onDismiss: () -> Void
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.75).ignoresSafeArea()
-            VStack(spacing: OrivioSpacing.lg) {
-                Image(systemName: "sparkles.tv")
-                    .font(.system(size: 64))
-                    .foregroundStyle(theme.palette.focusRing)
-                Text("Collection focus artwork")
-                    .font(.system(size: 40, weight: .bold))
-                    .foregroundStyle(theme.palette.textPrimary)
-                Text(message)
-                    .font(.system(size: 24))
-                    .foregroundStyle(theme.palette.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 900)
-                Text("Settings → Performance → Collection focus artwork")
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(theme.palette.textTertiary)
-                Button("Got it", action: onDismiss)
-                    .font(.system(size: 26, weight: .semibold))
-                    .padding(.top, OrivioSpacing.md)
-            }
-            .padding(OrivioSpacing.huge)
-            .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: OrivioRadius.lg, style: .continuous))
-            .padding(OrivioSpacing.huge)
-        }
-        .onExitCommand(perform: onDismiss)
-    }
-
-    private var message: String {
-        switch quality {
-        case .off:
-            return "These collections include animated artwork that plays when you focus a tile. It's off on \(PerformanceProfile.tierLabel) because it's demanding enough to affect playback and browsing. You can turn it on any time."
-        case .partial:
-            return "Focus artwork is set to still images on \(PerformanceProfile.tierLabel) — the art still changes when you focus a tile, without the cost of animation. You can switch to full animation any time."
-        case .full:
-            return "These collections include animated artwork that plays when you focus a tile. If browsing feels sluggish, you can switch it to still images or turn it off."
-        }
-    }
-}
-
+///
+/// (The one-time "Collection focus artwork" notice that used to greet the first
+/// open is gone: it sat over a grid that kept focus, so its "Got it" button
+/// could never be reached with the remote. Focus artwork is simply ON by
+/// default now, with the Settings → Performance dial to turn it down or off.)
 struct CollectionView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var addonManager: AddonManager
     @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
+    @EnvironmentObject private var trakt: TraktStore
     @ObservedObject private var perfSettings = PerformanceSettingsStore.shared
     @EnvironmentObject private var layoutSettings: HomeCatalogSettingsStore
-    @AppStorage("orivio.collections.gifNoticeSeen.v1") private var gifNoticeSeen = false
-    @State private var showGifNotice = false
 
     let collection: OrivioCollection
     let onSelect: (MetaItem) -> Void
@@ -531,13 +485,37 @@ struct CollectionView: View {
     /// on its way, and saying "nothing here" about it would be a lie.
     @State private var loadedFolders: Set<String> = []
     @State private var isLoading = true
-    @State private var hasUnsupportedSources = false
+    @State private var didLoad = false
+    /// Why each folder can't fill itself, for the folders that can't. Keyed by
+    /// folder id — the old single collection-wide flag meant one Trakt list in
+    /// one folder made EVERY empty folder in the collection claim it needed
+    /// Trakt, including folders that only ever used TMDB.
+    @State private var blockersByFolder: [String: CollectionResolver.FolderBlocker] = [:]
+    /// What was connected when this collection last resolved — decides which
+    /// empty state to show (nothing connected vs. nothing in the folder).
+    @State private var loadedProviders = CollectionProviders.none
+    /// Folders being fetched on demand right now (see `fetchOnDemand`), so
+    /// tabbing back and forth doesn't start the same fetch twice.
+    @State private var onDemandFolders: Set<String> = []
 
     private enum SortMode: String { case popular, topRated, az, newest }
     private enum TypeFilter: String { case all, movies, shows }
     @State private var sortMode: SortMode = .popular
     @State private var typeFilter: TypeFilter = .all
     @State private var genreFilter: String?   // nil = All genres
+
+    /// How a collection's inside looks: one horizontal row per category
+    /// (folder), the way Nuvio desktop lays a collection out — or the tabbed
+    /// merged grid. Unset ("" = automatic) shows categories whenever there is
+    /// more than one folder; a single-folder collection has nothing to group,
+    /// so it stays a grid and the picker hides. The choice is remembered
+    /// device-wide, not per collection.
+    private enum ViewMode: String { case categories, grid }
+    @AppStorage("orivio.collections.viewMode.v1") private var viewModeRaw = ""
+    private var viewMode: ViewMode {
+        guard collection.folders.count > 1 else { return .grid }
+        return ViewMode(rawValue: viewModeRaw) ?? .categories
+    }
 
     /// The current folder/"All" selection, before type/genre/sort — everything
     /// downstream (type filter, genre filter, sort) narrows or reorders this.
@@ -629,32 +607,16 @@ struct CollectionView: View {
     /// sliver of the mark).
     private var backdropIsRealPhoto: Bool { collection.backdropImageUrl?.isEmpty == false }
 
-    private var hasTabs: Bool { collection.folders.count > 1 || !collection.showAllTab }
+    private var hasTabs: Bool {
+        viewMode == .grid && (collection.folders.count > 1 || !collection.showAllTab)
+    }
     /// Height reserved for the pinned header (title + optional tabs + the
     /// sort/filter bar) — the grid starts below it and posters slide up UNDER
-    /// the scrim/header.
+    /// the scrim/header. Categories mode has no tab strip (every folder is a
+    /// row already), just the title + the view bar.
     private var headerInset: CGFloat { (hasTabs ? 230 : 150) + 76 }
 
-    var body: some View {
-        collectionBody
-            // First time a collection is opened, explain the focus-artwork
-            // setting — otherwise "why doesn't anything animate?" on a
-            // constrained box looks like a bug rather than a deliberate default.
-            .overlay {
-                if showGifNotice {
-                    CollectionGifNotice(quality: perfSettings.settings.collectionGifQuality) {
-                        gifNoticeSeen = true
-                        showGifNotice = false
-                    }
-                }
-            }
-            .task {
-                guard !gifNoticeSeen, collection.folders.contains(where: {
-                    !($0.focusGifUrl ?? "").isEmpty
-                }) else { return }
-                showGifNotice = true
-            }
-    }
+    var body: some View { collectionBody }
 
     private var collectionBody: some View {
         ZStack(alignment: .top) {
@@ -664,7 +626,8 @@ struct CollectionView: View {
             // is shown WHOLE via .fit instead of cropped/zoomed via .fill, at
             // a bit more opacity so the mark actually reads.
             if let backdrop = backdropURL {
-                RemoteImage(url: backdrop, contentMode: backdropIsRealPhoto ? .fill : .fit)
+                RemoteImage(url: backdrop, contentMode: backdropIsRealPhoto ? .fill : .fit,
+                            maxPixels: PerformanceProfile.backdropPixelCap)
                     .ignoresSafeArea()
                     .opacity(backdropIsRealPhoto ? 0.3 : 0.55)
                     .overlay(theme.palette.background.opacity(0.35).ignoresSafeArea())
@@ -705,26 +668,181 @@ struct CollectionView: View {
             .padding(.top, OrivioSpacing.xl)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .task { await loadAll() }
+        // Appearance-driven, so it re-ran on every return from a title (the
+        // pushed Detail route hides this view) — spinner back up, every folder
+        // refetched, focus lost. Load once per screen instance.
+        .task {
+            guard !didLoad else { return }
+            await loadAll()
+        }
         .onAppear {
-            if !collection.showAllTab {
+            // Grid mode only: categories mode has no tab selection, and
+            // narrowing to the first folder here would make its empty-check
+            // (and a later switch to Grid) start on the wrong tab state.
+            if viewMode == .grid && !collection.showAllTab {
                 selectedFolderID = collection.folders.first?.id
+            }
+        }
+        // Tabbing to a folder the background fill hasn't reached yet fetches it
+        // NOW. The fill works through the collection six folders at a time and
+        // only re-prioritises between chunks, so on a pack with dozens of
+        // folders the tab you actually pressed could sit on a spinner behind
+        // dozens you didn't. This is the fetch for the folder you're looking at.
+        .onChange(of: selectedFolderID) { _, folderID in
+            // Not during the first paint: phase 1 of `loadAll` is already
+            // fetching exactly the folder on screen, and racing it would just
+            // double the requests on open.
+            guard !isLoading,
+                  let folderID,
+                  !loadedFolders.contains(folderID),
+                  !onDemandFolders.contains(folderID),
+                  let folder = collection.folders.first(where: { $0.id == folderID })
+            else { return }
+            onDemandFolders.insert(folderID)
+            Task {
+                let items = await CollectionResolver.resolveFolder(
+                    folder,
+                    addonManager: addonManager,
+                    providers: CollectionProviders(tmdb: tmdbSettings.isEnabled,
+                                                   trakt: trakt.isSignedIn),
+                    tmdbLanguage: tmdbSettings.settings.language,
+                    maxTmdbPages: 3,
+                    hideUnreleased: layoutSettings.hideUnreleasedContent
+                )
+                onDemandFolders.remove(folderID)
+                // The queued fill may have landed first; don't overwrite a
+                // fuller result with this shallower one.
+                guard !loadedFolders.contains(folderID) else { return }
+                itemsByFolder[folderID] = items
+                loadedFolders.insert(folderID)
             }
         }
     }
 
+    /// Collections are built out of TMDB and Trakt sources and nothing else,
+    /// so an empty folder is usually a missing connection rather than an empty
+    /// list — say which, and point at TMDB first.
+    /// What is blocking the folder ON SCREEN. For "All", only a collection
+    /// where EVERY folder is blocked has a blocker worth naming — otherwise
+    /// the tab has content and nothing needs saying.
+    private var selectedBlocker: CollectionResolver.FolderBlocker {
+        if let selectedFolderID { return blockersByFolder[selectedFolderID] ?? .none }
+        guard !collection.folders.isEmpty,
+              collection.folders.allSatisfy({ blockersByFolder[$0.id] != nil })
+        else { return .none }
+        // Every folder is blocked; report the most common reason.
+        let reasons = collection.folders.compactMap { blockersByFolder[$0.id] }
+        return reasons.first ?? .none
+    }
+
+    private var emptyMessage: String {
+        switch selectedBlocker {
+        case .needsEither:
+            return "This folder needs TMDB or Trakt. Add your TMDB API key in "
+                + "Settings → Integrations → TMDB (free, and it covers every kind of source), "
+                + "or sign in to Trakt for your lists."
+        case .needsTMDB:
+            return "This folder's sources are TMDB — add your TMDB API key in "
+                + "Settings → Integrations → TMDB to show them here."
+        case .needsTrakt:
+            return "This folder's sources are Trakt lists — sign in to Trakt in "
+                + "Settings → Trakt to show them here."
+        case .unsupportedSources:
+            return "This folder is built from add-on catalogs, which collections no longer use. "
+                + "Add TMDB or Trakt sources to it in Settings → Collections."
+        case .empty:
+            return "This folder has no sources. Add TMDB or Trakt sources to it in "
+                + "Settings → Collections."
+        case .none:
+            return "Nothing came back for this folder. Its sources may be empty right now."
+        }
+    }
+
+    /// Whether every folder's first fetch has landed (categories mode's
+    /// "still filling in" indicator flips off once this is true).
+    private var allFoldersResolved: Bool {
+        collection.folders.allSatisfy { loadedFolders.contains($0.id) }
+    }
+
+    /// Categories mode: the collection laid out the way Nuvio desktop does it —
+    /// one titled horizontal row per folder, in the collection's own order,
+    /// each row keeping its sources' order. Rows appear as their folders
+    /// resolve (the background fill works in chunks), with a quiet indicator
+    /// at the bottom until every folder has landed.
+    private var categoryRows: some View {
+        ScrollView(.vertical) {
+            LazyVStack(alignment: .leading, spacing: OrivioSpacing.xl) {
+                ForEach(collection.folders) { folder in
+                    if let items = itemsByFolder[folder.id], !items.isEmpty {
+                        VStack(alignment: .leading, spacing: OrivioSpacing.md) {
+                            RowHeader(title: folder.title)
+                            ScrollView(.horizontal) {
+                                LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
+                                    ForEach(Self.uniqueItems(items)) { item in
+                                        Button {
+                                            onSelect(item)
+                                        } label: {
+                                            PosterCard(item: item)
+                                        }
+                                        .mediaCardButtonStyle()
+                                    }
+                                }
+                                .padding(.horizontal, OrivioSpacing.huge)
+                                .padding(.vertical, OrivioSpacing.lg)
+                            }
+                            .scrollClipDisabled()
+                            // Up/Down must stop on every row, sparse or not.
+                            .focusSection()
+                        }
+                    }
+                }
+                if !allFoldersResolved {
+                    HStack(spacing: OrivioSpacing.sm) {
+                        ProgressView()
+                        Text("Loading more categories…")
+                            .font(.system(size: 22))
+                            .foregroundStyle(theme.palette.textTertiary)
+                    }
+                    .padding(.horizontal, OrivioSpacing.huge)
+                    .padding(.vertical, OrivioSpacing.lg)
+                }
+            }
+            .padding(.bottom, OrivioSpacing.xxl)
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            Color.clear.frame(height: headerInset)
+        }
+    }
+
+    /// A folder's sources can hand back the same title twice; a repeated id
+    /// inside a `ForEach` crashes the tvOS focus engine (same rule as
+    /// `LiveTVView.uniqueByID`).
+    private static func uniqueItems(_ items: [MetaItem]) -> [MetaItem] {
+        var seen = Set<String>()
+        return items.filter { seen.insert($0.id).inserted }
+    }
+
     @ViewBuilder
     private var grid: some View {
-        if isLoading || !selectedFolderResolved {
-            OrivioLoadingView(label: "Loading collection")
+        if isLoading || (viewMode == .grid && !selectedFolderResolved) {
+            // holdsFocus ONLY on the first load, when the tab/filter row isn't
+            // rendered yet and this really is the only thing on screen (with
+            // nothing focusable, Menu suspends the app instead of popping).
+            //
+            // While TABBING, the tab bar is on screen and focused — and a
+            // focusable anchor appearing inside the grid pulled focus off the
+            // tab you just moved to, then vanished with the spinner, leaving
+            // focus nowhere and the remote apparently dead. That is the
+            // "folder tabs don't work" in tabbed/Folders mode.
+            OrivioLoadingView(label: "Loading collection", holdsFocus: isLoading)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if viewMode == .categories && !(folderItems.isEmpty && allFoldersResolved) {
+            categoryRows
         } else if visibleItems.isEmpty {
             OrivioEmptyState(
-                icon: "rectangle.stack",
-                title: "Nothing here yet",
-                message: hasUnsupportedSources
-                    ? "This folder uses TMDB sources — enable TMDB in Settings → Integrations to show them here."
-                    : "This folder has no items. Add catalog sources to it in Settings → Collections."
+                icon: selectedBlocker == .none ? "rectangle.stack" : "link.badge.plus",
+                title: selectedBlocker == .none ? "Nothing here yet" : "Connect a source",
+                message: emptyMessage
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -762,6 +880,46 @@ struct CollectionView: View {
     private var filterBar: some View {
         let genres = availableGenres
         HStack(spacing: OrivioSpacing.md) {
+            // Categories (a row per folder, desktop-style) vs the merged grid.
+            // Only for collections that actually have categories to lay out.
+            if collection.folders.count > 1 {
+                OrivioDropdown(
+                    title: "View",
+                    selection: viewMode.rawValue,
+                    options: [
+                        OrivioDropdownOption(ViewMode.categories.rawValue, "Categories"),
+                        OrivioDropdownOption(ViewMode.grid.rawValue, "Grid"),
+                    ],
+                    triggerWidth: 280
+                ) { raw in
+                    viewModeRaw = raw
+                    // Landing in Grid on a no-All collection needs a real tab
+                    // selected — categories mode never set one.
+                    if raw == ViewMode.grid.rawValue, !collection.showAllTab,
+                       selectedFolderID == nil {
+                        selectedFolderID = collection.folders.first?.id
+                    }
+                }
+            }
+
+            if viewMode == .grid {
+                gridFilterControls(genres: genres)
+            }
+        }
+        .padding(.horizontal, OrivioSpacing.huge)
+        // Same reachability rule as the tab strip above: the dropdowns sit on
+        // the left, so without a full-width section an Up press from the right
+        // grid columns sailed past (or nowhere), skipping the filter bar and
+        // the tabs behind it.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .focusSection()
+    }
+
+    /// Sort/Type/Genre — grid mode only. Category rows keep each folder's own
+    /// source order, exactly like the desktop layout they mirror.
+    @ViewBuilder
+    private func gridFilterControls(genres: [String]) -> some View {
+        Group {
             OrivioDropdown(
                 title: "Sort",
                 selection: sortMode.rawValue,
@@ -801,7 +959,6 @@ struct CollectionView: View {
                 ) { genreFilter = $0 == "All" ? nil : $0 }
             }
         }
-        .padding(.horizontal, OrivioSpacing.huge)
     }
 
     @ViewBuilder
@@ -820,6 +977,14 @@ struct CollectionView: View {
                 .padding(.vertical, OrivioSpacing.sm)
             }
             .scrollClipDisabled()
+            // Full-width focus section: the pills only occupy the left of the
+            // strip, and the tvOS focus engine searches in the direction of
+            // travel — so Up from a poster in the RIGHT columns found no tab
+            // above it and simply didn't move. That's the "tabs sometimes
+            // don't work" in Folders mode: whether the tab bar was reachable
+            // depended on which grid column you were in. The section makes the
+            // whole band catch the Up press and route it to the nearest pill.
+            .focusSection()
         }
     }
 
@@ -834,14 +999,14 @@ struct CollectionView: View {
 
     private func loadAll() async {
         isLoading = true
-        var unsupported = false
-        let tmdbEnabled = tmdbSettings.isEnabled
+        let providers = CollectionProviders(tmdb: tmdbSettings.isEnabled, trakt: trakt.isSignedIn)
         let tmdbLanguage = tmdbSettings.settings.language
-        let addons = addonManager.addons
         let manager = addonManager
         let hideUnreleased = layoutSettings.hideUnreleasedContent
-        for folder in collection.folders where CollectionResolver.hasUnsupportedSources(folder, tmdbEnabled: tmdbEnabled) {
-            unsupported = true
+        var blockers: [String: CollectionResolver.FolderBlocker] = [:]
+        for folder in collection.folders {
+            let blocker = CollectionResolver.blocker(for: folder, providers: providers)
+            if blocker != .none { blockers[folder.id] = blocker }
         }
 
         func resolveAll(folders: [OrivioCollectionFolder], maxTmdbPages: Int,
@@ -851,8 +1016,8 @@ struct CollectionView: View {
                 for folder in folders {
                     group.addTask {
                         let items = await CollectionResolver.resolveFolder(
-                            folder, addons: addons, addonManager: manager,
-                            tmdbEnabled: tmdbEnabled, tmdbLanguage: tmdbLanguage,
+                            folder, addonManager: manager,
+                            providers: providers, tmdbLanguage: tmdbLanguage,
                             maxTmdbPages: maxTmdbPages, tmdbStartPage: tmdbStartPage,
                             hideUnreleased: hideUnreleased
                         )
@@ -904,7 +1069,8 @@ struct CollectionView: View {
         if let firstFolder {
             await fill([firstFolder], pages: firstPassPages)
         }
-        hasUnsupportedSources = unsupported
+        blockersByFolder = blockers
+        loadedProviders = providers
         isLoading = false
 
         // The remaining folders stream in behind the visible grid. They're only
@@ -913,6 +1079,16 @@ struct CollectionView: View {
         await fill(collection.folders.filter { $0.id != firstFolder?.id },
                    pages: firstPassPages)
         if Task.isCancelled { return }
+        // Latch here — after every folder has its first pass — NOT after the
+        // phase-2 deep stream below. Phase 2 walks up to 500 TMDB pages, so on
+        // a big pack it is almost always still running when a poster is opened
+        // (which cancels this task); latching only a fully completed load meant
+        // every return from a title re-ran the whole screen — spinner back up,
+        // tabs torn down and refetched, focus yanked. From this point a
+        // cancelled load loses only catalog DEPTH (grids stay at ~60 titles),
+        // never a folder: tabbing to anything unfetched has its own on-demand
+        // fetch above.
+        didLoad = true
 
         // Phase 2 — the FULL catalog streams in behind the visible grid, but
         // ONLY for folders phase 1 could actually have truncated: a folder
