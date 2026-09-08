@@ -54,6 +54,13 @@ public final class MetalPlayView: UIView, VideoOutput {
     }
 
     public private(set) var pixelBuffer: PixelBufferProtocol?
+    /// Orivio diagnostics: how often the display link fires, how many frames
+    /// reached the display layer, and whether it was ready for them.
+    public private(set) var diagDisplayLinkTicks = 0
+    public private(set) var diagFramesEnqueued = 0
+    public private(set) var diagFramesReturnedNil = 0
+    public private(set) var diagLayerNotReady = 0
+    public var diagDisplayLinkPaused: Bool { displayLink.isPaused }
     /// 用displayLink会导致锁屏无法draw，
     /// 用DispatchSourceTimer的话，在播放4k视频的时候repeat的时间会变长,
     /// 用MTKView的draw(in:)也是不行，会卡顿
@@ -165,12 +172,14 @@ public final class MetalPlayView: UIView, VideoOutput {
 
 extension MetalPlayView {
     @objc private func renderFrame() {
+        diagDisplayLinkTicks += 1
         draw(force: false)
     }
 
     private func draw(force: Bool) {
         autoreleasepool {
             guard let frame = renderSource?.getVideoOutputRender(force: force) else {
+                diagFramesReturnedNil += 1
                 return
             }
             pixelBuffer = frame.corePixelBuffer
@@ -182,6 +191,19 @@ extension MetalPlayView {
             let cmtime = frame.cmtime
             let par = pixelBuffer.size
             let sar = pixelBuffer.aspectRatio
+            // Orivio probe: the last point before the pixels leave KSPlayer.
+            // Whatever the decode path was, these are the tags the display
+            // layer (or the shader) is handed — and which of the two gets them.
+            KSColorProbe.once("render") {
+                let usesDisplayLayer = pixelBuffer.cvPixelBuffer != nil && options.isUseDisplayLayer()
+                return "render via \(usesDisplayLayer ? "AVSampleBufferDisplayLayer" : "Metal")"
+                    + " planes=\(pixelBuffer.planeCount) depth=\(pixelBuffer.bitDepth)"
+                    + " leftShift=\(pixelBuffer.leftShift) isDovi=\(frame.isDovi)"
+                    + " matrix=\(ksProbeTag(pixelBuffer.yCbCrMatrix)) pri=\(ksProbeTag(pixelBuffer.colorPrimaries))"
+                    + " trc=\(ksProbeTag(pixelBuffer.transferFunction))"
+                    + " cgColorSpace=\(pixelBuffer.colorspace?.name.map { $0 as String } ?? "nil")"
+                    + " isFullRangeVideo=\(pixelBuffer.isFullRangeVideo)"
+            }
             if let pixelBuffer = pixelBuffer.cvPixelBuffer, options.isUseDisplayLayer() {
                 if displayView.isHidden {
                     displayView.isHidden = false
@@ -235,6 +257,8 @@ extension MetalPlayView {
 
     private func set(pixelBuffer: CVPixelBuffer, time: CMTime) {
         guard let formatDescription else { return }
+        diagFramesEnqueued += 1
+        if !displayView.displayLayer.isReadyForMoreMediaData { diagLayerNotReady += 1 }
         displayView.enqueue(imageBuffer: pixelBuffer, formatDescription: formatDescription, time: time)
     }
 }
@@ -275,6 +299,12 @@ class MetalView: UIView {
         metalLayer.drawableSize = size
         metalLayer.pixelFormat = KSOptions.colorPixelFormat(bitDepth: pixelBuffer.bitDepth)
         let colorspace = pixelBuffer.colorspace
+        // Orivio probe: the layer colourspace is what CoreAnimation colour-
+        // matches FROM. Wrong here and the shader's output is reinterpreted.
+        KSColorProbe.once("metalLayer") {
+            "metal layer pixelFormat=\(metalLayer.pixelFormat.rawValue)"
+                + " colorspace=\(colorspace?.name.map { $0 as String } ?? "nil")"
+        }
         if colorspace != nil, metalLayer.colorspace != colorspace {
             metalLayer.colorspace = colorspace
             KSLog("[video] CAMetalLayer colorspace \(String(describing: colorspace))")

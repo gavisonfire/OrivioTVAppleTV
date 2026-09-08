@@ -114,6 +114,13 @@ class VideoSwresample: FrameChange {
             // AV_PIX_FMT_VIDEOTOOLBOX格式是无法进行swscale的
             imgConvertCtx = sws_getCachedContext(imgConvertCtx, width, height, self.format, dstWidth, dstHeight, dstFormat, SWS_FAST_BILINEAR, nil, nil, nil)
         }
+        // Orivio probe: the pool's pixel format decides the RANGE the renderer
+        // infers, and `osType()` is called here without a fullRange argument —
+        // so a full-range source lands in a video-range buffer type.
+        KSColorProbe.once("swpool") {
+            "sw pool type=\(ksProbeFourCC(pixelFormatType)) swscale=\(imgConvertCtx != nil)"
+                + " src=\(width)x\(height) dst=\(dstWidth)x\(dstHeight)"
+        }
         pool = CVPixelBufferPool.create(width: dstWidth, height: dstHeight, bytesPerRowAlignment: linesize, pixelFormatType: pixelFormatType)
     }
 
@@ -121,6 +128,18 @@ class VideoSwresample: FrameChange {
         let format = AVPixelFormat(rawValue: frame.format)
         let width = frame.width
         let height = frame.height
+        // Orivio probe: software decode reached — so this is NOT the
+        // VideoToolbox path, and the frame's own tags (not the codecpar's)
+        // are what get attached below.
+        KSColorProbe.once("swframe") {
+            let pixName = av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?"
+            return "sw frame \(pixName) \(width)x\(height) leftShift=\(format.leftShift)"
+                + " range=\(frame.color_range.rawValue)(\(frame.color_range == AVCOL_RANGE_JPEG ? "full" : "video"))"
+                + " spc=\(frame.colorspace.rawValue)->\(ksProbeTag(frame.colorspace.ycbcrMatrix))"
+                + " pri=\(frame.color_primaries.rawValue)->\(ksProbeTag(frame.color_primaries.colorPrimaries))"
+                + " trc=\(frame.color_trc.rawValue)->\(ksProbeTag(frame.color_trc.transferFunction))"
+                + (format.leftShift > 0 ? " -> MTLBuffer (Metal render)" : " -> CVPixelBuffer")
+        }
         if format.leftShift > 0 {
             return PixelBuffer(frame: frame)
         }
@@ -139,6 +158,16 @@ class VideoSwresample: FrameChange {
                 CVBufferSetAttachment(pbuf, kCVImageBufferChromaLocationTopFieldKey, chroma, .shouldPropagate)
             }
             pbuf.colorspace = KSOptions.colorSpace(ycbcrMatrix: pbuf.yCbCrMatrix, transferFunction: pbuf.transferFunction)
+            // Orivio probe: what actually ended up ON the buffer. A nil matrix
+            // here means no attachment was written at all (the setter skips
+            // nil), and the CGColorSpace is whatever the `default:` arm chose.
+            KSColorProbe.once("swattach") {
+                "sw attach type=\(ksProbeFourCC(CVPixelBufferGetPixelFormatType(pbuf)))"
+                    + " matrix=\(ksProbeTag(pbuf.yCbCrMatrix)) pri=\(ksProbeTag(pbuf.colorPrimaries))"
+                    + " trc=\(ksProbeTag(pbuf.transferFunction))"
+                    + " cgColorSpace=\(pbuf.colorspace?.name.map { $0 as String } ?? "nil")"
+                    + " isFullRangeVideo=\(pbuf.isFullRangeVideo)"
+            }
         }
         return pbuf
     }

@@ -13,6 +13,9 @@ struct OrivioTVApp: App {
         // reset — no add-ons, library, profiles, progress or credentials.
         OrivioRenameMigration.runIfNeeded()
         PlayerTempSweep.sweepAtLaunch()
+        // Dev-only LAN read-out of the colour trail, so a session can be
+        // watched live without `devicectl` backgrounding the app mid-playback.
+        ColorProbeServer.shared.start()
     }
 
     @StateObject private var theme = ThemeManager()
@@ -247,7 +250,9 @@ struct RootView: View {
                         debridStore: debrid,
                         pluginStore: plugins,
                         torrentSettings: torrent,
-                        traktStore: trakt
+                        traktStore: trakt,
+                        simklStore: simkl,
+                        ratingsStore: ratings
                     )
                     sync = orivioSync
                     orivioSync.enrichContinueWatchingEnabled = { [tmdbSettings] in
@@ -260,10 +265,29 @@ struct RootView: View {
                     // store, but it only runs while signed in.
                     // Ratings are per-profile for the same reason Trakt is: a
                     // profile with its own Trakt account must not push another
-                    // profile's ratings into it.
-                    profiles.onSwitchLocal = { [weak trakt, weak ratings] id in
+                    // profile's ratings into it. SIMKL rides the same
+                    // per-profile switch as Trakt (one setting, both services).
+                    // Everything personal rescopes on a switch, even when
+                    // signed out of Orivio (the sync manager only runs while
+                    // signed in): trackers, add-ons/plugins (honouring the
+                    // profile's use-primary fallbacks), debrid logins, player
+                    // settings, TMDB, theme, badges — upstream Nuvio's
+                    // per-profile boundary, ported wholesale.
+                    profiles.onSwitchLocal = { [weak trakt, weak simkl, weak ratings, weak addonManager,
+                                                weak plugins, weak debrid, weak playerSettings,
+                                                weak tmdbSettings, weak theme, weak streamBadges,
+                                                weak profiles] id in
+                        let flags = profiles?.profiles.first { $0.id == id }
                         trakt?.setProfile(id)
+                        simkl?.setProfile(id)
                         ratings?.setProfile(id)
+                        addonManager?.setProfile(flags?.usesPrimaryAddons == true ? 1 : id)
+                        plugins?.setProfile(flags?.usesPrimaryPlugins == true ? 1 : id)
+                        debrid?.setProfile(id)
+                        playerSettings?.setProfile(id)
+                        tmdbSettings?.setProfile(id)
+                        theme?.setProfile(id)
+                        streamBadges?.setProfile(id)
                         // Every store just re-pointed at another profile's
                         // data; reconcile the new picture everywhere rather
                         // than waiting for a tick.
@@ -272,8 +296,18 @@ struct RootView: View {
                     profiles.onProfileLockChanged = { [weak progressStore] in
                         progressStore?.refreshTopShelf()
                     }
-                    profiles.onProfileDeleted = { [weak trakt] id in
+                    profiles.onProfileDeleted = { [weak trakt, weak simkl, weak addonManager,
+                                                   weak plugins, weak debrid, weak playerSettings,
+                                                   weak tmdbSettings, weak theme, weak streamBadges] id in
                         trakt?.forgetProfile(id)
+                        simkl?.forgetProfile(id)
+                        addonManager?.forgetProfile(id)
+                        plugins?.forgetProfile(id)
+                        debrid?.forgetProfile(id)
+                        playerSettings?.forgetProfile(id)
+                        tmdbSettings?.forgetProfile(id)
+                        theme?.forgetProfile(id)
+                        streamBadges?.forgetProfile(id)
                         SyncCoordinator.shared.requestFullSync("profile deleted")
                     }
                     traktSync = TraktSyncManager(
@@ -312,7 +346,17 @@ struct RootView: View {
                     coordinator.observe(watched: watched, library: library,
                                         ratings: ratings, progress: progressStore)
                     coordinator.addDestination("Orivio") { [weak orivioSync] in
-                        Task { await orivioSync?.syncNow() }
+                        Task { @MainActor in
+                            // A change made from inside the player (mark
+                            // watched, remove from Continue Watching) still
+                            // reaches the account at once — through the light
+                            // pass, so it cannot contend with the stream.
+                            if OrivioSyncManager.playbackActive {
+                                await orivioSync?.syncLight(reason: "local change during playback")
+                            } else {
+                                await orivioSync?.syncNow()
+                            }
+                        }
                     }
                     coordinator.addDestination("Trakt") { [weak traktSyncRef = traktSync] in
                         traktSyncRef?.syncNow(force: true)
@@ -389,6 +433,8 @@ struct RootView: View {
                     }
                     // Dev: can this device do Picture in Picture at all?
                     if args.contains("-pipProbe") {
+                        // Each probe run starts a fresh trail.
+                        UserDefaults.standard.removeObject(forKey: "dev.pipTrail")
                         NSLog("[OrivioPiP] isPictureInPictureSupported=%d",
                               AVPictureInPictureController.isPictureInPictureSupported() ? 1 : 0)
                     }
@@ -473,13 +519,22 @@ struct RootView: View {
                         .replacingOccurrences(of: "-removeCW:", with: ""), !meta.isEmpty {
                         progressStore.removeShow(metaID: meta, notifyTrakt: true)
                     }
-                    // Dev: flip per-profile Trakt and/or switch profile, the
-                    // same calls Settings and the profile gate make.
-                    if args.contains("-traktPerProfile") { trakt.perProfileAccounts = true }
-                    if args.contains("-traktShared") { trakt.perProfileAccounts = false }
+                    // Dev: flip per-profile accounts and/or switch profile, the
+                    // same calls Settings and the profile gate make. The switch
+                    // covers Trakt AND SIMKL, exactly as the Settings toggle does.
+                    if args.contains("-traktPerProfile") {
+                        trakt.perProfileAccounts = true
+                        simkl.perProfileAccounts = true
+                    }
+                    if args.contains("-traktShared") {
+                        trakt.perProfileAccounts = false
+                        simkl.perProfileAccounts = false
+                    }
                     if let f = args.first(where: { $0.hasPrefix("-traktForget:") })?
                         .replacingOccurrences(of: "-traktForget:", with: ""), let id = Int(f) {
-                        trakt.forgetProfile(id)   // same path a profile deletion takes
+                        // Same path a profile deletion takes.
+                        trakt.forgetProfile(id)
+                        simkl.forgetProfile(id)
                     }
                     if let p = args.first(where: { $0.hasPrefix("-profile:") })?
                         .replacingOccurrences(of: "-profile:", with: ""), let id = Int(p) {
@@ -607,6 +662,8 @@ struct RootView: View {
         #endif
     }
 
+    private static var playerDemoStarted = false
+
     /// Dev-only: `-playerDemo` opens the player with Apple's public HLS test
     /// stream (`-playerDemoMKV` uses an MKV sample to exercise the FFmpeg
     /// engine) so playback UI can be verified without a stream addon.
@@ -614,6 +671,11 @@ struct RootView: View {
         let args = ProcessInfo.processInfo.arguments
         let wantsMKV = args.contains("-playerDemoMKV")
         guard wantsMKV || args.contains("-playerDemo") else { return }
+        // Once per process: the root content re-appears whenever the player
+        // cover dismisses — including the Picture in Picture handoff — and a
+        // second demo session would tear the parked one down.
+        guard !Self.playerDemoStarted else { return }
+        Self.playerDemoStarted = true
         let meta = MetaItem(
             id: "tt0111161", type: "movie", name: wantsMKV ? "Demo Stream (MKV)" : "Demo Stream (HLS)"
         )
@@ -773,10 +835,13 @@ struct RootView: View {
 
     /// The app's single root: an always-visible Liquid Glass rail floating at
     /// the left edge over full-bleed content. OVERLAY layout (not an HStack)
-    /// so the expanding panel just draws over the dimmed content — the content
+    /// so the expanding panel just draws over the content — the content
     /// column never re-lays-out during the spring.
-    /// The rail is open and holding focus, so the content is dimmed and slid
-    /// aside beneath it.
+    /// The rail is open and holding focus, so the content is slid aside
+    /// beneath it. Nothing dims: a scrim under the rail turned the glass
+    /// black, and one over the content laid a sheet across the search field
+    /// and the headings while leaving the strip beside the rail lighter than
+    /// the page. Sliding the content clear is separation enough.
     private var sidebarExpanded: Bool { sidebarFocus != nil && showSidebar }
 
     private var tabLayout: some View {
@@ -793,14 +858,6 @@ struct RootView: View {
                 .transition(.asymmetric(insertion: .opacity, removal: .identity))
                 .animation(perf.sidebarAnimationEffective ? .easeOut(duration: 0.22) : nil,
                            value: selectedTab)
-                .overlay {
-                    // Dim the content while the rail is expanded/focused, so
-                    // the glass panel reads above it.
-                    Color.black.opacity(0.55)
-                        .ignoresSafeArea()
-                        .allowsHitTesting(false)
-                        .opacity(sidebarExpanded ? 1 : 0)
-                }
                 // Home runs full-bleed (hero art sweeps under the floating
                 // pill); other tabs clear the rail.
                 .padding(.leading, showSidebar && selectedTab != 0 ? GlassSidebar.collapsedWidth : 0)
@@ -814,6 +871,20 @@ struct RootView: View {
                 // already keeps, and the gap it opens on the left is exactly
                 // the strip the panel is covering, so nothing shows through.
                 .offset(x: sidebarExpanded ? GlassSidebar.expandedWidth + 28 - GlassSidebar.collapsedWidth : 0)
+                // The slide gets its OWN timing rather than inheriting the
+                // ZStack's, and it is ASYMMETRIC, because the panel's own
+                // width is driven by @FocusState and lands a few frames after
+                // this does. Opening, the content has to leave FIRST or the
+                // widening glass sweeps across the search field and the
+                // "Trending" heading; closing, it has to come back LAST or it
+                // slides in under a panel that is still full width. Hence the
+                // quick spring out and the delayed one back.
+                .animation(perf.sidebarAnimationEffective
+                           ? (sidebarExpanded
+                              ? .spring(response: 0.3, dampingFraction: 0.92)
+                              : .spring(response: 0.3, dampingFraction: 0.95).delay(0.12))
+                           : nil,
+                           value: sidebarExpanded)
                 .focusSection()
 
             if showSidebar {
@@ -1377,8 +1448,11 @@ struct RootView: View {
         var handoff = ExternalPlayerHandoff(items: items)
         if player.reportsPosition {
             // Bare scheme + host: the player APPENDS its own result query.
-            handoff.successURL = "orivio://external-return"
-            handoff.errorURL = "orivio://external-error"
+            // The scheme is this install's OWN (see AppCallbackScheme) — the
+            // generic `orivio` is claimed by every other sideload of this app
+            // on the box, and the callback was landing in one of those.
+            handoff.successURL = "\(AppCallbackScheme.value)://external-return"
+            handoff.errorURL = "\(AppCallbackScheme.value)://external-error"
         }
         ExternalPlaybackSession.begin(ExternalPlaybackSession.Pending(
             items: sessions, playerID: player.id, playerName: player.name,

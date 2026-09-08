@@ -216,7 +216,48 @@ public class FFmpegAssetTrack: MediaPlayerTrack {
             }
             let format = AVPixelFormat(rawValue: codecpar.format)
             bitDepth = format.bitDepth
-            let fullRange = codecpar.color_range == AVCOL_RANGE_JPEG
+            // Orivio: recover missing colour signalling from the BITSTREAM.
+            //
+            // The demuxer's codecpar can say UNSPECIFIED for primaries /
+            // transfer / matrix even when the SPS VUI carries the real values
+            // (verified on a 2160p HDR remux: codecpar said 2/2/2 with a 16 MB
+            // probe budget, so this is not a probe-size artefact). Everything
+            // downstream trusts codecpar: the format description is built with
+            // no colour extensions, VideoToolbox tags its output BT.709, and
+            // HDR plays as washed-out SDR.
+            //
+            // avcodec parses the parameter sets out of extradata at open time
+            // and exports the VUI colour description onto the context — so a
+            // single-threaded open with NO frames decoded reads the
+            // bitstream's own answer. Only attempted when something is
+            // actually missing; tagged files pay nothing.
+            var colorPrimaries = codecpar.color_primaries
+            var colorTrc = codecpar.color_trc
+            var colorSpace = codecpar.color_space
+            var colorRange = codecpar.color_range
+            if colorPrimaries == AVCOL_PRI_UNSPECIFIED || colorTrc == AVCOL_TRC_UNSPECIFIED
+                || colorSpace == AVCOL_SPC_UNSPECIFIED || colorRange == AVCOL_RANGE_UNSPECIFIED,
+                let sniffed = Self.bitstreamColor(codecpar: self.codecpar) {
+                if colorPrimaries == AVCOL_PRI_UNSPECIFIED { colorPrimaries = sniffed.primaries }
+                if colorTrc == AVCOL_TRC_UNSPECIFIED { colorTrc = sniffed.trc }
+                if colorSpace == AVCOL_SPC_UNSPECIFIED { colorSpace = sniffed.space }
+                if colorRange == AVCOL_RANGE_UNSPECIFIED { colorRange = sniffed.range }
+                // Keep the stored copy coherent for every later reader.
+                self.codecpar.color_primaries = colorPrimaries
+                self.codecpar.color_trc = colorTrc
+                self.codecpar.color_space = colorSpace
+                self.codecpar.color_range = colorRange
+                KSColorProbe.once("bitstream") {
+                    "bitstream recovery (SPS VUI):"
+                        + " spc=\(sniffed.space.rawValue)->\(ksProbeTag(sniffed.space.ycbcrMatrix))"
+                        + " pri=\(sniffed.primaries.rawValue)->\(ksProbeTag(sniffed.primaries.colorPrimaries))"
+                        + " trc=\(sniffed.trc.rawValue)->\(ksProbeTag(sniffed.trc.transferFunction))"
+                        + " range=\(sniffed.range.rawValue)"
+                }
+            } else if colorPrimaries == AVCOL_PRI_UNSPECIFIED || colorTrc == AVCOL_TRC_UNSPECIFIED {
+                KSColorProbe.once("bitstream") { "bitstream recovery: nothing recoverable (decoder open failed or codec unsupported)" }
+            }
+            let fullRange = colorRange == AVCOL_RANGE_JPEG
             let dic: NSMutableDictionary = [
                 kCVImageBufferChromaLocationBottomFieldKey: kCVImageBufferChromaLocation_Left,
                 kCVImageBufferChromaLocationTopFieldKey: kCVImageBufferChromaLocation_Left,
@@ -230,9 +271,28 @@ public class FFmpegAssetTrack: MediaPlayerTrack {
             }
             dic[kCVPixelBufferPixelFormatTypeKey] = format.osType(fullRange: fullRange)
             dic[kCVImageBufferPixelAspectRatioKey] = sar.aspectRatio
-            dic[kCVImageBufferColorPrimariesKey] = codecpar.color_primaries.colorPrimaries as String?
-            dic[kCVImageBufferTransferFunctionKey] = codecpar.color_trc.transferFunction as String?
-            dic[kCVImageBufferYCbCrMatrixKey] = codecpar.color_space.ycbcrMatrix as String?
+            dic[kCVImageBufferColorPrimariesKey] = colorPrimaries.colorPrimaries as String?
+            dic[kCVImageBufferTransferFunctionKey] = colorTrc.transferFunction as String?
+            dic[kCVImageBufferYCbCrMatrixKey] = colorSpace.ycbcrMatrix as String?
+            // Orivio probe: the SOURCE of every colour decision downstream.
+            // Each tag is reported as the raw ffmpeg enum AND what it mapped
+            // to — a raw 2 (UNSPECIFIED) mapping to nil is the case that
+            // silently becomes BT.601 + sRGB further down.
+            KSColorProbe.once("track") {
+                let pixName = av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?"
+                return "track \(codecpar.width)x\(codecpar.height) \(pixName) depth=\(format.bitDepth)"
+                    + " planes=\(format.planeCount) leftShift=\(format.leftShift)"
+                    + " range=\(codecpar.color_range.rawValue)(\(fullRange ? "full" : "video"))"
+                    + " spc=\(codecpar.color_space.rawValue)->\(ksProbeTag(codecpar.color_space.ycbcrMatrix))"
+                    + " pri=\(codecpar.color_primaries.rawValue)->\(ksProbeTag(codecpar.color_primaries.colorPrimaries))"
+                    + " trc=\(codecpar.color_trc.rawValue)->\(ksProbeTag(codecpar.color_trc.transferFunction))"
+                    + " osType=\(ksProbeFourCC(format.osType(fullRange: fullRange)))"
+            }
+            // The decoder's view of the SPS would settle whether the colour
+            // description is in the bitstream, but reading it by opening an
+            // HEVC decoder here allocates a decoder and its worker threads at
+            // load time — too much to spend inside a diagnostic. Read the VUI
+            // straight out of the hvcC bytes instead when this resumes.
             // swiftlint:disable line_length
             _ = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: codecType.rawValue, width: codecpar.width, height: codecpar.height, extensions: dic, formatDescriptionOut: &formatDescriptionOut)
             // swiftlint:enable line_length
@@ -260,6 +320,32 @@ public class FFmpegAssetTrack: MediaPlayerTrack {
 
     func createContext(options: KSOptions) throws -> UnsafeMutablePointer<AVCodecContext> {
         try codecpar.createContext(options: options)
+    }
+
+    /// The bitstream's own colour description, read from the parameter sets in
+    /// `extradata` — the SPS VUI carries primaries/transfer/matrix/range, and
+    /// avcodec exports them onto the context when it parses extradata at open.
+    ///
+    /// No frames are decoded and threading is forced off, so the open is a
+    /// parameter-set parse and nothing more. Any failure returns nil and the
+    /// caller keeps the demuxer's (unspecified) values — recovery must never
+    /// be the reason a track fails to load.
+    private static func bitstreamColor(codecpar: AVCodecParameters)
+        -> (primaries: AVColorPrimaries, trc: AVColorTransferCharacteristic, space: AVColorSpace, range: AVColorRange)? {
+        guard codecpar.codec_id == AV_CODEC_ID_HEVC || codecpar.codec_id == AV_CODEC_ID_H264,
+              codecpar.extradata_size > 0,
+              let codec = avcodec_find_decoder(codecpar.codec_id),
+              let context = avcodec_alloc_context3(codec)
+        else { return nil }
+        var contextRef: UnsafeMutablePointer<AVCodecContext>? = context
+        defer { avcodec_free_context(&contextRef) }
+        var par = codecpar
+        guard avcodec_parameters_to_context(context, &par) >= 0 else { return nil }
+        context.pointee.thread_count = 1
+        context.pointee.thread_type = 0
+        guard avcodec_open2(context, codec, nil) >= 0 else { return nil }
+        return (context.pointee.color_primaries, context.pointee.color_trc,
+                context.pointee.colorspace, context.pointee.color_range)
     }
 
     public var isEnabled: Bool {

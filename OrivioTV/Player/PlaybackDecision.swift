@@ -67,5 +67,9 @@ struct PlaybackDecisionLog {
         entries.removeAll { $0.stage == stage }
         entries.append(PlaybackDecisionEntry(stage: stage, choice: choice, reason: reason))
         NSLog("[OrivioDecision] %@ -> %@ (%@)", stage, choice, reason)
+        // Mirrored into the colour trail so the engine/DV choice reads in
+        // sequence with the colour facts it produced — which engine ran is the
+        // first thing that has to be established when a picture looks wrong.
+        PlayerViewModel.colorTrail("decision \(stage) = \(choice) — \(reason)")
     }
 }

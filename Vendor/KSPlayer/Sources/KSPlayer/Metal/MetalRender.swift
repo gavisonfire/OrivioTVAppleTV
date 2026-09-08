@@ -116,16 +116,29 @@ class MetalRender {
     private func setFragmentBuffer(pixelBuffer: PixelBufferProtocol, encoder: MTLRenderCommandEncoder) {
         if pixelBuffer.planeCount > 1 {
             let buffer: MTLBuffer?
+            let matrixName: String
             let yCbCrMatrix = pixelBuffer.yCbCrMatrix
             let isFullRangeVideo = pixelBuffer.isFullRangeVideo
             if yCbCrMatrix == kCVImageBufferYCbCrMatrix_ITU_R_709_2 {
                 buffer = isFullRangeVideo ? colorConversion709FullRangeMatrixBuffer : colorConversion709VideoRangeMatrixBuffer
+                matrixName = "BT.709"
             } else if yCbCrMatrix == kCVImageBufferYCbCrMatrix_SMPTE_240M_1995 {
                 buffer = isFullRangeVideo ? colorConversionSMPTE240MFullRangeMatrixBuffer : colorConversionSMPTE240MVideoRangeMatrixBuffer
+                matrixName = "SMPTE240M"
             } else if yCbCrMatrix == kCVImageBufferYCbCrMatrix_ITU_R_2020 {
                 buffer = isFullRangeVideo ? colorConversion2020FullRangeMatrixBuffer : colorConversion2020VideoRangeMatrixBuffer
+                matrixName = "BT.2020"
             } else {
                 buffer = isFullRangeVideo ? colorConversion601FullRangeMatrixBuffer : colorConversion601VideoRangeMatrixBuffer
+                // The fallback arm. Reached both by genuine BT.601 content and
+                // by anything whose matrix tag is missing.
+                matrixName = yCbCrMatrix == nil ? "BT.601 (FALLBACK — no matrix tag)" : "BT.601"
+            }
+            // Orivio probe: the actual arithmetic. This is the ground truth for
+            // "is the shader using the right matrix and the right range".
+            KSColorProbe.once("shader") {
+                "shader matrix=\(matrixName) range=\(isFullRangeVideo ? "full" : "video")"
+                    + " leftShift=\(pixelBuffer.leftShift == 0 ? 1 : 64) planes=\(pixelBuffer.planeCount)"
             }
             encoder.setFragmentBuffer(buffer, offset: 0, index: 0)
             let colorOffset = isFullRangeVideo ? colorOffsetFullRangeMatrixBuffer : colorOffsetVideoRangeMatrixBuffer
