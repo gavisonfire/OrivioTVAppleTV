@@ -21,6 +21,14 @@ import Network
 /// CFNetwork's response spool files (`tmp/CFNetworkDownload_*.tmp`) leak the
 /// same way and for the same reason — the app dies with requests in flight —
 /// so they are swept on the same pass (179 MB / 12,231 files on that device).
+///
+/// The hybrid disk cache's file (`Caches/hybrid-cache/current.bin`) is the
+/// third case, and the largest of them: `MediaCacheServer.endSession()` deletes
+/// it on player teardown, but teardown only runs on a normal exit. A crash, a
+/// jetsam kill, or the user force-quitting mid-film leaves TENS OF GIGABYTES
+/// stranded, and nothing would ever remove it — the next `beginSession` only
+/// clears the file if a cache session actually starts, so turning the feature
+/// off (or never playing a cacheable stream again) strands it permanently.
 enum PlayerTempSweep {
     private static let remuxPrefix = "dv-remux-"
     private static let spoolPrefix = "CFNetworkDownload_"
@@ -34,9 +42,34 @@ enum PlayerTempSweep {
         Task.detached(priority: .utility) { sweep() }
     }
 
+    /// Delete a hybrid-cache file orphaned by a kill. Launch is the one moment
+    /// no session can own it: `MediaCacheServer` creates its file inside
+    /// `beginSession`, which cannot have run yet.
+    private static func sweepHybridCache() {
+        let fm = FileManager.default
+        guard let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return }
+        let dir = caches.appendingPathComponent("hybrid-cache", isDirectory: true)
+        guard let entries = try? fm.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey]
+        ), !entries.isEmpty else { return }
+        var reclaimed: Int64 = 0
+        for entry in entries {
+            reclaimed += Int64(
+                (try? entry.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
+                    .totalFileAllocatedSize ?? 0
+            )
+            try? fm.removeItem(at: entry)
+        }
+        if reclaimed > 0 {
+            NSLog("[OrivioSweep] reclaimed %.2f GB of orphaned hybrid cache at launch",
+                  Double(reclaimed) / 1e9)
+        }
+    }
+
     /// The sweep itself. Synchronous — call it directly only from a background
     /// context (or a test).
     static func sweep() {
+        sweepHybridCache()
         let fm = FileManager.default
         let tmp = fm.temporaryDirectory
         guard let entries = try? fm.contentsOfDirectory(

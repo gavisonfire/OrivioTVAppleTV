@@ -62,7 +62,20 @@ final class MediaCacheServer {
     private var redirectAll = false
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
-    private var downloader: SegmentDownloader?
+    /// The download POOL. One connection is throttled by the provider, not by
+    /// the link — several pulling different chunks is how a 22 GB remux keeps
+    /// ahead of playback instead of losing to it by half.
+    private var workers: [SegmentDownloader] = []
+    /// How many workers may hold a live request right now. Starts gentle,
+    /// grows by one per completed chunk, and HALVES when the origin answers
+    /// 429/503 — the provider's ceiling is discovered, not assumed.
+    private var parallelLimit = 2
+    /// No ramp-up (and retries wait) until this passes.
+    private var throttledUntil = Date.distantPast
+    /// Next byte to hand out. Chunks are assigned in order from here, so the
+    /// contiguous coverage the reader needs grows from the front even though
+    /// the fetches complete out of order.
+    private var fetchCursor: Int64 = 0
 
     // MARK: Sliding window (queue-confined)
 
@@ -81,8 +94,12 @@ final class MediaCacheServer {
     /// Where each live reader currently is, so eviction never pulls bytes out
     /// from under the slowest one.
     private var readOffsets: [ObjectIdentifier: Int64] = [:]
-    /// High-water mark of served bytes — the playhead estimate when no reader
-    /// happens to be connected at the moment eviction looks.
+    /// The most recent MINIMUM of the active media readers — the playhead
+    /// estimate that survives the moments between range requests when no
+    /// reader happens to be connected. (A high-water mark was wrong twice
+    /// over: an engine's open probes the file at far offsets, and one such
+    /// read dragged the "playhead" deep into the film, mispointing both the
+    /// request routing and the sliding window's eviction.)
     private var lastReadOffset: Int64 = 0
 
     /// Free-space slack always left for the system and other apps.
@@ -104,6 +121,52 @@ final class MediaCacheServer {
     /// anything nearer is about to arrive sequentially anyway.
     private static let jumpAheadSlopBytes: Int64 = 4 * 1_048_576
 
+    /// Ceiling on concurrent range requests. Debrid providers rate-limit per
+    /// CONNECTION, so parallelism multiplies throughput — but past the
+    /// provider's per-account ceiling it answers 429 instead. `parallelLimit`
+    /// ramps toward this and backs off when throttled; this is only the cap.
+    private static let workerCount = 5
+    /// How far ahead of an active reader the pool tries to stay before doing
+    /// background fill. The demand side of the demand-driven pool.
+    private static let readerLookaheadBytes: Int64 = 96 * 1_048_576
+    /// Bytes per assignment. Large enough that a request's latency is
+    /// amortised, small enough that a slow worker can't hold the contiguous
+    /// edge back for long — the reader can only advance through bytes that
+    /// have MERGED with the coverage in front of it.
+    private static let chunkBytes: Int64 = 8 * 1_048_576
+
+    /// A bounded range request this far from the frontier is metadata, not
+    /// playback — MKV cues and MP4 moov tables sit at the END of the file and
+    /// the demuxer reads them repeatedly while probing. Fetch those on the
+    /// side instead of dragging the sequential download to them.
+    private static let sideFetchMaxBytes: Int64 = 8 * 1_048_576
+    /// Side fetches in flight, keyed by start offset (also the de-dup — the
+    /// demuxer asks for the same cue block more than once).
+    private var sideFetchers: [Int64: SideFetcher] = [:]
+    /// Their byte spans, so chunk assignment treats them as claimed.
+    private var sideFetchSpans: [Int64: Int64] = [:]
+    /// The end of the CONTIGUOUS run of cached bytes in front of the reader —
+    /// the only frontier that means anything to a player, since it can only
+    /// advance through bytes that have merged with what it is already reading.
+    ///
+    /// Emphatically NOT `ranges.last?.end`: once a side fetch has pulled the
+    /// container index in from the tail, the last range ENDS AT THE END OF THE
+    /// FILE. Every subsequent request then looked like it was safely behind
+    /// the download, so a cue read in the middle of the file neither jumped
+    /// nor side-fetched — it just waited for bytes that were hundreds of
+    /// megabytes away, and the engine hung there. Nor is it "the last byte
+    /// written": with a parallel pool those land out of order.
+    private var downloadHead: Int64 { coverageEnd(from: minActiveRead()) }
+
+    /// Dev diagnostics: how many proxy requests have been narrated to the
+    /// trail. Bounded — an engine makes hundreds and the trail holds 40 lines.
+    private var loggedRequests = 0
+    private func requestTrail(_ line: String) {
+        guard loggedRequests < 18 else { return }
+        loggedRequests += 1
+        PlayerViewModel.colorTrail("proxy \(line)")
+    }
+
     // MARK: - HUD snapshot
 
     /// A lock-guarded copy of the session's coverage, readable from the main
@@ -118,6 +181,11 @@ final class MediaCacheServer {
     /// Queue-confined master copy of the failure reason.
     private var failureReason: String?
     private var snapshotWindow: String?
+    private var snapshotPool = ""
+    /// How far the download is AHEAD of the furthest reader. Negative or tiny
+    /// means the download is barely keeping up (or losing) and nothing else
+    /// should be competing with it for the connection, the disk or the CPU.
+    private var snapshotLead: Int64 = 0
 
     private func publishSnapshot() {
         snapshotLock.lock()
@@ -127,6 +195,8 @@ final class MediaCacheServer {
         snapshotWindow = windowed
             ? "window budget=\(budget) paused=\(pausedForSpace) evicted=\(evictedTotal)\(evictionBroken ? " EVICTION BROKEN" : "")"
             : nil
+        snapshotLead = downloadHead - minActiveRead()
+        snapshotPool = "pool=\(workers.count(where: { !$0.isIdle }))/\(parallelLimit)"
         snapshotLock.unlock()
     }
 
@@ -140,6 +210,7 @@ final class MediaCacheServer {
         }
         let onDisk = snapshotRanges.reduce(Int64(0)) { $0 + ($1.end - $1.start) }
         var line = "cache: total=\(snapshotTotal) onDisk=\(onDisk) ranges=\(snapshotRanges.count)"
+            + " lead=\(snapshotLead / 1_048_576)MB \(snapshotPool)"
         if let window = snapshotWindow { line += " " + window }
         if let failure = snapshotFailure { line += " FAILED: \(failure)" }
         return line
@@ -180,6 +251,16 @@ final class MediaCacheServer {
         return 0
     }
 
+    /// How far the download is ahead of the furthest reader, in bytes. The
+    /// honest measure of whether the cache is winning: on a high-bitrate remux
+    /// it can be pinned near zero, and anything else touching the file then
+    /// makes playback worse rather than better.
+    var readerLeadBytes: Int64 {
+        snapshotLock.lock()
+        defer { snapshotLock.unlock() }
+        return snapshotLead
+    }
+
     /// Covered byte ranges as 0…1 fractions of the file — what a scheduler
     /// needs to run work over ONLY the parts already on disk (the scrub
     /// preview pass). Empty until the file's length is known.
@@ -218,6 +299,23 @@ final class MediaCacheServer {
         let ext = origin.pathExtension.lowercased()
         guard ext != "m3u8", ext != "m3u" else { return nil }
         return q.sync {
+            // RE-ENTRY FOR THE SAME FILM keeps the live session and hands back
+            // the SAME url. Two reasons, and the first is severe:
+            //
+            // 1. The token is a fresh UUID per session, so restarting here
+            //    minted a NEW proxy url every time — and the player's
+            //    "don't do this again" guards (`dvFirstTried`, `dvFailedURLs`,
+            //    `probedURLs`) are all keyed on the url string. None of them
+            //    could ever match, so a DV-first attempt retried forever. Worse,
+            //    the teardown killed the connection feeding the engine that had
+            //    just been started, which failed it over into another load —
+            //    a self-sustaining reload loop in which nothing ever played.
+            // 2. Even without that, throwing away a partly-downloaded film on
+            //    an engine swap or a failover is pure waste.
+            if self.origin == origin, !token.isEmpty, listener != nil,
+               writeHandle != nil, failureReason == nil {
+                return proxyURL(for: origin)
+            }
             teardownSessionLocked()
             guard startListenerLocked() else { return nil }
             self.origin = origin
@@ -226,6 +324,9 @@ final class MediaCacheServer {
             rangeCapable = true
             totalLength = -1
             ranges = []
+            loggedRequests = 0
+            sideFetchers = [:]
+            sideFetchSpans = [:]
             budget = 0
             windowed = false
             pausedForSpace = false
@@ -241,15 +342,21 @@ final class MediaCacheServer {
             guard let handle = try? FileHandle(forWritingTo: file) else { return nil }
             fileURL = file
             writeHandle = handle
-            let downloader = SegmentDownloader(server: self, origin: origin, queue: q)
-            self.downloader = downloader
-            downloader.start(at: 0)
-            // Keep the origin's extension: the engine router picks
-            // native-vs-FFmpeg by it, and losing ".mkv" would send Matroska
-            // to AVPlayer.
-            let name = ext.isEmpty ? "v" : "v.\(ext)"
-            return URL(string: "http://127.0.0.1:\(Self.port)/m/\(token)/\(name)")
+            fetchCursor = 0
+            parallelLimit = 2
+            throttledUntil = .distantPast
+            ensurePool()
+            return proxyURL(for: origin)
         }
+    }
+
+    /// The playback url for the live session. Keeps the origin's extension:
+    /// the engine router picks native-vs-FFmpeg by it, and losing ".mkv" would
+    /// send Matroska to AVPlayer.
+    private func proxyURL(for origin: URL) -> URL? {
+        let ext = origin.pathExtension.lowercased()
+        let name = ext.isEmpty ? "v" : "v.\(ext)"
+        return URL(string: "http://127.0.0.1:\(Self.port)/m/\(token)/\(name)")
     }
 
     /// Stop downloading, drop every connection, delete the cache file.
@@ -260,8 +367,9 @@ final class MediaCacheServer {
     // MARK: - Session teardown (on q)
 
     private func teardownSessionLocked() {
-        downloader?.cancel()
-        downloader = nil
+        for worker in workers { worker.cancel() }
+        workers = []
+        fetchCursor = 0
         for connection in connections.values { connection.cancel() }
         connections.removeAll()
         try? writeHandle?.close()
@@ -280,7 +388,54 @@ final class MediaCacheServer {
         evictedTotal = 0
         readOffsets = [:]
         lastReadOffset = 0
+        sideFetchers = [:]
+        sideFetchSpans = [:]
+        parallelLimit = 2
+        throttledUntil = .distantPast
         publishSnapshot()
+    }
+
+    /// Fetch a small, far-away byte range on its own connection, leaving the
+    /// sequential downloader exactly where it is.
+    ///
+    /// Repositioning the main downloader for a container's index (what `jump`
+    /// does) abandons the download that is feeding playback, and the two then
+    /// pull against each other: the demuxer re-reads the cues, the downloader
+    /// is yanked to the tail again, and the front creeps forward a few KB at a
+    /// time. That is a startup that never finishes, not a slow one.
+    private func sideFetch(start: Int64, endExclusive: Int64, attempt: Int = 0) {
+        guard let origin, writeHandle != nil, !redirectAll else { return }
+        guard sideFetchers[start] == nil else { return }   // already in flight
+        // NEVER drop the request on the floor: the connection that triggered
+        // it is sitting in `serve` waiting for those bytes, and with nobody
+        // fetching them it waits out the full 60s stall timeout — the
+        // intermittent "sometimes it just doesn't play". At capacity, wait a
+        // beat and try again; capacity is small on purpose, because these
+        // connections count against the same provider ceiling as the pool.
+        guard sideFetchers.count < 3 else {
+            q.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.sideFetch(start: start, endExclusive: endExclusive, attempt: attempt)
+            }
+            return
+        }
+        sideFetchSpans[start] = endExclusive
+        sideFetchers[start] = SideFetcher(
+            origin: origin, start: start, endExclusive: endExclusive, queue: q
+        ) { [weak self] data in
+            guard let self else { return }
+            self.sideFetchers[start] = nil
+            self.sideFetchSpans[start] = nil
+            if let data, self.writeHandle != nil {
+                self.downloaderWrote(data, at: start, isSideFetch: true)
+            } else if attempt < 3 {
+                // Backed-off retry — a 429 here clears in seconds.
+                self.q.asyncAfter(deadline: .now() + Double(attempt + 1) * 2) { [weak self] in
+                    self?.sideFetch(start: start, endExclusive: endExclusive, attempt: attempt + 1)
+                }
+            } else {
+                self.requestTrail("SIDE-FETCH failed at \(start) — reader will fail over")
+            }
+        }
     }
 
     private static func cacheDirectory() -> URL {
@@ -400,6 +555,8 @@ final class MediaCacheServer {
         let endExclusive = range.map { min(($0.1 ?? (total - 1)) + 1, total) } ?? total
         guard start < endExclusive else { sendSimple(connection, "416 Range Not Satisfiable"); return }
 
+        requestTrail("\(cacheOnly ? "/t" : "/m") \(method) start=\(start) end=\(endExclusive)"
+            + " covEnd=\(coverageEnd(from: start)) head=\(downloadHead) ranges=\(ranges.count)")
         // Cache-only lane: what's on disk or a fast refusal — no jump, no
         // redirect, no waiting on the network.
         if cacheOnly {
@@ -408,23 +565,27 @@ final class MediaCacheServer {
                 return
             }
         }
-        // Route an uncovered request. (The old check here — `start >
-        // coverageEnd(from: start)` — could never be true, so deep seeks
-        // stalled against the sequential download instead of repositioning it.)
+        // Route an uncovered request. Small bounded reads are container
+        // metadata (MKV cues, MP4 tables) and get their own connection; a big
+        // or open-ended read is a PLAYBACK reader, which registers its
+        // position below and is then fed by the demand side of the pool —
+        // nothing repositions, nothing thrashes, and several concurrent probe
+        // readers each just become demand.
         else if rangeCapable, coverageEnd(from: start) == start, start < total {
-            let frontier = ranges.last?.end ?? 0
-            if start > frontier + Self.jumpAheadSlopBytes {
-                // Deep forward seek: reposition the download to serve the
-                // viewer's new position now rather than eventually.
-                pausedForSpace = false
-                downloader?.jump(to: start)
-            } else if windowed, start < frontier {
-                // Behind the sliding window (evicted, or a gap the window
-                // will never refill) — this reader gets the origin directly.
+            if endExclusive - start <= Self.sideFetchMaxBytes {
+                requestTrail("SIDE-FETCH \(start)..<\(endExclusive)")
+                sideFetch(start: start, endExclusive: endExclusive)
+            } else if windowed,
+                      let windowStart = ranges.first(where: { $0.end > Self.headerProtectBytes })?.start,
+                      start < windowStart {
+                // Behind the sliding window — those bytes were EVICTED and the
+                // window will not go back for them; this reader gets the
+                // origin directly.
                 sendRedirect(connection)
                 return
             }
         }
+        let mediaRead = !cacheOnly && endExclusive - start > Self.sideFetchMaxBytes
 
         let contentType: String
         switch origin?.pathExtension.lowercased() {
@@ -445,8 +606,16 @@ final class MediaCacheServer {
         \r
 
         """
-        // Preview readers are not the viewer: they must not steer eviction.
-        if !cacheOnly { readOffsets[ObjectIdentifier(connection)] = start }
+        // Only PLAYBACK readers steer eviction, demand and the playhead
+        // estimate. Metadata reads must not: one cue read at the tail of a
+        // 22 GB file dragged the "playhead" to the end of the film, which
+        // broke the request routing (mid-file reads waited on bytes nobody
+        // was fetching) and pointed eviction at everything the real reader
+        // still needed.
+        if mediaRead {
+            readOffsets[ObjectIdentifier(connection)] = start
+            kickPool()   // fresh demand — put idle capacity on it now
+        }
         connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             self.q.async {
@@ -456,7 +625,8 @@ final class MediaCacheServer {
                     self.drop(connection); return
                 }
                 self.serve(connection, reader: reader, offset: start,
-                           endExclusive: endExclusive, stalledSince: nil, cacheOnly: cacheOnly)
+                           endExclusive: endExclusive, stalledSince: nil,
+                           cacheOnly: cacheOnly, mediaRead: mediaRead)
             }
         })
     }
@@ -466,7 +636,7 @@ final class MediaCacheServer {
     /// crude, but local, cheap, and immune to lost-wakeup bugs.
     private func serve(_ connection: NWConnection, reader: FileHandle,
                        offset: Int64, endExclusive: Int64, stalledSince: Date?,
-                       cacheOnly: Bool = false) {
+                       cacheOnly: Bool = false, mediaRead: Bool = false) {
         guard connections[ObjectIdentifier(connection)] != nil else {
             try? reader.close(); return
         }
@@ -488,13 +658,33 @@ final class MediaCacheServer {
             // never change — cut the connection so the engine's own failover
             // takes over (its retry meets `redirectAll` and plays direct).
             if redirectAll || (stalledSince.map { Date().timeIntervalSince($0) > 60 } ?? false) {
+                requestTrail("STALL-DROP at \(offset) (covEnd=\(coverageEnd(from: offset)))")
                 try? reader.close()
                 drop(connection)
                 return
             }
+            if stalledSince == nil { requestTrail("waiting at \(offset) head=\(downloadHead)") }
+            // A READER WAITING IS ALSO PROGRESS. `resumeIfRoom` used to be
+            // called only from the send-completion path — i.e. only while
+            // bytes were actually flowing — so a window that had filled to its
+            // budget while a reader sat waiting for bytes just past the edge
+            // could never slide: the download stayed parked waiting for
+            // playback to advance, and playback waited for the download. The
+            // cache stopped dead until the 60s stall timeout killed the
+            // connection. Publish where this reader is and try to make room.
+            if mediaRead {
+                readOffsets[ObjectIdentifier(connection)] = offset
+                lastReadOffset = readOffsets.values.min() ?? offset
+                publishSnapshot()
+                resumeIfRoom()
+            }
+            // Equally: an all-idle pool leaves nobody fetching what this
+            // reader is waiting for.
+            if !pausedForSpace, workers.allSatisfy(\.isIdle) { kickPool() }
             q.asyncAfter(deadline: .now() + 0.08) { [weak self] in
                 self?.serve(connection, reader: reader, offset: offset,
-                            endExclusive: endExclusive, stalledSince: stalledSince ?? Date())
+                            endExclusive: endExclusive, stalledSince: stalledSince ?? Date(),
+                            cacheOnly: cacheOnly, mediaRead: mediaRead)
             }
             return
         }
@@ -508,13 +698,14 @@ final class MediaCacheServer {
             self.q.async {
                 if error != nil { try? reader.close(); self.drop(connection); return }
                 let next = offset + Int64(data.count)
-                if !cacheOnly {
+                if mediaRead {
                     self.readOffsets[ObjectIdentifier(connection)] = next
-                    self.lastReadOffset = max(self.lastReadOffset, next)
+                    self.lastReadOffset = self.readOffsets.values.min() ?? next
                     self.resumeIfRoom()
                 }
                 self.serve(connection, reader: reader, offset: next,
-                           endExclusive: endExclusive, stalledSince: nil, cacheOnly: cacheOnly)
+                           endExclusive: endExclusive, stalledSince: nil,
+                           cacheOnly: cacheOnly, mediaRead: mediaRead)
             }
         })
     }
@@ -569,23 +760,23 @@ final class MediaCacheServer {
         publishSnapshot()
     }
 
-    /// The first missing byte range, for the fill-the-gaps pass. In windowed
-    /// mode, gaps behind the slowest reader are the EVICTED past — refilling
-    /// them would fight the eviction forever, so only gaps from the reader
-    /// forward qualify.
-    private func firstGap() -> (start: Int64, end: Int64)? {
-        guard totalLength > 0 else { return nil }
-        var cursor: Int64 = windowed ? minActiveRead() : 0
-        for range in ranges {
-            if range.start > cursor { return (cursor, range.start) }
-            cursor = max(cursor, range.end)
-        }
-        return cursor < totalLength ? (cursor, totalLength) : nil
-    }
 
     // MARK: - Downloader callbacks (on q)
 
-    fileprivate func downloaderGotResponse(_ response: HTTPURLResponse, requestedOffset: Int64) -> Bool {
+    /// What a worker should do with the response it just received.
+    enum ResponseVerdict {
+        case allow
+        /// Throttled (429/503) or transiently broken: keep the segment, retry
+        /// it after the delay. The provider's ceiling was discovered, not
+        /// fatal — one 429 used to kill the entire cache session.
+        case retryLater(TimeInterval)
+        /// Origin ignored the Range header mid-file: restart from zero.
+        case restartAtZero
+        /// The session is over (failSession already ran) — stand down.
+        case abandon
+    }
+
+    fileprivate func downloaderGotResponse(_ response: HTTPURLResponse, requestedOffset: Int64) -> ResponseVerdict {
         switch response.statusCode {
         case 206:
             // "bytes X-Y/TOTAL"
@@ -595,31 +786,42 @@ final class MediaCacheServer {
                let total = Int64(totalPart) {
                 totalLength = total
                 publishSnapshot()
-                return configureBudget()
+                guard configureBudget() else { return .abandon }
+                fillPool()
             }
-            return true
+            return .allow
         case 200:
             if requestedOffset > 0 {
                 // Origin ignored the Range header — it can't seek. What's
                 // cached so far still serves; jumps are off the table.
                 rangeCapable = false
-                return false
+                return .restartAtZero
             }
             rangeCapable = false
             totalLength = response.expectedContentLength
             guard totalLength > 0 else {
                 failSession("origin sent no content length")
-                return false
+                return .abandon
             }
             publishSnapshot()
-            return configureBudget()
+            guard configureBudget() else { return .abandon }
+            fillPool()
+            return .allow
+        case 429, 503:
+            // Too many connections for this provider: halve the parallelism,
+            // hold the ramp for a while, and retry the same chunk shortly.
+            parallelLimit = max(1, parallelLimit / 2)
+            throttledUntil = Date().addingTimeInterval(8)
+            requestTrail("origin throttled (\(response.statusCode)) — backing off to \(parallelLimit) connection\(parallelLimit == 1 ? "" : "s")")
+            publishSnapshot()
+            return .retryLater(4)
         default:
             failSession("origin answered \(response.statusCode)")
-            return false
+            return .abandon
         }
     }
 
-    fileprivate func downloaderWrote(_ data: Data, at offset: Int64) {
+    fileprivate func downloaderWrote(_ data: Data, at offset: Int64, isSideFetch: Bool = false) {
         guard let writeHandle else { return }
         do {
             try writeHandle.seek(toOffset: UInt64(offset))
@@ -637,21 +839,161 @@ final class MediaCacheServer {
         }
     }
 
-    fileprivate func downloaderFinishedSegment() {
-        // Tail done (or segment complete) → fill the earliest gap next; no
-        // gaps means the whole file is on disk and the downloader retires.
-        guard let gap = firstGap() else {
-            NSLog("[OrivioCache] %@ (%lld bytes)",
-                  windowed ? "window reaches the end of the file — download retired" : "file fully cached",
-                  totalLength)
-            downloader = nil
-            return
+    /// A throttled worker asks to resume through the SERVER, not by itself:
+    /// a self-timed restart bypassed `parallelLimit`, so five workers that
+    /// were 429'd together all came back together — re-tripping the very
+    /// ceiling the back-off had just discovered. The abandoned segment isn't
+    /// lost either way: with no task it is unclaimed, and the next
+    /// `pickChunk` hands it out again.
+    fileprivate func downloaderThrottled(_ worker: SegmentDownloader,
+                                         resumeAt offset: Int64, end: Int64?,
+                                         after delay: TimeInterval) {
+        q.asyncAfter(deadline: .now() + delay) { [weak self, weak worker] in
+            guard let self, !self.redirectAll, !self.pausedForSpace else { return }
+            guard let worker, worker.isIdle else { return }
+            if self.workers.count(where: { !$0.isIdle }) < self.parallelLimit {
+                worker.start(at: offset, endExclusive: end)
+            } else {
+                self.kickPool()
+            }
         }
-        downloader?.start(at: gap.start, endExclusive: rangeCapable ? gap.end : nil)
     }
 
-    fileprivate func downloaderFailed() {
-        failSession("download failed")
+    fileprivate func downloaderFinishedSegment(_ worker: SegmentDownloader) {
+        // A finished chunk is evidence the provider is happy at this rate —
+        // grow toward the ceiling, then put every idle worker (this one
+        // included) onto whatever needs fetching most.
+        if Date() > throttledUntil, parallelLimit < Self.workerCount {
+            parallelLimit += 1
+        }
+        kickPool()
+    }
+
+    fileprivate func downloaderFailed(_ worker: SegmentDownloader) {
+        // One worker dying is not the session dying — the others carry on and
+        // the pool is topped back up. Only losing ALL of them is terminal.
+        retire(worker)
+        if workers.isEmpty { failSession("every download connection failed") }
+    }
+
+    fileprivate func retire(_ worker: SegmentDownloader) {
+        worker.cancel()
+        workers.removeAll { $0 === worker }
+    }
+
+    // MARK: - Download pool (on q)
+
+    /// Make sure the pool exists, then put idle capacity to work.
+    private func ensurePool() {
+        guard !redirectAll, writeHandle != nil, let origin else { return }
+        let target = rangeCapable ? Self.workerCount : 1
+        while workers.count < target {
+            workers.append(SegmentDownloader(server: self, origin: origin, queue: q))
+        }
+        kickPool()
+    }
+
+    /// Deferred `kickPool` — for callers running inside a worker's own
+    /// delegate callback, where starting siblings would re-enter.
+    private func fillPool() {
+        q.async { [weak self] in self?.kickPool() }
+    }
+
+    /// Assign work to idle workers, demand first, until the adaptive
+    /// parallelism limit or the work runs out.
+    private func kickPool() {
+        guard !redirectAll, !pausedForSpace, writeHandle != nil else { return }
+        for worker in workers where worker.isIdle {
+            guard workers.count(where: { !$0.isIdle }) < parallelLimit else { return }
+            guard assignChunk(to: worker) else { return }
+        }
+    }
+
+    /// Hand `worker` the most useful unclaimed chunk. False = nothing to do.
+    @discardableResult
+    private func assignChunk(to worker: SegmentDownloader) -> Bool {
+        guard !redirectAll, !pausedForSpace, writeHandle != nil else { return false }
+        // BOOTSTRAP. The file's length is only learned from the first
+        // response's Content-Range, so the opening request goes out WITHOUT
+        // it — requiring the length first meant every worker parked waiting
+        // for a fact only a worker could learn, and nothing ever downloaded.
+        guard totalLength > 0 else {
+            guard workers.first === worker else { return false }
+            worker.start(at: fetchCursor, endExclusive: fetchCursor + Self.chunkBytes)
+            return true
+        }
+        guard rangeCapable else {
+            // No ranges: one open-ended stream from zero is all the origin
+            // allows — and only while something is actually missing, or a
+            // finished stream's completion would start the whole download
+            // over from the top, forever.
+            guard nextUnclaimedGap(from: 0) != nil else { return false }
+            worker.start(at: 0, endExclusive: nil)
+            return true
+        }
+        guard let gap = pickChunk() else {
+            if workers.allSatisfy(\.isIdle) {
+                NSLog("[OrivioCache] %@ (%lld bytes)",
+                      windowed ? "window reaches the end of the file" : "file fully cached",
+                      totalLength)
+            }
+            return false
+        }
+        worker.start(at: gap.start, endExclusive: gap.end)
+        return true
+    }
+
+    /// The most useful chunk to fetch next. DEMAND FIRST: the active reader
+    /// with the least contiguous road ahead of it gets fed before any
+    /// background filling — that is what lets a freshly opened engine (which
+    /// probes at several offsets at once) come up without anyone repositioning
+    /// anything. Then the background cursor, then hole-filling.
+    private func pickChunk() -> (start: Int64, end: Int64)? {
+        var best: (lead: Int64, gap: (start: Int64, end: Int64))?
+        for readerOffset in readOffsets.values {
+            let edge = coverageEnd(from: readerOffset)
+            let lead = edge - readerOffset
+            guard lead < Self.readerLookaheadBytes,
+                  let gap = nextUnclaimedGap(from: edge),
+                  gap.start < readerOffset + Self.readerLookaheadBytes
+            else { continue }
+            if best == nil || lead < best!.lead { best = (lead, gap) }
+        }
+        if let best { return bounded(best.gap) }
+        if let gap = nextUnclaimedGap(from: fetchCursor) {
+            let chunk = bounded(gap)
+            fetchCursor = max(fetchCursor, chunk.end)
+            return chunk
+        }
+        // Holes left behind by seeks — but never behind the sliding window.
+        if let gap = nextUnclaimedGap(from: windowed ? minActiveRead() : 0) {
+            return bounded(gap)
+        }
+        return nil
+    }
+
+    private func bounded(_ gap: (start: Int64, end: Int64)) -> (start: Int64, end: Int64) {
+        (gap.start, min(gap.start + Self.chunkBytes, gap.end))
+    }
+
+    /// First byte at or after `cursor` that is neither on disk NOR already
+    /// being fetched. Ignoring in-flight segments here was the duplicate-
+    /// download bug: two workers pulling the same bytes, halving throughput
+    /// and doubling the connection count the provider sees.
+    private func nextUnclaimedGap(from cursor: Int64) -> (start: Int64, end: Int64)? {
+        guard totalLength > 0 else { return nil }
+        var spans = ranges
+        for worker in workers {
+            if let pending = worker.pendingSegment { spans.append(pending) }
+        }
+        for (start, end) in sideFetchSpans { spans.append((start, end)) }
+        spans.sort { $0.start < $1.start }
+        var probe = max(0, min(cursor, totalLength))
+        for span in spans where span.end > probe {
+            if span.start > probe { return (probe, min(span.start, totalLength)) }
+            probe = max(probe, span.end)
+        }
+        return probe < totalLength ? (probe, totalLength) : nil
     }
 
     private func failSession(_ reason: String) {
@@ -662,8 +1004,8 @@ final class MediaCacheServer {
         PlayerViewModel.colorTrail("cache session failed: \(reason) — direct playback from origin")
         failureReason = reason
         redirectAll = true
-        downloader?.cancel()
-        downloader = nil
+        for worker in workers { worker.cancel() }
+        workers = []
         publishSnapshot()
     }
 
@@ -763,7 +1105,7 @@ final class MediaCacheServer {
     private func pauseForSpaceIfNeeded() {
         guard !pausedForSpace else { return }
         pausedForSpace = true
-        downloader?.pause()
+        for worker in workers { worker.cancelSegment() }
         publishSnapshot()
         NSLog("[OrivioCache] window full (%lld of %lld) — download paused until playback advances", usedBytes(), budget)
     }
@@ -775,13 +1117,78 @@ final class MediaCacheServer {
         evictBehind()
         guard usedBytes() + Self.resumeHeadroomBytes <= budget else { return }
         pausedForSpace = false
-        downloader?.resume()
+        kickPool()
         publishSnapshot()
         NSLog("[OrivioCache] window slid — download resumed")
     }
 }
 
 // MARK: - Segment downloader
+
+/// One bounded range fetch on its own connection, for data far from the
+/// sequential frontier (a container's index).
+///
+/// Delegate-based rather than a completion-handler `dataTask`, for one
+/// specific reason: a completion handler buffers the ENTIRE response before
+/// anything can inspect it, so an origin that ignores the Range header and
+/// answers 200 with the whole file would be held in memory in full — a 4 GB
+/// remux is a jetsam kill on a 3 GB box, and writing it at the requested
+/// offset would corrupt the cache besides. Here the response is inspected
+/// first and anything but a 206 is cancelled before a byte is buffered.
+private final class SideFetcher: NSObject, URLSessionDataDelegate {
+    private let span: Int64
+    private let completion: (Data?) -> Void
+    private var session: URLSession!
+    private var buffer = Data()
+    private var finished = false
+
+    init(origin: URL, start: Int64, endExclusive: Int64, queue: DispatchQueue,
+         completion: @escaping (Data?) -> Void) {
+        span = endExclusive - start
+        self.completion = completion
+        super.init()
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 20
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let delegateQueue = OperationQueue()
+        delegateQueue.underlyingQueue = queue
+        delegateQueue.maxConcurrentOperationCount = 1
+        session = URLSession(configuration: config, delegate: self, delegateQueue: delegateQueue)
+        var request = URLRequest(url: origin)
+        request.setValue("bytes=\(start)-\(endExclusive - 1)", forHTTPHeaderField: "Range")
+        session.dataTask(with: request).resume()
+    }
+
+    func urlSession(_: URLSession, dataTask _: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard (response as? HTTPURLResponse)?.statusCode == 206 else {
+            completionHandler(.cancel)
+            finish(nil)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+        if Int64(buffer.count) > span {   // origin sending more than asked
+            dataTask.cancel()
+            finish(nil)
+        }
+    }
+
+    func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: Error?) {
+        finish(error == nil && !buffer.isEmpty ? buffer : nil)
+    }
+
+    private func finish(_ data: Data?) {
+        guard !finished else { return }
+        finished = true
+        session.invalidateAndCancel()
+        completion(data)
+    }
+}
 
 /// One URLSession pulling the origin at full speed, one segment at a time,
 /// writing straight through to the cache file. `jump(to:)` abandons the
@@ -798,6 +1205,30 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
     private var segmentEnd: Int64?
     private var retries = 0
     private var cancelled = false
+
+    /// No segment in hand — the pool may assign one.
+    var isIdle: Bool { task == nil && !cancelled }
+
+    /// The bytes this worker is still expected to deliver, so chunk
+    /// assignment treats them as claimed rather than fetching them twice.
+    var pendingSegment: (start: Int64, end: Int64)? {
+        guard task != nil else { return nil }
+        return (writeOffset, segmentEnd ?? writeOffset + 64 * 1_048_576)
+    }
+
+    /// Stand down until the pool has work again.
+    func park() {
+        task?.cancel()
+        task = nil
+    }
+
+    /// Abandon the current segment WITHOUT retiring: a seek moved the pool, or
+    /// the sliding window ran out of budget. Distinct from `cancel()`, which
+    /// tears the worker down for good.
+    func cancelSegment() {
+        task?.cancel()
+        task = nil
+    }
 
     init(server: MediaCacheServer, origin: URL, queue: DispatchQueue) {
         self.server = server
@@ -834,27 +1265,6 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
         task.resume()
     }
 
-    /// Abandon the current segment for a seek target (on q).
-    func jump(to offset: Int64) {
-        guard !cancelled else { return }
-        start(at: offset)
-    }
-
-    /// Space pause: drop the network request but keep our place. `task` is
-    /// nilled so any chunks URLSession already buffered are discarded by the
-    /// delegate guards; `resume()` re-requests from exactly where writing
-    /// stopped, bounded to the same segment.
-    func pause() {
-        guard !cancelled else { return }
-        task?.cancel()
-        task = nil
-    }
-
-    func resume() {
-        guard !cancelled, task == nil else { return }
-        start(at: writeOffset, endExclusive: segmentEnd)
-    }
-
     func cancel() {
         cancelled = true
         task?.cancel()
@@ -866,12 +1276,21 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         guard !cancelled, dataTask === task, let http = response as? HTTPURLResponse,
               let server else { completionHandler(.cancel); return }
-        if server.downloaderGotResponse(http, requestedOffset: requestedOffset) {
+        switch server.downloaderGotResponse(http, requestedOffset: requestedOffset) {
+        case .allow:
             completionHandler(.allow)
-        } else {
+        case .retryLater(let delay):
             completionHandler(.cancel)
-            // A 200-to-a-ranged-request origin restarts from zero once.
-            if requestedOffset > 0 { start(at: 0) }
+            let offset = writeOffset
+            let end = segmentEnd
+            task = nil
+            server.downloaderThrottled(self, resumeAt: offset, end: end, after: delay)
+        case .restartAtZero:
+            completionHandler(.cancel)
+            start(at: 0)
+        case .abandon:
+            completionHandler(.cancel)
+            task = nil
         }
     }
 
@@ -885,9 +1304,15 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
         guard !cancelled, task === self.task, let server else { return }
         if let error {
             let code = (error as NSError).code
-            if code == NSURLErrorCancelled { return }   // a jump superseded this segment
+            // A cancel is the pool repositioning or parking us, never a
+            // failure — and `task` is already nil in that case.
+            if code == NSURLErrorCancelled { return }
             retries += 1
-            guard retries <= 3 else { server.downloaderFailed(); return }
+            guard retries <= 3 else {
+                self.task = nil
+                server.downloaderFailed(self)
+                return
+            }
             let offset = writeOffset
             q.asyncAfter(deadline: .now() + Double(retries)) { [weak self] in
                 guard let self, !self.cancelled else { return }
@@ -896,6 +1321,7 @@ private final class SegmentDownloader: NSObject, URLSessionDataDelegate {
             return
         }
         retries = 0
-        server.downloaderFinishedSegment()
+        self.task = nil
+        server.downloaderFinishedSegment(self)
     }
 }

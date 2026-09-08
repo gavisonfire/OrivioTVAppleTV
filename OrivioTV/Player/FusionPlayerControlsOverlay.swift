@@ -481,7 +481,10 @@ private struct FusionBottomBlock<Trailing: View>: View {
     /// the hybrid disk cache when it is running, else the engine's own
     /// read-ahead. This is the growing lighter band on the bar.
     private var cacheEnd: CGFloat {
-        CGFloat(min(max(viewModel.cacheBandEnd, 0), 1))
+        // From the CLOCK, which publishes it on its own timer — reading the
+        // view model's computed value gave SwiftUI nothing to observe, so the
+        // band only moved while playback happened to be ticking the position.
+        CGFloat(min(max(clock.cacheEnd, 0), 1))
     }
 
     private var track: some View {

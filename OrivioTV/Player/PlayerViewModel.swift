@@ -161,6 +161,12 @@ enum SessionDisplayMode {
     /// Apply `criteria` only if nothing was pinned this launch. Lock-based
     /// (not actor-isolated): callers arrive from KSPlayer's setup thread AND
     /// from the main actor, and a main.sync hop from main would deadlock.
+    /// Video refresh rates worth asking a TV for. A stream whose fps has not
+    /// been established yet reports nonsense — a rate of 10 was seen pinned
+    /// for a whole app session, and because the pin is one-per-stint every
+    /// later title was then locked out of the mode it actually wanted.
+    static func isPlausibleRate(_ rate: Float) -> Bool { rate >= 20 && rate <= 121 }
+
     static func applyOnce(_ criteria: AVDisplayCriteria,
                           via manager: AVDisplayManager,
                           rate: Float = 0) -> Bool {
@@ -349,7 +355,7 @@ final class OrivioPlayerOptions: KSOptions {
         // stint (releaseDisplayForExit is a no-op) and tvOS performs the one
         // unavoidable revert invisibly when the app backgrounds.
         guard matchDisplayCriteria || nativeDV,
-              refreshRate > 0,
+              SessionDisplayMode.isPlausibleRate(refreshRate),
               let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled,
               let formatDescription
@@ -470,6 +476,15 @@ final class PlaybackClock: ObservableObject {
     /// a few points. `PlayerViewModel.scanPreview` proxies through to here so
     /// the playback logic reads and writes it exactly as before.
     @Published var scanPreview: Double?
+    /// The cache band's end, 0…1 of the film.
+    ///
+    /// PUBLISHED rather than read straight off `MediaCacheServer`: the server
+    /// is a plain singleton, so a computed property reading it gave SwiftUI
+    /// nothing to observe. The bar only refreshed as a side effect of
+    /// `position` ticking — which meant that while PAUSED nothing invalidated
+    /// the view and the band sat still, looking for all the world like a
+    /// stalled download while the cache was in fact filling normally.
+    @Published var cacheEnd: Double = 0
 }
 
 @MainActor
@@ -928,6 +943,15 @@ final class PlayerViewModel: ObservableObject {
     /// they don't get a second preflight (failures fall back to the normal
     /// engine path, which still has the mid-play switch as an upgrade).
     private var dvFirstTried: Set<String> = []
+
+    /// The key every "already tried / already failed / already probed" set is
+    /// stored under. NEVER the playback url: with the hybrid cache on, that is
+    /// a localhost proxy url carrying a per-session UUID, so a re-entry minted
+    /// a string no guard had ever seen and each of them silently stopped
+    /// working. The origin link is stable for the title.
+    private func retryKey(for url: URL) -> String {
+        (url.host == "127.0.0.1" ? currentEntry.stream.url : nil) ?? url.absoluteString
+    }
     private var dvFirstTask: Task<Void, Never>?
     /// Bumped by every `load()` and every `startDVFirst`. The DV-first probe
     /// takes seconds, and cancellation alone is not enough once the task is past
@@ -942,8 +966,8 @@ final class PlayerViewModel: ObservableObject {
               !url.isFileURL,
               DynamicRange.availableHDRModes.contains(.dolbyVision),
               Self.memoryFootprintMB() < 850,
-              !dvFailedURLs.contains(url.absoluteString),
-              !dvFirstTried.contains(url.absoluteString)
+              !dvFailedURLs.contains(retryKey(for: url)),
+              !dvFirstTried.contains(retryKey(for: url))
         else { return false }
         // A native-friendly container plays DV through AVPlayer as-is — the
         // remux is for the MKV world.
@@ -970,7 +994,7 @@ final class PlayerViewModel: ObservableObject {
     /// normal engine path.
     private func startDVFirst(entry: StreamEntry, url: URL) {
         PictureInPictureController.trail("load: DV-first preflight begins")
-        dvFirstTried.insert(url.absoluteString)
+        dvFirstTried.insert(retryKey(for: url))
         currentURL = url
         dvSessionPrepared = false
         loadPhase = .loading
@@ -1368,7 +1392,7 @@ final class PlayerViewModel: ObservableObject {
         guard let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return false }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
-        if fps > 0 {   // always match the content rate — the revert that made this risky is gone
+        if SessionDisplayMode.isPlausibleRate(fps) {   // match the content rate when it's real
             rate = fps
             if (23.5...24.2).contains(rate) { rate = 23.976 }
         }
@@ -1402,7 +1426,7 @@ final class PlayerViewModel: ObservableObject {
               let displayManager = UIApplication.shared.ks_keyWindow?.avDisplayManager,
               displayManager.isDisplayCriteriaMatchingEnabled else { return false }
         var rate = Float(UIScreen.main.maximumFramesPerSecond)
-        if fps > 0 {   // always match the content rate — the revert that made this risky is gone
+        if SessionDisplayMode.isPlausibleRate(fps) {   // match the content rate when it's real
             rate = fps
             if (23.5...24.2).contains(rate) { rate = 23.976 }
         }
@@ -2245,6 +2269,14 @@ final class PlayerViewModel: ObservableObject {
         var url = originURL
         let wantsHybridCache = settings.hybridDiskCacheEnabled
             || ProcessInfo.processInfo.arguments.contains("-hybridCache")
+        // The trail is opened FIRST. It clears itself when the title changes,
+        // so anything written before this call — the cache decision, notably —
+        // was wiped by the clear it triggers and never reached the read-out.
+        startCacheBandTicker()
+        Self.beginColorTrail(for: originURL.absoluteString,
+                             "=== load: \(entry.stream.name ?? entry.addonName)"
+                                 + " ext=\(originURL.pathExtension) engine=\(effectiveEngine.rawValue)"
+                                 + " mode=\(activeMode.rawValue) override=\(overrideURL != nil) ===")
         if overrideURL == nil, !wantsHybridCache {
             Self.colorTrail("cache: not attempted — Hybrid disk cache is off in Settings → Playback")
         }
@@ -2258,10 +2290,6 @@ final class PlayerViewModel: ObservableObject {
             Self.colorTrail("cache: declined (non-http origin, HLS playlist, or listener failed) — direct playback")
         }
         PictureInPictureController.trail("load: begin \(url.host ?? "?") ext=\(url.pathExtension) engine=\(effectiveEngine.rawValue) override=\(overrideURL != nil) addon=\(entry.addonName)")
-        Self.beginColorTrail(for: originURL.absoluteString,
-                             "=== load: \(entry.stream.name ?? entry.addonName)"
-                                 + " ext=\(url.pathExtension) engine=\(effectiveEngine.rawValue)"
-                                 + " mode=\(activeMode.rawValue) override=\(overrideURL != nil) ===")
         audioOptions = []
         subtitleOptions = []
         selectedSubtitleID = nil
@@ -4620,6 +4648,90 @@ final class PlayerViewModel: ObservableObject {
         return hasDV ? "Off" : nil
     }
 
+    /// The Video tab's left column: what this stream actually IS.
+    ///
+    /// Dynamic range is named PRECISELY — "Dolby Vision · Profile 8.1" rather
+    /// than a bare "DV" — because the profile decides which pipeline runs and
+    /// what the TV is actually being sent. HDR is read from the TRANSFER
+    /// FUNCTION rather than `formatDescription.dynamicRange`, which calls
+    /// anything 10-bit "HDR10" and is wrong on 10-bit SDR encodes.
+    func videoFormatRows() -> [(label: String, value: String)] {
+        var rows: [(label: String, value: String)] = []
+        let player = playerLayer?.player
+        let track = player?.tracks(mediaType: .video).first(where: \.isEnabled)
+            ?? player?.tracks(mediaType: .video).first
+
+        if let engine = dvDirectEngine {
+            let profile = engine.detectedDVProfile
+            if profile > 0, !engine.forceHDR10 {
+                rows.append(("Dynamic Range", profile == 7
+                    ? "Dolby Vision · Profile 7 → 8.1"
+                    : "Dolby Vision · Profile \(profile)"))
+                rows.append(("Output", "Native Dolby Vision"))
+            } else if engine.forceHDR10 {
+                rows.append(("Dynamic Range", "Dolby Vision · Profile 7 (FEL)"))
+                rows.append(("Output", "HDR10 base layer"))
+            } else {
+                rows.append(("Dynamic Range", "HDR10 / SDR — from the bitstream"))
+            }
+        } else if let track {
+            let trc = track.transferFunction
+            let isPQ = trc == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+            let isHLG = trc == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
+            if let dovi = track.dovi {
+                let profile = Int(dovi.dv_profile)
+                var name = "Dolby Vision · Profile \(profile)"
+                if profile == 8 { name += ".\(Int(dovi.dv_bl_signal_compatibility_id))" }
+                rows.append(("Dynamic Range", name))
+                rows.append(("Output", profile == 7 && !settings.dolbyVisionProfile7
+                    ? "HDR10 base layer (P7 conversion off)"
+                    : "HDR10 base layer"))
+            } else if hasHDR10Plus {
+                rows.append(("Dynamic Range", "HDR10+ · dynamic metadata"))
+            } else if isPQ {
+                rows.append(("Dynamic Range", "HDR10"))
+            } else if isHLG {
+                rows.append(("Dynamic Range", "HLG"))
+            } else {
+                rows.append(("Dynamic Range", trc == nil ? "SDR (stream carries no colour tags)" : "SDR"))
+            }
+        }
+
+        if let track {
+            rows.append(("Codec", Self.prettyVideoCodec(Self.codecName(track))))
+            let size = track.naturalSize
+            if size.width > 0 {
+                rows.append(("Resolution", "\(Int(size.width)) × \(Int(size.height))"))
+            }
+            if track.bitDepth > 0 { rows.append(("Bit Depth", "\(track.bitDepth)-bit")) }
+            if let primaries = track.colorPrimaries {
+                rows.append(("Primaries", Self.shortColorTag(primaries)))
+            }
+            if let transfer = track.transferFunction {
+                rows.append(("Transfer", Self.shortColorTag(transfer)))
+            }
+            if track.nominalFrameRate > 0 {
+                rows.append(("Frame Rate", String(format: "%.3g fps", track.nominalFrameRate)))
+            }
+            let bitrate = player?.dynamicInfo?.videoBitrate ?? Int(track.bitRate)
+            if bitrate > 0 {
+                rows.append(("Bitrate", String(format: "%.1f Mbps", Double(bitrate) / 1_000_000)))
+            }
+        } else if let engine = dvDirectEngine {
+            rows.append(("Codec", "HEVC"))
+            if engine.videoWidth > 0 {
+                rows.append(("Resolution", "\(engine.videoWidth) × \(engine.videoHeight)"))
+            }
+            if engine.videoFPS > 0 {
+                rows.append(("Frame Rate", String(format: "%.3g fps", engine.videoFPS)))
+            }
+            if engine.containerMbps > 0 {
+                rows.append(("Bitrate", String(format: "%.1f Mbps", engine.containerMbps)))
+            }
+        }
+        return rows
+    }
+
     /// The Infuse Info card's one-line file summary: runtime, then size,
     /// codec, "(4K DV)", audio, bitrate and frame rate — whatever's known.
     func infuseFileSummary() -> (runtime: String?, details: [String]) {
@@ -4836,6 +4948,23 @@ final class PlayerViewModel: ObservableObject {
         return MediaCacheServer.shared.coverageFraction(
             fromTimeFraction: clock.position / clock.duration
         )
+    }
+
+    /// Keeps `clock.cacheEnd` current while a cache session is live, at a
+    /// rate that has nothing to do with playback — the download runs whether
+    /// or not the picture is moving, and the bar has to say so.
+    private var cacheBandTask: Task<Void, Never>?
+
+    private func startCacheBandTicker() {
+        cacheBandTask?.cancel()
+        cacheBandTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let value = self.cacheBandEnd
+                if abs(self.clock.cacheEnd - value) > 0.0005 { self.clock.cacheEnd = value }
+                try? await Task.sleep(nanoseconds: 700_000_000)
+            }
+        }
     }
 
     /// The growing cache band on the transport, 0…1 of the film. While the
@@ -5848,6 +5977,8 @@ final class PlayerViewModel: ObservableObject {
         saveProgress()
         recordLinkVerdict()
         cacheTask?.cancel()
+        cacheBandTask?.cancel()
+        cacheBandTask = nil
         thumbnailTask?.cancel()
         thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
         thumbnailer = nil
@@ -5911,6 +6042,8 @@ final class PlayerViewModel: ObservableObject {
         MediaCacheServer.shared.endSession()
         saveProgress()
         cacheTask?.cancel()
+        cacheBandTask?.cancel()
+        cacheBandTask = nil
         thumbnailTask?.cancel()
         thumbnailer?.cancel()   // aborts its FFmpeg session, even mid-read
         thumbnailer = nil
@@ -6250,6 +6383,20 @@ final class PlayerViewModel: ObservableObject {
             // film (smaller than the threshold but final) still qualifies.
             let fresh = Self.subtractSpans(covered, minus: done)
                 .filter { $0.1 - $0.0 >= spacing * 2 || $0.1 >= runtime - spacing }
+            // STAND ASIDE WHEN THE CACHE IS LOSING. The preview pass opens a
+            // second reader on the same file and software-decodes 4K
+            // keyframes — its reads are served on the cache's own serial
+            // queue, so on a high-bitrate remux whose download is barely
+            // keeping ahead of playback it steals exactly the disk and CPU
+            // that playback needs. `bufferAhead` can't see this: it measures
+            // the ENGINE's buffer, which looks fine right up until the cache
+            // runs out from under it. The cache's own lead is the honest
+            // signal, so wait for real headroom before each pass.
+            let lead = MediaCacheServer.shared.readerLeadBytes
+            if lead < 128 * 1_048_576 {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                continue
+            }
             if let span = fresh.first {
                 let count = max(2, min(Int((span.1 - span.0) / spacing), 120))
                 let pass = ScrubThumbnailer(
