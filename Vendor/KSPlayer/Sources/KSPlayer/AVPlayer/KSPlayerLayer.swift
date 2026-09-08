@@ -705,16 +705,27 @@ extension KSPlayerLayer {
         else {
             return
         }
+        KSOptions.hostTrail?("KSPlayerLayer.audioInterrupted type=\(typeValue) state=\(state)")
         switch type {
         case .began:
+            // ONLY when playback is actually running. `pause()` clears
+            // `isAutoPlay`, and an interruption that arrives while the session
+            // is still starting up (activating the audio category can produce
+            // one) would therefore cancel the `play()` that `prepareToPlay`
+            // and `readyToPlay` are about to make — the title then sits there
+            // having never started. Stock KSPlayer masked that: its `.ended`
+            // branch called `play()` unconditionally and happened to rescue
+            // the startup case while also resurrecting deliberately paused
+            // films. Both halves are fixed here.
+            guard state.isPlaying else { break }
             pause()
 
         case .ended:
-            // Orivio: NO auto-resume. Stock KSPlayer called `play()` here
-            // whenever the system flagged `.shouldResume` — with no memory of
-            // whether playback was even running when the interruption began.
-            // Any ambient audio event (Siri, a route blip, a notification
-            // chime) that ended with that flag restarted a film the viewer had
+            // NO auto-resume. Stock KSPlayer called `play()` here whenever the
+            // system flagged `.shouldResume`, with no memory of whether
+            // playback was running when the interruption began — so any
+            // ambient audio event (Siri, a route blip, a notification chime)
+            // ending with that flag restarted a film the viewer had
             // deliberately paused. The host app's policy is "press play to
             // continue" (its own interruption handler pauses and never
             // resumes); the engine must not override it.
