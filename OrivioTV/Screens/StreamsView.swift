@@ -1071,20 +1071,39 @@ struct StreamsView: View {
         .focusSection()
     }
 
+    /// How many dead links one automatic flow will resolve through before
+    /// giving up and showing the manual list.
+    ///
+    /// The point is to EXHAUST the qualifying links rather than sample them:
+    /// `autoLinkPick` walks the preferred addon's links first, then the
+    /// secondary addon's, then anything else, and the pool it draws from has
+    /// already dropped everything below the minimum resolution (and over the
+    /// size cap, and uncached when cached-only is set). So "keep going until
+    /// nothing qualifies" is simply "keep going until the pool runs dry", and
+    /// this ceiling exists only so a title whose links are ALL dead can't
+    /// grind for minutes — each attempt is a debrid resolve over the network.
+    private static let autoFailoverLimit = 25
+
     /// After an AUTO-picked link fails to resolve, move on to the next
     /// candidate instead of surfacing the alert — "couldn't resolve" over the
     /// 'Finding the best source' screen, with playable alternates in hand,
     /// was the selector giving up one link too early (and dismissing the
     /// alert then dumped the viewer onto the manual list). Returns true when
     /// another candidate was dispatched; false → let the caller alert as a
-    /// last resort. Capped so a title whose links are ALL dead still fails
-    /// fast rather than grinding through dozens of resolves.
+    /// last resort.
+    ///
+    /// The old ceiling here was FOUR, which on a well-seeded title meant the
+    /// preferred addon was abandoned while it still had a dozen good links
+    /// left — the exact "it dropped to the backup addon too early" report.
     private func autoAdvance(after entry: StreamEntry, _ all: [StreamEntry]) -> Bool {
         // Only while an automatic flow is in charge; a manually tapped link
         // keeps its error alert.
         guard autoLinkResolving else { return false }
         autoTriedKeys.insert(entry.rejectionKey)
-        guard autoTriedKeys.count < 4 else { return false }
+        guard autoTriedKeys.count < Self.autoFailoverLimit else {
+            viewModel.stage("gave up after \(autoTriedKeys.count) dead links")
+            return false
+        }
         let prefs = profiles.activeAutoLink
         let next = prefs.enabled
             ? viewModel.autoLinkPick(prefs, excluding: autoTriedKeys)
@@ -1094,7 +1113,12 @@ struct StreamsView: View {
                 excluding: autoTriedKeys
             )
         guard let next else { return false }
-        viewModel.stage("auto-pick failed to resolve — trying \(next.addonName) instead")
+        // Name the addon AND the attempt: walking 15 links of one addon looks
+        // identical to a hang from the sofa otherwise.
+        let sameAddon = next.addonName == entry.addonName
+        viewModel.stage(sameAddon
+            ? "link \(autoTriedKeys.count) from \(next.addonName) failed — trying the next one"
+            : "\(entry.addonName) is out of links — switching to \(next.addonName)")
         handleSelection(next, all)
         return true
     }

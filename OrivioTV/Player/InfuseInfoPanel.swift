@@ -225,9 +225,15 @@ struct InfuseInfoPanel: View {
                         .font(.system(size: 27, weight: .bold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
-                    HStack(spacing: 20) {
+                    // WRAPPING, not clipped. As one `HStack … lineLimit(1)`
+                    // everything past the width of the column simply vanished —
+                    // on a well-described file that was the codec, the HDR tag,
+                    // the audio format and the bitrate, i.e. most of what the
+                    // card exists to say. It now flows onto as many rows as it
+                    // needs.
+                    InfuseWrapRow(spacing: 20, lineSpacing: 8) {
                         if let runtime = summary.runtime {
-                            Text(runtime).padding(.trailing, 60)
+                            Text(runtime)
                         }
                         ForEach(Array(summary.details.enumerated()), id: \.offset) { _, item in
                             Text(item)
@@ -282,6 +288,34 @@ struct InfuseInfoPanel: View {
     // MARK: Video tab
 
     private var videoTab: some View {
+        HStack(alignment: .top, spacing: 48) {
+            formatColumn
+            videoOptions
+        }
+        .padding(.vertical, 22)
+        .padding(.horizontal, 40)
+    }
+
+    /// What the stream IS, beside the controls that change how it's shown.
+    /// Read-only and non-focusable: it answers "am I actually getting Dolby
+    /// Vision / HDR10 / SDR, and which profile" without leaving the player.
+    private var formatColumn: some View {
+        let rows = viewModel.videoFormatRows()
+        return VStack(alignment: .leading, spacing: 0) {
+            InfuseColumnHeader(text: "Format")
+            if rows.isEmpty {
+                InfuseOptionRow(label: "Still identifying the stream…", value: nil, interactive: false)
+            } else {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    InfuseOptionRow(label: row.label, value: row.value, interactive: false)
+                }
+            }
+        }
+        .frame(width: 620, alignment: .leading)
+        .allowsHitTesting(false)
+    }
+
+    private var videoOptions: some View {
         optionsColumn(header: "Options") {
             optionRow("video.zoom", label: "Zoom Mode", value: zoomLabel(viewModel.aspectMode)) {
                 InfusePickerSpec(title: "Zoom Mode", content: .items(
@@ -344,9 +378,7 @@ struct InfuseInfoPanel: View {
                 InfuseOptionRow(label: "Dolby Vision", value: dolby, interactive: false)
             }
         }
-        .frame(width: 560)
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 22)
+        .frame(width: 560, alignment: .leading)
     }
 
     private static let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
@@ -671,6 +703,50 @@ private struct InfuseTabLabel: View {
                 }
             }
             .focusLift(OrivioFocus.card, isFocused)
+    }
+}
+
+/// A horizontal run of items that wraps onto further rows instead of being
+/// clipped. tvOS has no `FlowLayout`, and an `HStack` silently truncates —
+/// which is how the Info card came to hide half of what it had been given.
+struct InfuseWrapRow: Layout {
+    var spacing: CGFloat = 20
+    var lineSpacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache _: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, widest: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0, x + spacing + size.width > maxWidth {
+                widest = max(widest, x)
+                y += rowHeight + lineSpacing
+                x = 0
+                rowHeight = 0
+            }
+            x += (x > 0 ? spacing : 0) + size.width
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: min(max(widest, x), maxWidth), height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize,
+                       subviews: Subviews, cache _: inout ()) {
+        let maxWidth = proposal.width ?? bounds.width
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0, x + spacing + size.width > maxWidth {
+                y += rowHeight + lineSpacing
+                x = 0
+                rowHeight = 0
+            }
+            if x > 0 { x += spacing }
+            subview.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y),
+                          anchor: .topLeading, proposal: ProposedViewSize(size))
+            x += size.width
+            rowHeight = max(rowHeight, size.height)
+        }
     }
 }
 
