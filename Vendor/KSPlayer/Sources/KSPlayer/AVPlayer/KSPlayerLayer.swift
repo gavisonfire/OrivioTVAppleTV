@@ -314,6 +314,11 @@ open class KSPlayerLayer: NSObject {
     }
 
     open func pause() {
+        // ORIVIO PATCH: symbolicating the call stack costs milliseconds; only
+        // pay it when a trail sink is installed (`-pipProbe`).
+        if let trail = KSOptions.hostTrail {
+            trail("KSPlayerLayer.pause from: " + Thread.callStackSymbols.dropFirst().prefix(6).map { String($0.split(separator: " ", omittingEmptySubsequences: true).dropFirst(3).prefix(2).joined(separator: " ")) }.joined(separator: " | "))
+        }
         isAutoPlay = false
         player.pause()
         timer.fireDate = Date.distantFuture
@@ -660,6 +665,11 @@ extension KSPlayerLayer {
         if #available(tvOS 14.0, *), player.pipController?.isPictureInPictureActive == true {
             return
         }
+        // Orivio: the host app drives PiP with its own controller (the engine's
+        // own pipController above is never used there), so ask it too.
+        if KSOptions.hostPictureInPictureActive?() == true {
+            return
+        }
 
         if KSOptions.canBackgroundPlay {
             player.enterBackground()
@@ -700,13 +710,15 @@ extension KSPlayerLayer {
             pause()
 
         case .ended:
-            // An interruption ended. Resume playback, if appropriate.
-
-            guard let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt else { return }
-            let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-            if options.contains(.shouldResume) {
-                play()
-            }
+            // Orivio: NO auto-resume. Stock KSPlayer called `play()` here
+            // whenever the system flagged `.shouldResume` — with no memory of
+            // whether playback was even running when the interruption began.
+            // Any ambient audio event (Siri, a route blip, a notification
+            // chime) that ended with that flag restarted a film the viewer had
+            // deliberately paused. The host app's policy is "press play to
+            // continue" (its own interruption handler pauses and never
+            // resumes); the engine must not override it.
+            break
 
         default:
             break
