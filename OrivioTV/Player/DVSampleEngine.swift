@@ -146,6 +146,71 @@ final class DVSampleEngine {
 
     var isPlaying: Bool { synchronizer.rate > 0 }
 
+    /// How far ahead this engine has read — its answer to KSPlayer's
+    /// `playableTime`.
+    ///
+    /// Not cosmetic. `PlayerViewModel.buffered` was only ever written from
+    /// `layer.player.playableTime`, so on a DV-direct session it stayed at
+    /// ZERO for the whole film, and everything gated on buffer health silently
+    /// never ran — including the scrub-preview thumbnailer, whose
+    /// `shouldProceed` asks for eight seconds of buffer before decoding a
+    /// frame. Measured on the device: `coarse=0 fine=0` for an entire session
+    /// with the cache gate PASSING and 541 seconds of road ahead. The preview
+    /// window "not showing up" was this, and it was invisible because it only
+    /// happens on one engine.
+    ///
+    /// MEASURED AT THE DEMUXER, not at the renderer. The first version of this
+    /// returned `lastRenderedEnd` — what has been handed to
+    /// `AVSampleBufferDisplayLayer` — which reports about two seconds and never
+    /// more, because the layer stops asking once it is satisfied. Against an
+    /// eight-second gate that is just a slower way of never passing, and the
+    /// probe said so: `engineBuffer=2s ahead (gate 8s → BLOCKED)` with the disk
+    /// cache SIX MINUTES in front. `playableTime` means "how much have you
+    /// read", and the demuxer's own queue is the honest equivalent.
+    var bufferedUpTo: Double { max(lastQueuedVideoPTS, lastRenderedEnd) }
+
+    /// Live state for the `/live` probe's `[dv]` block.
+    ///
+    /// Everything this engine knows about itself already existed — queue
+    /// depths, renderer readiness, the vsync census, the demux feed rate — and
+    /// all of it went to `dvDiag`, i.e. NSLog, i.e. a console-attached device.
+    /// That is precisely the setup the live probe exists to avoid, so a DV
+    /// session was the one engine you could not watch over the network. These
+    /// are the numbers that distinguish the failures that all look identical
+    /// from the sofa: a frozen picture with the clock running (renderer
+    /// wedged), a frozen picture with the clock stopped (demuxer starved), and
+    /// a stutter (vsync damage).
+    var probeLines: [String] {
+        queueLock.lock()
+        let vq = videoQueue.count
+        let aq = audioQueue.count
+        let eof = demuxEOF
+        queueLock.unlock()
+        let clock = CMTimeGetSeconds(synchronizer.currentTime())
+        let layerStatus: String
+        switch displayLayer.status {
+        case .failed: layerStatus = "FAILED(\(displayLayer.error?.localizedDescription ?? "?"))"
+        case .rendering: layerStatus = "rendering"
+        case .unknown: layerStatus = "unknown"
+        @unknown default: layerStatus = "?"
+        }
+        return [
+            String(format: "clock=%.1f rate=%.2f queues v=%d/%d a=%d/%d eof=%@",
+                   clock, synchronizer.rate, vq, videoQueueCap, aq, audioQueueCap, eof.probe),
+            "layer=\(layerStatus)"
+                + " vReady=\(displayLayer.isReadyForMoreMediaData.probe)"
+                + " aReady=\(audioRenderer.isReadyForMoreMediaData.probe)"
+                + String(format: " demuxed=%.0fMB", Double(bytesDemuxed) / 1_048_576),
+            String(format: "queuedV=%.1f queuedA=%.1f rendered=%.1f (lead %.1fs)",
+                   lastQueuedVideoPTS, lastQueuedAudioPTS, lastRenderedEnd,
+                   max(lastQueuedVideoPTS - clock, 0)),
+            lastVsyncCensus.isEmpty ? "vsync: no census yet (needs 10s of playback)" : lastVsyncCensus,
+            "audioTrack=\(desiredAudioIndex) subTrack=\(activeSubtitleIndex)"
+                + " seekGen=\(seekGeneration)"
+                + " pendingSeek=\(pendingSeekTo < 0 ? "-" : String(format: "%.1f", pendingSeekTo))",
+        ]
+    }
+
     // MARK: Internals
 
     private let inputURLString: String
@@ -215,8 +280,29 @@ final class DVSampleEngine {
     /// of 48 (two seconds!) made every multi-second network dip an underrun,
     /// and the live probe showed exactly that: vq sawtoothing 48→0 with the
     /// clock flapping 0.22↔1.00 (the reported stop-go).
-    private var videoQueueCap: Int { vtDecodeAhead ? 120 : 240 }
-    private let audioQueueCap = 96
+    /// Tiered: a 4K DV AU is ~0.3-0.7 MB, so 120 of them is 31-80 MB of
+    /// compressed video held at once — on a 3 GB Apple TV that is a large
+    /// slice of the budget, and NONE of these caps had a performance-tier
+    /// branch even though the KSPlayer path budgets the same resource by tier.
+    private var videoQueueCap: Int {
+        let full = vtDecodeAhead ? 120 : 240
+        if PerformanceProfile.isLowPower { return full / 3 }
+        if PerformanceProfile.isMidPower { return full / 2 }
+        return full
+    }
+    /// Post-PCM-batching each buffer is ~0.25s, so 96 is ~24s of audio — far
+    /// past the cushion this was sized for, and it blocks the demux thread
+    /// before the video queue can fill (which is what made the deeper underrun
+    /// cushions unreachable on E-AC3/AAC titles).
+    private var audioQueueCap: Int {
+        PerformanceProfile.isLowPower || PerformanceProfile.isMidPower ? 48 : 96
+    }
+
+    /// Audio buffers the underrun hold insists on before it will restart the
+    /// clock. Named because `enqueueBounded` has to guarantee this number is
+    /// REACHABLE — a cushion the demuxer has parked itself out of reach of is
+    /// a hold that never lifts.
+    static let audioResumeCushion = 4
 
     /// MKV timestamps are in MILLISECONDS; a 23.976fps frame lasts 41.708ms.
     /// Stamped raw, every frame's PTS lands up to 0.5ms off the panel's frame
@@ -413,6 +499,9 @@ final class DVSampleEngine {
     /// for as long as the movie sat at its end. That is the app locking up when
     /// a film finishes: not a missing case, a repeating one.
     private var didSignalEnd = false
+    /// Bumped by every seek/re-arm, so an end signal already scheduled on its
+    /// drain delay can tell it has been overtaken and stay silent.
+    @Atomic private var endSignalGeneration = 0
 
     /// End (PTS + duration) of the last sample handed to a RENDERER, on the
     /// synchronizer's timeline. Written on `feedQueue`, read on `feedQueue`
@@ -464,8 +553,14 @@ final class DVSampleEngine {
             if !remaining.isFinite { remaining = 0 }
             remaining = min(max(remaining, 0), 5)
         }
+        // The drain wait is not cancellable, so it carries a generation: a
+        // seek inside the window (rewinding to rewatch an ending) used to let
+        // the stale block fire anyway — the title was marked ended and Up
+        // Next counted down mid-rewind.
+        let generation = endSignalGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
-            self?.onEnded?()
+            guard let self, self.endSignalGeneration == generation else { return }
+            self.onEnded?()
         }
     }
 
@@ -503,6 +598,7 @@ final class DVSampleEngine {
         feedQueue.async { [weak self] in
             guard let self, !self.cancelled else { return }
             self.didSignalEnd = false
+            self.endSignalGeneration += 1
             // Nothing the renderers held survives the seek's flush.
             self.lastRenderedEnd = 0
             self.installFeeders()
@@ -608,6 +704,11 @@ final class DVSampleEngine {
     private var autoPaused = false
     private var playbackClockStarted = false
     private let startupVideoPreroll = 18
+    /// A SEEK's preroll, and deliberately shorter than a cold start's: the
+    /// decoders, the renderers and the connection are all already warm, so the
+    /// only thing being waited for is enough decoded video that the clock
+    /// won't underrun the moment it starts.
+    private let seekVideoPreroll = 10
 
     /// Cushion required before resuming from an underrun. The old flat 16
     /// (0.7s) meant each resume ran dry again within seconds on a feed
@@ -651,10 +752,26 @@ final class DVSampleEngine {
         // now (a debrid link warming up) — each one demands a deeper cushion,
         // up to the full buffer, so a cold link produces one honest buffering
         // pause instead of a minute of stop-go machine-gunning.
+        // Every value here is compared against `videoQueue.count`, which stays
+        // at or near `videoQueueCap` (`enqueueBounded` allows a small fixed
+        // overshoot when the audio queue is starving, never more) — so a
+        // cushion at or above the cap is arithmetically unreachable and the
+        // hold becomes PERMANENT: the queues sit full, the demuxer blocks,
+        // `onBuffering(true)` is never cleared, and the stall watchdog
+        // abandons a perfectly good link.
+        // With decode-ahead on (always) the cap is 120, so the old 192/240
+        // rungs could never be met. Clamp to what the queue can actually hold,
+        // leaving headroom for the audio queue to block the demuxer first.
+        let ceiling = max(24, videoQueueCap - 8)
         if recentUnderruns <= 1 {
-            return Date().timeIntervalSince(autoPausedAt) > 4 ? 24 : 120
+            return Date().timeIntervalSince(autoPausedAt) > 4 ? 24 : min(120, ceiling)
         }
-        return min(24 << min(recentUnderruns, 4), 240)   // 96, 192, 240…
+        // A hold that has already lasted a while stops escalating — the point
+        // is one honest pause, not an unreachable target. `recentUnderruns` is
+        // only reset on ENTERING a hold, so without this a long hold keeps the
+        // deepest cushion forever.
+        if Date().timeIntervalSince(autoPausedAt) > 20 { return min(48, ceiling) }
+        return min(24 << min(recentUnderruns, 4), ceiling)
     }
 
     func play() {
@@ -694,9 +811,17 @@ final class DVSampleEngine {
         recentUnderruns = 0
         lastUnderrunAt = .distantPast
         seekRefill = true
+        // An end signal waiting out its drain delay belongs to the position
+        // this seek is leaving.
+        endSignalGeneration += 1
         // The renderers are about to be flushed, so nothing they held counts
-        // towards the end-of-stream drain wait any more.
+        // towards the end-of-stream drain wait any more — and neither does the
+        // DEMUXER's old read-ahead: `bufferedUpTo` kept reporting the pre-seek
+        // frontier (an hour of "buffer" after a long rewind), which opened the
+        // preview passes' health gates during exactly the post-seek refill
+        // they exist to stand down for.
         lastRenderedEnd = 0
+        lastQueuedVideoPTS = target
         queueLock.lock()
         videoQueue.removeAll()
         audioQueue.removeAll()
@@ -717,9 +842,29 @@ final class DVSampleEngine {
         vtFlush()
         displayLayer.flush()
         audioRenderer.flush()
-        let targetRate = playbackClockStarted && !autoPaused && userRate > 0 ? userRate : 0
-        synchronizer.setRate(targetRate,
-                             time: CMTime(seconds: target, preferredTimescale: 90000))
+        // HOLD THE CLOCK AT THE TARGET until the refill actually arrives —
+        // the cold-start preroll gate, re-armed.
+        //
+        // This used to start the rate right here, which ran the clock over
+        // queues that were emptied three lines above while the demux thread
+        // was still doing an `av_seek_frame` across the network and then
+        // decoding the keyframe LEAD-IN. Every millisecond of that is clock
+        // drift past the target, and it is worst on a BACKWARD seek, where
+        // the run from the preceding keyframe is longest. The frames that
+        // finally arrive carry PTS at the target — by then in the clock's
+        // PAST — so the display layer burns through them to catch up: the
+        // picture lands where you aimed and then fast-forwards away from it.
+        //
+        // The underrun watchdog could not rescue this either. It holds at
+        // `currentTime()`, which is already target-plus-drift, so the clock
+        // never came back to where the seek aimed.
+        //
+        // At rate 0 the clock cannot drift, so when the gate finally starts
+        // it `currentTime()` is still exactly the target.
+        playbackClockStarted = false
+        autoPaused = false
+        synchronizer.setRate(0, time: CMTime(seconds: target, preferredTimescale: 90000))
+        onBuffering?(true)
     }
 
     func stop() {
@@ -1116,12 +1261,30 @@ final class DVSampleEngine {
                 // when a real cushion is back. Hysteresis (enter at empty,
                 // exit at 16 AUs ≈ two-thirds of a second) prevents flapping.
                 self.queueLock.lock()
-                let depth = self.videoQueue.count
+                // COUNT ONLY WHAT CAN ACTUALLY BE SHOWN.
+                //
+                // A seek lands on the keyframe BEFORE the target, and that
+                // lead-in is decoded and flagged do-not-display so playback
+                // resumes exactly where it was aimed. Those frames still sit in
+                // the queue though, and counting them satisfied the preroll gate
+                // on content that will never reach the screen: the clock started
+                // with a queue that was mostly lead-in, ran out within a frame or
+                // two of the target, and the picture froze while the refill it
+                // was supposed to have waited for arrived. That is the "+/-10s
+                // freezes while it loads" report, and it is worst on a backward
+                // skip, where the run from the preceding keyframe is longest.
+                let seekTarget = self.pendingSeekTo
+                let depth = self.seekRefill && seekTarget >= 0
+                    ? self.videoQueue.count(where: {
+                        CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp($0)) >= seekTarget - 0.05
+                      })
+                    : self.videoQueue.count
                 let aqDepth = self.audioQueue.count
                 let eof = self.demuxEOF
                 self.queueLock.unlock()
                 if !self.playbackClockStarted {
-                    if depth >= self.startupVideoPreroll || eof {
+                    let preroll = self.seekRefill ? self.seekVideoPreroll : self.startupVideoPreroll
+                    if depth >= preroll || eof {
                         self.playbackClockStarted = true
                         self.autoPaused = false
                         if self.userRate > 0 {
@@ -1169,7 +1332,8 @@ final class DVSampleEngine {
                     // the stuck spinner at the end of a film this branch exists
                     // to prevent.
                     let cushionMet = eof
-                        || (depth >= self.underrunResumeDepth(eof: eof) && aqDepth >= 4)
+                        || (depth >= self.underrunResumeDepth(eof: eof)
+                            && aqDepth >= Self.audioResumeCushion)
                     if cushionMet {
                         self.autoPaused = false
                         self.seekRefill = false
@@ -1337,7 +1501,18 @@ final class DVSampleEngine {
                 if activeSub >= 0, let ictxL = liveFormatCtx,
                    let stream = ictxL.pointee.streams[Int(activeSub)] {
                     let stb = stream.pointee.time_base
+                    // Only cues that can still reach the screen. The backlog
+                    // holds ~90s of every subtitle stream, and this loop is the
+                    // one feeding the picture: decoding every expired cue of a
+                    // bitmap track here — each one a PGS bitmap — stalled the
+                    // demux for long enough that the picture dropped out on a
+                    // track switch. A cue whose end is already behind the
+                    // playhead has nothing to show.
+                    let playhead = position
                     for stored in subPacketBuffer where stored.stream == activeSub {
+                        let length = stored.duration > 0
+                            ? Double(stored.duration) * av_q2d(stb) : 6
+                        guard stored.ptsSeconds + length >= playhead - 1 else { continue }
                         replayStoredSubPacket(stored, tb: stb)
                     }
                 }
@@ -1447,7 +1622,10 @@ final class DVSampleEngine {
     private var audioPTSSeen = 0
     private var audioPTSGaps = 0
     private var audioPTSWorstGap: Double = 0
-    private var lastQueuedVideoPTS: Double = 0
+    /// Read from the display-link thread and from main as well as written on
+    /// the demux thread — it was already crossing threads before either of
+    /// those readers existed.
+    @Atomic private var lastQueuedVideoPTS: Double = 0
     private var lastQueuedAudioPTS: Double = 0
 
     private func censusAudioPTS(_ sample: CMSampleBuffer) {
@@ -1476,9 +1654,68 @@ final class DVSampleEngine {
             censusAudioPTS(sample)
         }
         queueLock.lock()
-        while !cancelled, seekGeneration == generation,
-              (isVideo ? videoQueue.count >= videoQueueCap
-                       : audioQueue.count >= audioQueueCap) {
+        // NEVER PARK THIS THREAD ON A FULL QUEUE WHILE THE OTHER ONE IS
+        // STARVING.
+        //
+        // One demux thread feeds both queues, so a wait here stops BOTH. That
+        // is a livelock whenever the queue being waited on can only drain once
+        // the other queue is fed, and after a seek it is the normal case:
+        //
+        //   1. audio runs dry → the underrun hold stops the clock
+        //   2. nothing consumes video, so the video queue stays full
+        //   3. this loop parks the demux thread on the full video queue
+        //   4. no audio is produced, so the hold's exit cushion
+        //      (`aqDepth >= audioResumeCushion`) can never be met
+        //   5. never recovers
+        //
+        // Caught on a 4K DV seek: v=60/60, a=0/48, rate=0.00, pendingSeek
+        // unresolved — frozen until the 20s stall watchdog gave up, and
+        // because `attemptFailover` routes a DV session into
+        // `fallBackFromDirect`, the film finished on FFmpeg with Dolby Vision
+        // gone for good. The link and the cache were both healthy throughout
+        // (84s of read-ahead on disk, still writing).
+        //
+        // `underrunResumeDepth` already clamps the VIDEO cushion to keep it
+        // reachable, noting it leaves "headroom for the audio queue to block
+        // the demuxer first". That holds while audio fills first; a seek with
+        // video decode-ahead fills video first and inverts it. This closes the
+        // other half.
+        //
+        // Bounded twice: the exemption only applies while the other queue is
+        // actually below what the restart needs, and a hard ceiling stops a
+        // degenerate stream (no audio track at all, a renderer that has
+        // genuinely stopped) from growing the queue without limit.
+        //
+        // The ceiling is a FIXED overshoot rather than a multiple of the cap.
+        // The job is to walk far enough through an interleaved stream to reach
+        // the other track's next packets — a handful of samples — and a
+        // multiplier would have meant another 120 compressed 4K access units
+        // on the full-power tier, on the box that is already the one being
+        // jetsammed.
+        let cap = isVideo ? videoQueueCap : audioQueueCap
+        let hardCeiling = cap + 32
+        while !cancelled, seekGeneration == generation {
+            let count = isVideo ? videoQueue.count : audioQueue.count
+            guard count >= cap else { break }
+            // Feeding the starved side is worth going over cap for; it is the
+            // only thing that can unblock this side.
+            let otherStarving = isVideo
+                ? audioQueue.count < Self.audioResumeCushion
+                : videoQueue.isEmpty
+            if otherStarving, count < hardCeiling {
+                // Only on the FIRST overshoot of an episode — this is the
+                // demux hot path, and the interesting fact is that the
+                // exemption engaged at all, not each of the ~32 samples it
+                // then lets through.
+                if count == cap {
+                    PlayerProbe.event("dv", "queue exemption — \(isVideo ? "video" : "audio")"
+                        + " at cap \(cap) while the other side is starving"
+                        + " (v=\(videoQueue.count) a=\(audioQueue.count)); feeding past cap"
+                        + " so the underrun hold can lift")
+                    PlayerProbe.count("dv.queue-exempt")
+                }
+                break
+            }
             queueLock.wait(until: Date().addingTimeInterval(0.25))
         }
         if !cancelled, seekGeneration == generation {
@@ -1924,7 +2161,14 @@ final class DVSampleEngine {
     /// Display-order safety margin: never release a frame until this many
     /// are decoded and waiting (covers reorder depth 8) — except at EOF.
     private let reorderHoldback = 8
-    private let decodedCap = 12
+    /// Each entry retains a decoded `CVImageBuffer`: ~25 MB for 4K 10-bit
+    /// 4:2:0. Twelve of those is ~300 MB held for the whole session, which is
+    /// most of what jetsams a 3 GB Apple TV mid-film. Tiered to sit just above
+    /// `reorderHoldback` on the constrained boxes (the KSPlayer path already
+    /// budgets its frame pool this way; this engine never did).
+    private var decodedCap: Int {
+        PerformanceProfile.isLowPower || PerformanceProfile.isMidPower ? reorderHoldback + 2 : 12
+    }
     /// Guarded by `decodedLock` (see `vtSession`).
     private var displayFormatCache: CMFormatDescription?
 
@@ -2150,11 +2394,19 @@ final class DVSampleEngine {
     }
 
     // Decode-pacing probe (feedQueue thread): the display layer pulls a new
-    // sample only when its internal decoder has room — the pull cadence IS
-    // the decoder's pacing. A pull gap much longer than a frame while our
-    // queue is full means the DECODER fell behind and the layer repeated a
-    // frame on screen: the one stutter mechanism invisible to every clock/
-    // queue/vsync probe. Reported per ~10s through the vsync probe line.
+    // sample only when its internal decoder has room, so the pull cadence IS
+    // the decoder's pacing — but ONLY while the layer is nearly dry. A layer
+    // holding two seconds of video is *supposed* to go quiet for two seconds,
+    // and counting that recorded 15 "stalls" with a worst of 1525ms on a
+    // session whose picture was perfect, which is worse than no metric at all:
+    // it reads as a fault and sent a whole diagnostic session down the wrong
+    // path. Gated on the renderer being within `pullGapDryAhead` of empty, it
+    // means what the rest of this comment claims — the decoder fell behind and
+    // the layer repeated a frame on screen. Reported per ~10s in the vsync
+    // line.
+    /// A renderer holding more than this much video is entitled to go quiet;
+    /// only a gap below it says the decoder is behind.
+    private static let pullGapDryAhead: Double = 0.5
     private var lastVideoPullAt: CFAbsoluteTime = 0
     @Atomic private var pullGapCount = 0        // gaps > 100ms this window
     @Atomic private var pullGapWorstMs = 0      // worst gap this window
@@ -2164,7 +2416,8 @@ final class DVSampleEngine {
             let now = CFAbsoluteTimeGetCurrent()
             if lastVideoPullAt > 0, synchronizer.rate > 0 {
                 let gapMs = Int((now - lastVideoPullAt) * 1000)
-                if gapMs > 100 {
+                let dry = lastRenderedEnd - CMTimeGetSeconds(synchronizer.currentTime())
+                if gapMs > 100, dry < Self.pullGapDryAhead {
                     // Locked read-modify-write: `+=` on an @Atomic is two
                     // separate locked accesses, so main's 10s reset could land
                     // between them and swallow this gap.
@@ -2180,7 +2433,8 @@ final class DVSampleEngine {
             let now = CFAbsoluteTimeGetCurrent()
             if lastVideoPullAt > 0, synchronizer.rate > 0 {
                 let gapMs = Int((now - lastVideoPullAt) * 1000)
-                if gapMs > 100 {
+                let dry = lastRenderedEnd - CMTimeGetSeconds(synchronizer.currentTime())
+                if gapMs > 100, dry < Self.pullGapDryAhead {
                     // Locked read-modify-write: `+=` on an @Atomic is two
                     // separate locked accesses, so main's 10s reset could land
                     // between them and swallow this gap.

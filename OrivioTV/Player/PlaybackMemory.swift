@@ -82,6 +82,8 @@ struct TitleMemory: Codable {
     /// Subtitle language, or "off" for an explicit off choice.
     var subtitleLanguage: String?
     var speed: Float?
+    /// Lip-sync offset in seconds (+ = voices later). nil = none set.
+    var audioSyncOffset: Double?
     var updatedAt = Date()
 }
 
@@ -89,10 +91,30 @@ enum PlaybackMemory {
     private static let key = "orivio.player.titleMemory.v1"
     private static let limit = 200
 
+    /// In-process mirror of the persisted table.
+    ///
+    /// `loadAll()` is a UserDefaults read plus a JSON decode of up to two
+    /// hundred entries, and it was being paid per QUESTION rather than per
+    /// session: twice in the same expression while the direct DV engine is
+    /// being constructed (once for the audio language, once for the track
+    /// label) — on the critical path of opening a stream — plus once per load,
+    /// once per subtitle wave, and once per VLC track wave. This process is the
+    /// only writer, so a mirror can never go stale: every mutation goes through
+    /// `saveAll`, which refreshes it.
+    private nonisolated(unsafe) static var mirror: [String: TitleMemory]?
+    private static let mirrorLock = NSLock()
+
     private static func loadAll() -> [String: TitleMemory] {
+        mirrorLock.lock()
+        defer { mirrorLock.unlock() }
+        if let mirror { return mirror }
         guard let data = UserDefaults.standard.data(forKey: key),
               let decoded = try? JSONDecoder().decode([String: TitleMemory].self, from: data)
-        else { return [:] }
+        else {
+            mirror = [:]
+            return [:]
+        }
+        mirror = decoded
         return decoded
     }
 
@@ -103,6 +125,9 @@ enum PlaybackMemory {
             let keep = all.sorted { $0.value.updatedAt > $1.value.updatedAt }.prefix(limit)
             all = Dictionary(uniqueKeysWithValues: Array(keep))
         }
+        mirrorLock.lock()
+        mirror = all
+        mirrorLock.unlock()
         if let data = try? JSONEncoder().encode(all) {
             UserDefaults.standard.set(data, forKey: key)
         }

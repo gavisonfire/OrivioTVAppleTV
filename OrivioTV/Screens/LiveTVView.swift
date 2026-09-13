@@ -10,6 +10,47 @@ struct LiveChannel: Identifiable, Hashable {
     /// Direct stream URL (from the embedded M3U). nil → resolve via `meta`.
     let directURL: String?
     let meta: MetaItem?
+    /// Headers / manifest type / DRM the playlist declared for this channel.
+    /// Carried all the way to the player — a CDN that checks `User-Agent` or
+    /// `Referer` returns 403 without them and the channel looks dead.
+    var options: LiveStreamOptions = LiveStreamOptions()
+
+    /// The storable form, for the favourites list.
+    var favorite: FavoriteChannel {
+        FavoriteChannel(id: id, name: name, logo: logo, group: group,
+                        directURL: directURL, metaID: meta?.id, metaType: meta?.type,
+                        options: options)
+    }
+
+    /// Rebuild a playable channel from a stored favourite. An add-on channel
+    /// keeps only enough of its `MetaItem` to be handed back to the source
+    /// picker, which re-fetches the real meta anyway.
+    init(_ favorite: FavoriteChannel) {
+        id = favorite.id
+        name = favorite.name
+        logo = favorite.logo
+        group = favorite.group
+        directURL = favorite.directURL
+        options = favorite.options ?? LiveStreamOptions()
+        if let metaID = favorite.metaID {
+            meta = MetaItem(id: metaID, type: favorite.metaType ?? "tv",
+                            name: favorite.name, poster: favorite.logo)
+        } else {
+            meta = nil
+        }
+    }
+
+    init(id: String, name: String, logo: String?, group: String,
+         directURL: String?, meta: MetaItem?,
+         options: LiveStreamOptions = LiveStreamOptions()) {
+        self.id = id
+        self.name = name
+        self.logo = logo
+        self.group = group
+        self.directURL = directURL
+        self.meta = meta
+        self.options = options
+    }
 }
 
 /// Live TV / IPTV tab. Merges two sources: `tv`-type catalogs from installed
@@ -35,7 +76,11 @@ final class LiveTVViewModel: ObservableObject {
         await load(addonManager: addonManager)
         // A load cancelled by `onDisappear` (tapping a channel mid-load) must
         // not latch: it dropped the IPTV list for the rest of the visit.
-        if Task.isCancelled { loaded = false }
+        // Neither may a load that came back with NOTHING — a network blip at
+        // tab-open latched an empty screen for the whole session, with no
+        // retry control anywhere. Empty-and-latched means the next visit
+        // simply tries again; a genuinely empty setup re-fetches cheaply.
+        if Task.isCancelled || sections.isEmpty { loaded = false }
     }
 
     /// Two settings changes in quick succession (country, then language)
@@ -119,7 +164,8 @@ final class LiveTVViewModel: ObservableObject {
         for c in channels {
             if byGroup[c.group] == nil { order.append(c.group) }
             byGroup[c.group, default: []].append(
-                LiveChannel(id: c.id, name: c.name, logo: c.logo, group: c.group, directURL: c.url, meta: nil)
+                LiveChannel(id: c.id, name: c.name, logo: c.logo, group: c.group,
+                            directURL: c.url, meta: nil, options: c.options)
             )
         }
         return order.map { g in Section(id: "iptv|\(g)", title: g, channels: byGroup[g] ?? []) }
@@ -144,6 +190,7 @@ struct LiveTVView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var addonManager: AddonManager
     @ObservedObject private var liveSettings = LiveTVSettingsStore.shared
+    @ObservedObject private var favorites = LiveChannelFavorites.shared
     @StateObject private var viewModel = LiveTVViewModel()
 
     /// Add-on channel → source picker.
@@ -225,6 +272,9 @@ struct LiveTVView: View {
                         gridContext
                         filteredGrid
                     } else {
+                        // Favourites first, above every other group — that is
+                        // the whole point of favouriting a channel.
+                        favoritesRow
                         ForEach(viewModel.sections) { section in
                             channelRow(section)
                         }
@@ -293,9 +343,23 @@ struct LiveTVView: View {
         .padding(.horizontal, OrivioSpacing.huge)
     }
 
+    /// Most rows a filtered grid will hand SwiftUI. LazyVGrid materializes
+    /// few cells, but `ForEach` still builds and diffs the full identifier
+    /// collection every keystroke — five figures of ids per key press on the
+    /// iptv-org list was real per-keystroke cost on the A8/A10X, for rows
+    /// nobody scrolls 400 cards deep to find. Narrowing the search shows the
+    /// rest.
+    private static let gridDisplayCap = 400
+
     private var filteredGrid: some View {
-        Group {
-            if displayChannels.isEmpty {
+        // Evaluated ONCE per render: the computed property flat-maps, dedupes
+        // and (searching) filters the whole merged pool — five figures of
+        // channels on the iptv-org list — and it was being run twice per body
+        // pass, which read as per-keystroke jank on the A10X.
+        let shown = displayChannels
+        let capped = shown.count > Self.gridDisplayCap ? Array(shown.prefix(Self.gridDisplayCap)) : shown
+        return Group {
+            if shown.isEmpty {
                 Text(searchText.isEmpty ? "No channels in this group." : "No channels match “\(searchText)”.")
                     .font(.system(size: 22))
                     .foregroundStyle(theme.palette.textSecondary)
@@ -307,15 +371,55 @@ struct LiveTVView: View {
                     alignment: .leading,
                     spacing: OrivioSpacing.xl
                 ) {
-                    ForEach(displayChannels) { channel in
+                    ForEach(capped) { channel in
                         Button { play(channel) } label: {
-                            ChannelCard(channel: channel)
+                            ChannelCard(channel: channel,
+                                        isFavorite: favorites.isFavorite(channel.id))
                         }
                         .buttonStyle(PlainCardButtonStyle())
                         .onPlayPauseCommand { play(channel) }
+                        .channelHoldMenu(channel.favorite)
                     }
                 }
                 .padding(.horizontal, OrivioSpacing.huge)
+                if shown.count > capped.count {
+                    Text("Showing the first \(capped.count) of \(shown.count) channels — keep typing to narrow the search.")
+                        .font(.system(size: 22))
+                        .foregroundStyle(theme.palette.textSecondary)
+                        .padding(.horizontal, OrivioSpacing.huge)
+                }
+            }
+        }
+    }
+
+    /// The pinned Favourites row. Built from the STORED snapshots, not from
+    /// `viewModel.sections`, so it is on screen immediately — before the
+    /// several-megabyte IPTV playlist has finished loading, and even if the
+    /// channel's own group has since disappeared from the playlist.
+    @ViewBuilder
+    private var favoritesRow: some View {
+        if !favorites.channels.isEmpty {
+            VStack(alignment: .leading, spacing: OrivioSpacing.md) {
+                HStack(alignment: .firstTextBaseline) {
+                    RowHeader(title: "Favorites")
+                    Spacer()
+                }
+                ScrollView(.horizontal) {
+                    LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
+                        ForEach(favorites.channels) { favorite in
+                            let channel = LiveChannel(favorite)
+                            Button { play(channel) } label: {
+                                ChannelCard(channel: channel, isFavorite: true)
+                            }
+                            .buttonStyle(PlainCardButtonStyle())
+                            .onPlayPauseCommand { play(channel) }
+                            .channelHoldMenu(favorite)
+                        }
+                    }
+                    .padding(.horizontal, OrivioSpacing.huge)
+                    .padding(.vertical, OrivioSpacing.lg)
+                }
+                .scrollClipDisabled()
             }
         }
     }
@@ -336,10 +440,12 @@ struct LiveTVView: View {
                 LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
                     ForEach(Self.uniqueByID(section.channels.prefix(40))) { channel in
                         Button { play(channel) } label: {
-                            ChannelCard(channel: channel)
+                            ChannelCard(channel: channel,
+                                        isFavorite: favorites.isFavorite(channel.id))
                         }
                         .buttonStyle(PlainCardButtonStyle())
                         .onPlayPauseCommand { play(channel) }
+                        .channelHoldMenu(channel.favorite)
                     }
                 }
                 .padding(.horizontal, OrivioSpacing.huge)
@@ -356,12 +462,18 @@ struct LiveTVView: View {
 /// every one in the row. Focus visuals come through \.isFocused, which
 /// bypasses the == gate.
 private struct ChannelCard: View, Equatable {
-    static func == (lhs: Self, rhs: Self) -> Bool { lhs.channel == rhs.channel }
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.channel == rhs.channel && lhs.isFavorite == rhs.isFavorite
+    }
 
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @Environment(\.isFocused) private var isFocused
     let channel: LiveChannel
+    /// Passed IN rather than read from the store here: this view's `==` is
+    /// what lets a focus step skip unchanged tiles, so anything that changes
+    /// what it draws has to be part of the comparison.
+    var isFavorite: Bool = false
 
     private let width: CGFloat = 300
 
@@ -384,6 +496,18 @@ private struct ChannelCard: View, Equatable {
                 RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
                     .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
             )
+            // A favourited channel is marked wherever it appears, so the hold
+            // menu's state is legible without opening it.
+            .overlay(alignment: .topTrailing) {
+                if isFavorite {
+                    Image(systemName: "star.fill")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.yellow)
+                        .padding(6)
+                        .background(Circle().fill(.black.opacity(0.6)))
+                        .padding(8)
+                }
+            }
             .shadow(color: .black.opacity(perf.settings.cardShadows && isFocused ? 0.65 : 0),
                     radius: perf.settings.cardShadows && isFocused ? 22 : 0, y: 10)
 

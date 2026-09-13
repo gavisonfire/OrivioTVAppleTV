@@ -170,10 +170,19 @@ extension KSSubtitle: KSSubtitleProtocol {
 public extension KSSubtitle {
     func parse(url: URL, userAgent: String? = nil, encoding: String.Encoding? = nil) async throws {
         let data = try await url.data(userAgent: userAgent)
-        try parse(data: data, encoding: encoding)
+        // ORIVIO PATCH: parse where we are (this runs off a background task),
+        // but PUBLISH the cue list on the main thread — `search(for:)` reads
+        // `parts` there on every clock tick, and swapping the array under it
+        // mid-search was a data race.
+        let parsed = try Self.parseParts(data: data, encoding: encoding)
+        await MainActor.run { self.parts = parsed }
     }
 
     func parse(data: Data, encoding: String.Encoding? = nil) throws {
+        parts = try Self.parseParts(data: data, encoding: encoding)
+    }
+
+    static func parseParts(data: Data, encoding: String.Encoding? = nil) throws -> [SubtitlePart] {
         var string: String?
         let encodes = [encoding ?? String.Encoding.utf8,
                        String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.big5.rawValue))),
@@ -192,10 +201,11 @@ public extension KSSubtitle {
         _ = scanner.scanCharacters(from: .controlCharacters)
         let parse = KSOptions.subtitleParses.first { $0.canParse(scanner: scanner) }
         if let parse {
-            parts = parse.parse(scanner: scanner)
+            let parts = parse.parse(scanner: scanner)
             if parts.count == 0 {
                 throw NSError(errorCode: .subtitleUnParse)
             }
+            return parts
         } else {
             throw NSError(errorCode: .subtitleFormatUnSupport)
         }
@@ -329,6 +339,13 @@ open class SubtitleModel: ObservableObject {
         if subtitleInfos.first(where: { $0.subtitleID == info.subtitleID }) == nil {
             subtitleInfos.append(info)
         }
+    }
+
+    /// ORIVIO PATCH: drop tracks, so a reload can add them back as FRESH
+    /// objects — `addSubtitle` de-duplicates by id, which otherwise kept a
+    /// track whose download or parse had failed.
+    public func removeSubtitles(where shouldRemove: (any SubtitleInfo) -> Bool) {
+        subtitleInfos.removeAll(where: shouldRemove)
     }
 
     public func subtitle(currentTime: TimeInterval) -> Bool {

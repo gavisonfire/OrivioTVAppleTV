@@ -29,7 +29,11 @@ final class ImageCache: @unchecked Sendable {
         let config = URLSessionConfiguration.default
         config.httpMaximumConnectionsPerHost = PerformanceProfile.isLowPower ? 6 : (PerformanceProfile.isMidPower ? 8 : 12)
         config.timeoutIntervalForRequest = 25
-        config.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 128 << 20)
+        // NO URLCache: every body fetched here is persisted (and served back)
+        // by ImageCache's own orivio-images disk layer, so a URLCache stored
+        // each poster a SECOND time — up to 128 MB of duplicate encoded bytes
+        // on flash plus 16 MB of cache memory the 2 GB box can't spare.
+        config.urlCache = nil
         return URLSession(configuration: config)
     }()
 
@@ -158,6 +162,33 @@ final class ImageCache: @unchecked Sendable {
         ioQueue.async { [self] in writeCacheFile(payload, to: fileURL) }
     }
 
+    /// Raw encoded bytes from the disk layer, no decode — for consumers that
+    /// decode themselves (the animated collection GIFs). Touches the file's
+    /// mtime so a GIF in active rotation survives LRU trimming.
+    func diskData(for key: String) async -> Data? {
+        let fileURL = fileURL(for: key)
+        return await withCheckedContinuation { continuation in
+            ioQueue.async { [weak self] in
+                guard let data = try? Data(contentsOf: fileURL) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: data)
+                self?.ioQueue.async { [weak self] in
+                    try? self?.fm.setAttributes([.modificationDate: Date()],
+                                                ofItemAtPath: fileURL.path)
+                }
+            }
+        }
+    }
+
+    /// Persist encoded bytes with no decoded image attached (same disk layer
+    /// and LRU budget as artwork).
+    func insertData(_ data: Data, for key: String) {
+        let fileURL = fileURL(for: key)
+        ioQueue.async { [self] in writeCacheFile(data, to: fileURL) }
+    }
+
     /// Where the disk layer lives, derived the same way `init` does so callers
     /// can measure/clear it without reaching into the singleton. "Clear cache"
     /// needs it because this directory is a SIBLING of `Caches/OrivioCache`,
@@ -231,7 +262,26 @@ final class ImageCache: @unchecked Sendable {
             try? fm.createDirectory(at: diskURL, withIntermediateDirectories: true)
             try? data.write(to: fileURL, options: .atomic)
         }
+        // Re-arm the LRU trim after enough new bytes. It used to run exactly
+        // once per launch (10s in), so a long browsing session could push the
+        // store well past its 512 MB budget with no trim until next launch —
+        // and an oversized Caches directory is what invites tvOS to purge the
+        // WHOLE directory under pressure. Atomic: writes run on the
+        // CONCURRENT ioQueue, so a plain counter would race.
+        var shouldTrim = false
+        bytesWrittenSinceTrim.mutate { count in
+            count += data.count
+            if count >= Self.trimRearmBytes { count = 0; shouldTrim = true }
+        }
+        if shouldTrim {
+            ioQueue.async(flags: .barrier) { [weak self] in self?.trimDisk() }
+        }
     }
+
+    /// Bytes written between trims (~one trim per 64 MB of fresh artwork —
+    /// rare enough that the barrier walk stays negligible).
+    private let bytesWrittenSinceTrim = Atomic<Int>(wrappedValue: 0)
+    private static let trimRearmBytes = 64 << 20
 
     /// Release every decoded image held in RAM.
     ///
@@ -372,8 +422,11 @@ final class ImageCache: @unchecked Sendable {
         var data: Data? = await withCheckedContinuation { continuation in
             ioQueue.async { continuation.resume(returning: try? Data(contentsOf: fileURL)) }
         }
+        // Through the coalescer: at first paint the sharp RemoteImage layer is
+        // usually fetching this same backdrop — a direct session hit here
+        // downloaded it twice in parallel.
         if data == nil, let url = URL(string: key),
-           let (fetched, _) = try? await Self.downloadSession.data(from: url) {
+           let fetched = try? await download(url) {
             data = fetched
             ioQueue.async { try? fetched.write(to: fileURL, options: .atomic) }
         }
@@ -485,14 +538,25 @@ struct RemoteImage: View {
         Self.pixelBudget(maxDimension: maxDimension, maxPixels: maxPixels)
     }
 
+    /// Coarse budget ladder (≈√2 steps). The raw budget derives from each call
+    /// site's point size, so the same poster URL rendered at 150/168/180 pt in
+    /// different rows produced three distinct memory keys — three decodes of
+    /// the same bytes, three slots in the A8's 96 MB cache. Rounding UP to a
+    /// shared rung keeps every consumer supersampled (never softer than asked)
+    /// while nearby sizes collapse into one decode.
+    private static let budgetLadder: [CGFloat] = [240, 340, 480, 680, 960, 1360, 1920, 2720, 3840]
+
     private static func pixelBudget(maxDimension: CGFloat?, maxPixels: CGFloat?) -> CGFloat? {
         let fromPoints = maxDimension.map { $0 * UIScreen.main.scale * 1.5 }
+        let raw: CGFloat?
         switch (fromPoints, maxPixels) {
-        case (let a?, let b?): return min(a, b)
-        case (let a?, nil): return a
-        case (nil, let b?): return b
-        case (nil, nil): return nil
+        case (let a?, let b?): raw = min(a, b)
+        case (let a?, nil): raw = a
+        case (nil, let b?): raw = b
+        case (nil, nil): raw = nil
         }
+        guard let raw else { return nil }
+        return budgetLadder.first { $0 >= raw } ?? raw
     }
 
     private static func memoryKey(_ value: String, maxDimension: CGFloat?, maxPixels: CGFloat?) -> String {
@@ -881,7 +945,9 @@ struct LandscapeCard: View {
     var subtitleBehavior: LandscapeSubtitleBehavior = .compact
     var detailLine: String? = nil
     var remainingText: String? = nil
-    var hasNewEpisode: Bool = false
+    /// Episodes that have aired since the viewer started the show and are
+    /// still unwatched. 0 hides the badge.
+    var newEpisodeCount: Int = 0
     /// Spoiler-blur the still until the card is focused (then it reveals).
     var blurImage: Bool = false
     /// When false, the title/subtitle caption is omitted — the Apple TV theme
@@ -915,8 +981,8 @@ struct LandscapeCard: View {
                 if let rating { RatingBadge(rating: rating).padding(10) }
             }
             .overlay(alignment: .topTrailing) {
-                if hasNewEpisode {
-                    NewEpisodeBadge().padding(10)
+                if newEpisodeCount > 0 {
+                    NewEpisodeBadge(count: newEpisodeCount).padding(10)
                 } else if watched {
                     WatchedBadge().padding(10)
                 }
@@ -1037,7 +1103,13 @@ struct LandscapeCardCaption: View {
                     .opacity(isFocused ? 1 : 0)
                     .offset(y: isFocused ? 0 : 6)
             }
-            .frame(width: width, height: 98, alignment: .topLeading)
+            // Sized by the text, not a fixed 98pt (five lines) slot: that
+            // slot put the cast line ~130pt down whatever the synopsis said,
+            // so a one-line overview had three lines of nothing between it
+            // and its cast. Both copies are always laid out, so the box is
+            // still stable across focus — it is just the height of the
+            // longest one the text needs.
+            .frame(width: width, alignment: .topLeading)
             .clipped()
             .animation(perf.motion(FusionFocus.liftAnimation), value: isFocused)
         } else {
@@ -1074,14 +1146,32 @@ private struct RemainingTimeBadge: View {
     }
 }
 
+/// "+2" — how many episodes have aired since you started the show that you
+/// haven't watched. Green so it reads as new-content-available rather than as
+/// the neutral add-to-library "+" it replaced, and small: this sits on a card
+/// that already carries a progress strip and a remaining-time pill.
 private struct NewEpisodeBadge: View {
+    let count: Int
+
+    /// Two digits is the widest this can get without the pill starting to
+    /// crowd the still. Anything past it reads as "lots" either way.
+    private var label: String { count > 9 ? "+9+" : "+\(count)" }
+
     var body: some View {
-        Image(systemName: "plus")
-            .font(.system(size: 18, weight: .bold))
-            .foregroundStyle(.black)
-            .frame(width: 34, height: 34)
-            .background(.white, in: Circle())
-            .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+        Text(label)
+            .font(.system(size: 15, weight: .heavy, design: .rounded))
+            .monospacedDigit()
+            .foregroundStyle(.white)
+            .padding(.horizontal, 9)
+            .frame(height: 26)
+            .background(Color(red: 0.18, green: 0.72, blue: 0.35),
+                        in: Capsule(style: .continuous))
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(.white.opacity(0.22), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
+            .accessibilityLabel(count == 1 ? "1 new episode" : "\(count) new episodes")
     }
 }
 
@@ -1220,7 +1310,13 @@ struct GridPosterCell: View {
             onSelect(item)
         } label: {
             PosterCard(item: item)
-                .onFocusChange { focused = $0 }
+                .onFocusChange {
+                    focused = $0
+                    // Honest router note (no handler): a rail exit from a grid
+                    // falls back to the engine's pick instead of teleporting
+                    // to the last routed ROW the viewer was in.
+                    if $0 { ContentFocusRouter.shared.noteFocused(row: "grid") }
+                }
         }
         .mediaCardButtonStyle()
         .posterHoldMenu(item) { onSelect(item) }

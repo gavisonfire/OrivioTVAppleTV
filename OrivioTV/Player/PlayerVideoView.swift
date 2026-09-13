@@ -34,13 +34,52 @@ struct PlayerVideoView: UIViewRepresentable {
     func updateUIView(_ container: UIView, context: Context) {
         attach(to: container)
         applyTransform(to: container)
+        reportBounds(of: container)
     }
+
+    /// Probe the container's SIZE, on change only.
+    ///
+    /// This view fills the player's ZStack, which also hosts every overlay —
+    /// so any sibling that overflows the screen silently drags the video's
+    /// container with it, and a `.resizeAspect` layer in an oversized frame
+    /// scales the picture up. That is a zoom with no zoom in it: `aspectMode`
+    /// reads `fit`, the container transform stays the identity, and nothing in
+    /// the player's own state is wrong — which is exactly why the Video tab
+    /// overflowing by 78pt took a full investigation to find. Anything other
+    /// than the screen size here is that bug, whatever caused it.
+    private func reportBounds(of container: UIView) {
+        let size = container.bounds.size
+        guard size != Self.lastReportedSize.value, size != .zero else { return }
+        Self.lastReportedSize.value = size
+        let screen = UIScreen.main.bounds.size
+        let fits = abs(size.width - screen.width) < 1 && abs(size.height - screen.height) < 1
+        PlayerProbe.event("aspect", String(
+            format: "video container %.0fx%.0f (screen %.0fx%.0f)%@",
+            size.width, size.height, screen.width, screen.height,
+            fits ? "" : "  <-- OVERSIZED, the picture is being scaled up"))
+        if !fits { PlayerProbe.count("layout.container-oversized") }
+    }
+
+    /// Last size reported, so an `updateUIView` on every body pass doesn't
+    /// flood the probe. A plain box: this is only ever touched on the main
+    /// actor, from `updateUIView`.
+    private final class SizeBox: @unchecked Sendable { var value: CGSize = .zero }
+    private static let lastReportedSize = SizeBox()
 
     private func applyTransform(to container: UIView) {
         let wanted = scale.width == 1 && scale.height == 1 && shiftY == 0
             ? CGAffineTransform.identity
             : CGAffineTransform(translationX: 0, y: shiftY).scaledBy(x: scale.width, y: scale.height)
         guard container.transform != wanted else { return }
+        // The picture is being rescaled — say so, with the numbers behind it.
+        // This is the ONE place a zoom can actually be applied, so a report of
+        // the picture zooming is either visible here or is not this transform
+        // at all, and knowing which of those it is settles the question in one
+        // reproduction instead of a hunt through the layout.
+        PlayerProbe.event("aspect", String(
+            format: "transform %.3fx%.3f shiftY=%.0f (was %.3fx%.3f)",
+            scale.width, scale.height, shiftY,
+            container.transform.a, container.transform.d))
         UIView.animate(withDuration: 0.25, delay: 0, options: [.curveEaseInOut]) {
             container.transform = wanted
         }
@@ -134,13 +173,42 @@ struct SubtitleOverlayView: View {
         return .system(size: size, weight: settings.subtitleBold ? .bold : .medium)
     }
 
+    /// Strip the cue's OWN presentation attributes so the Playback settings
+    /// are the only thing deciding how a caption looks.
+    ///
+    /// Every embedded ASS/SSA track (most anime, most MKV remuxes) carries a
+    /// full style in the subtitle header — `Fontname`, `Fontsize`, primary
+    /// colour, outline colour — and KSPlayer's parser copies all of it onto
+    /// the attributed string as `.font` / `.foregroundColor` / `.strokeColor`
+    /// runs. A SwiftUI `.font()` or `.foregroundStyle()` modifier CANNOT
+    /// override an attribute the string already carries, so those scripts
+    /// rendered at their own point size — an 80pt ASS style is text across the
+    /// whole screen — and the Size control did nothing at all. The outline had
+    /// the same problem from the other side: the 8-way stroke below is the
+    /// same `Text` re-tinted, and a cue carrying its own white
+    /// `.foregroundColor` ignored the tint, so the "black" outline drew white.
+    ///
+    /// Only the presentation attributes go. Emphasis the script author meant
+    /// (italics, underline, strikethrough) is left alone.
+    private func restyled(_ text: NSAttributedString) -> AttributedString {
+        let mutable = NSMutableAttributedString(attributedString: text)
+        let whole = NSRange(location: 0, length: mutable.length)
+        for key: NSAttributedString.Key in [
+            .font, .foregroundColor, .backgroundColor,
+            .strokeColor, .strokeWidth, .shadow, .expansion
+        ] {
+            mutable.removeAttribute(key, range: whole)
+        }
+        return AttributedString(mutable)
+    }
+
     /// One caption line with the configured color and (optionally) a real
     /// outline — SwiftUI has no text stroke, so the outline is the same text
     /// rendered in 8 directions behind the fill. Falls back to a soft double
     /// shadow when the outline is off.
     @ViewBuilder
     private func styledCaption(_ text: NSAttributedString) -> some View {
-        let base = Text(AttributedString(text))
+        let base = Text(restyled(text))
             .font(captionFont)
             .multilineTextAlignment(.center)
             .lineSpacing(4)

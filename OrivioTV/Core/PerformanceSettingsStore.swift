@@ -198,12 +198,15 @@ final class PerformanceSettingsStore: ObservableObject {
 
     /// Restore the hardware-tuned baseline for this box (the first-run defaults).
     func resetToRecommended() {
-        let show = settings.showFPSOverlay   // a diagnostic, not part of the reset
-        let diag = settings.showPlayerDiagnostics
-        var s = Self.tierDefaults()
-        s.showFPSOverlay = show
-        s.showPlayerDiagnostics = diag
-        settings = s
+        // Diagnostics are cleared by the reset now, rather than preserved.
+        //
+        // Two of the three used to survive it, on the reasoning that a reset
+        // shouldn't disable something you are mid-investigation on. In practice
+        // the opposite is true: a reset is what someone reaches for when the
+        // screen looks wrong, and an overlay drawing over the UI is one of the
+        // likelier reasons it looks wrong. `showHoldProbe` was never in the
+        // preserved set either, so the three behaved differently for no reason.
+        settings = Self.tierDefaults()
     }
 
     private static let key = "orivio.performance.v1"
@@ -255,13 +258,45 @@ final class PerformanceSettingsStore: ObservableObject {
             // stays put. (A deliberate pre-existing off can't be told apart
             // from the old tier default; the one-time flip is the price of
             // the new default actually reaching existing installs.)
+            // Property observers do NOT fire for assignments made inside a
+            // type's own initializer, so `didSet { save() }` cannot persist
+            // anything the migrations below change — `migrated` tracks it and
+            // the explicit `save()` at the end of init writes it. Without that,
+            // a migration that ran once (its flag now set, so it never runs
+            // again) was silently reverted by the still-unchanged stored blob
+            // on the very next launch.
+            var migrated = false
+
             let migrationKey = "orivio.performance.gifDefaultOn.v1"
             if !UserDefaults.standard.bool(forKey: migrationKey) {
                 UserDefaults.standard.set(true, forKey: migrationKey)
                 if settings.collectionGifQuality == .off {
                     settings.collectionGifQuality = .full
+                    migrated = true
                 }
             }
+            // One-shot: clear the on-screen DIAGNOSTIC overlays.
+            //
+            // These are debugging tools that draw over the app, and they are
+            // sticky — once switched on for one investigation they stay on
+            // across launches and (until now) across a settings reset. That has
+            // twice been reported as a rendering bug: first as "garbage in the
+            // top black border" of the player, then as a "screen tear" over the
+            // poster rows, which was this HUD's own 640-wide panel. Nobody
+            // leaves one of these on deliberately for weeks, so clear them once
+            // and let the toggles be opt-in again from a known-off state.
+            let overlayKey = "orivio.performance.clearStickyDiagnostics.v1"
+            if !UserDefaults.standard.bool(forKey: overlayKey) {
+                UserDefaults.standard.set(true, forKey: overlayKey)
+                if settings.showHoldProbe || settings.showFPSOverlay || settings.showPlayerDiagnostics {
+                    settings.showHoldProbe = false
+                    settings.showFPSOverlay = false
+                    settings.showPlayerDiagnostics = false
+                    migrated = true
+                    NSLog("[OrivioPerf] cleared sticky on-screen diagnostics left on from a previous session")
+                }
+            }
+            if migrated { save() }
         } else {
             settings = Self.tierDefaults()
         }

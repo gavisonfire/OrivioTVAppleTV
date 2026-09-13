@@ -27,8 +27,10 @@ final class StremioResponseCache: @unchecked Sendable {
     /// uncapped, a long browse session keeps every response ever fetched in
     /// RAM. Eviction is invisible: a dropped entry is just one round-trip
     /// again. Also emptied outright on a memory warning, same policy as the
-    /// image cache (cheapest bytes to give back).
-    private let entryLimit = 96
+    /// image cache (cheapest bytes to give back). Tier-scaled: 96 bodies can
+    /// be tens of MB, which the 2–3 GB boxes can't idle on.
+    private let entryLimit = PerformanceProfile.isLowPower ? 32
+        : PerformanceProfile.isMidPower ? 64 : 96
 
     init() {
         NotificationCenter.default.addObserver(
@@ -64,7 +66,12 @@ enum StremioAPI {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 20
         config.requestCachePolicy = .useProtocolCachePolicy
-        config.urlCache = URLCache(memoryCapacity: 32 << 20, diskCapacity: 256 << 20)
+        // Memory side tier-scaled — 32 MB of response bodies pinned in RAM is
+        // a real bite out of the 2 GB box; disk stays generous.
+        config.urlCache = URLCache(
+            memoryCapacity: PerformanceProfile.isLowPower ? (8 << 20)
+                : PerformanceProfile.isMidPower ? (16 << 20) : (32 << 20),
+            diskCapacity: 256 << 20)
         // A single addon (Cinemeta, Torrentio…) usually serves every catalog /
         // stream request from one host; the default cap of 6 makes a Home load
         // fetch its rows 6-at-a-time. Let them all fire in parallel.

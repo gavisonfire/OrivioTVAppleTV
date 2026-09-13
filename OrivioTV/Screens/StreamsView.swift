@@ -91,7 +91,9 @@ final class StreamsViewModel: ObservableObject {
         if let resolvedID { return resolvedID }
         var showID = meta.id
         if showID.hasPrefix("tmdb:"), let n = Int(showID.dropFirst("tmdb:".count)),
-           let tt = await TMDBService.imdbID(tmdbID: n, isMovie: meta.type != "series") {
+           // `!isSeries`, not `type != "series"`: a meta typed "tv" went down
+           // TMDB's movie endpoint (disjoint id space) and never resolved.
+           let tt = await TMDBService.imdbID(tmdbID: n, isMovie: !meta.isSeries) {
             // A network round-trip BEFORE a single addon is queried. Catalogs
             // sourced from TMDB hand us `tmdb:` ids, so this is on the critical
             // path of most plays.
@@ -191,12 +193,6 @@ final class StreamsViewModel: ObservableObject {
         if let prefs = autoLinkPrefs { evaluateEarlyAutoLink(prefs) }
     }
 
-    /// Best source for a profile's Auto Link Selector. Entries are already
-    /// sorted best-first; we filter by the profile's cached-only / min-
-    /// resolution / max-size prefs, then prefer the chosen addon (then the
-    /// secondary), falling back to the best remaining link. Unknown
-    /// resolution/size never disqualifies a link (missing metadata shouldn't
-    /// hide a possibly-good source).
     /// Addons whose stream request has returned (either way).
     @Published private(set) var finishedAddonNames: Set<String> = []
     private var sweepStarted = Date()
@@ -213,6 +209,18 @@ final class StreamsViewModel: ObservableObject {
     private var earlyPickFired = false
     /// Longest we will hold out for a preferred addon that hasn't answered.
     private static let preferredAddonWait: TimeInterval = 6
+    /// Longest we will keep collecting before picking with no addon preference
+    /// left to honour.
+    ///
+    /// Without one, the early pick fired on the FIRST addon to answer, so with
+    /// several installed the selector's choice was decided by network race
+    /// order: whoever replied first got to pick, and a cached remux arriving
+    /// 200ms later never entered the running. This is the settling time that
+    /// buys — short enough to stay imperceptible next to the addon sweep it
+    /// overlaps, and cut short the moment the field can no longer improve
+    /// (every addon answered, or a link that plays now at the best resolution
+    /// this box accepts is already in hand).
+    private static let fieldSettleWait: TimeInterval = 2
 
     /// A pick that is safe to act on BEFORE the sweep has finished.
     ///
@@ -226,18 +234,11 @@ final class StreamsViewModel: ObservableObject {
     /// If it has answered and produced nothing, fall through to the secondary
     /// on the same terms. Only wait while an addon we actually care about is
     /// still outstanding — and not past `preferredAddonWait`, so one dead addon
-    /// can't hold up the whole thing.
+    /// can't hold up the whole thing. With no addon left to wait for, take the
+    /// best of the whole field once it has settled (`fieldSettleWait`).
     func earlyAutoLinkPick(_ prefs: AutoLinkPreferences) -> StreamEntry? {
         let pool = autoLinkPool(prefs)
-        // Patience only means something when there is a specific addon whose
-        // answer we are waiting FOR. With neither a preferred nor a secondary
-        // addon set — the default — the window below made the selector sit on a
-        // perfectly good cached link that arrived at 300ms for the full 6s and
-        // then take it anyway.
-        let hasAddonPreference = !prefs.preferredAddon.trimmingCharacters(in: .whitespaces).isEmpty
-            || !prefs.secondaryAddon.trimmingCharacters(in: .whitespaces).isEmpty
-        let patient = hasAddonPreference
-            && Date().timeIntervalSince(sweepStarted) < Self.preferredAddonWait
+        let elapsed = Date().timeIntervalSince(sweepStarted)
 
         /// Whether an addon can still change the answer: it has to be one we
         /// queried at all (a Stremio addon OR a plugin scraper), and not yet
@@ -255,14 +256,34 @@ final class StreamsViewModel: ObservableObject {
             return pool.first { $0.addonName.lowercased().contains(q) }
         }
 
+        // Patience only means something while a specific addon we are waiting
+        // FOR can still answer. It used to be spent on the clock alone, so once
+        // the preferred and secondary addons had both replied with nothing the
+        // pick still sat out the rest of the 6s for addons no preference names.
+        let patient = elapsed < Self.preferredAddonWait
+
         if let hit = firstFrom(prefs.preferredAddon) { return hit }
         if patient, outstanding(prefs.preferredAddon) { return nil }
         if let hit = firstFrom(prefs.secondaryAddon) { return hit }
         if patient, outstanding(prefs.secondaryAddon) { return nil }
-        // No addon preference left to honour. Anything already in hand will do
-        // once the sweep is done; until then keep collecting.
-        guard finishedAddons >= totalAddons || !patient else { return nil }
-        return pool.first
+
+        // No addon preference left to honour: this is now a straight "best
+        // available" choice, and the answer keeps improving while addons are
+        // still arriving. Four ways to stop collecting, cheapest first — the
+        // settle window is the CAP, not the normal wait, so the usual play is
+        // still decided in the first few hundred milliseconds.
+        guard let best = pool.first else { return nil }
+        if finishedAddons >= totalAddons { return best }        // nothing more can arrive
+        if elapsed >= Self.fieldSettleWait { return best }      // waited long enough
+        if playsNow(best) {
+            // Unbeatable: plays now, at the best resolution this box will take.
+            if let top = topAllowedTier(prefs),
+               ResolutionTier.from(resolutionLabel: best.resolutionLabel) == top { return best }
+            // Most of the field is in and what we hold plays now — the
+            // stragglers are not worth holding the screen for.
+            if finishedAddons * 2 >= totalAddons { return best }
+        }
+        return nil
     }
 
     /// Evaluate the early pick and fire it at most once per sweep.
@@ -273,7 +294,12 @@ final class StreamsViewModel: ObservableObject {
     /// whichever is LATER". One slow addon stretched a 6s window to the full
     /// 45s stream timeout.
     func evaluateEarlyAutoLink(_ prefs: AutoLinkPreferences) {
-        guard !earlyPickFired, !allEntries.isEmpty else { return }
+        // Gate on the RAW pool, not on `allEntries`: the latter reads through
+        // `groups`, which the sweep only re-flushes every 400ms, so a batch
+        // landing inside that window was turned away for having "no entries"
+        // while holding the first links of the whole sweep — and turned away
+        // before the rebuild that would have fixed it.
+        guard !earlyPickFired, !pool.isEmpty else { return }
         rebuildGroups()
         guard let pick = earlyAutoLinkPick(prefs) else { return }
         earlyPickFired = true
@@ -285,6 +311,85 @@ final class StreamsViewModel: ObservableObject {
     /// once per addon batch and re-walks the whole pool each time, so the regex
     /// work behind a verdict is done once per link per sweep, not once per pass.
     private var titleVerdicts: [UUID: StreamTitleVerdict] = [:]
+
+    /// `Stream.isCached` is regex work over three strings, and the auto-pick
+    /// ranks the whole pool again on every addon batch. Memoized per entry for
+    /// the same reason as `titleVerdicts`.
+    private var cachedFlags: [UUID: Bool] = [:]
+
+    /// Does this link play RIGHT NOW? Strict `isCached`, not `isInstant`: a
+    /// debrid addon hands back a playable URL for uncached results too (it
+    /// downloads on access), and an auto-pick that lands on one is exactly the
+    /// wait the selector exists to avoid.
+    private func playsNow(_ entry: StreamEntry) -> Bool {
+        if let cached = cachedFlags[entry.id] { return cached }
+        let cached = entry.stream.isCached
+        cachedFlags[entry.id] = cached
+        return cached
+    }
+
+    /// Rank the whole field for an automatic pick.
+    ///
+    /// The visible page is grouped by ADDON in INSTALLED order and ranked only
+    /// within a group, so its first entry is the best link of whichever addon
+    /// happens to sit first — not the best link available. Every automatic path
+    /// took that first entry and the comments called it "already sorted
+    /// best-first", which it is only inside one addon block: with two addons
+    /// installed the selector would take a 720p from the first over a cached
+    /// 2160p remux from the second, purely on install order.
+    ///
+    /// The order, most significant first:
+    ///  1. Plays now. An auto-pick that has to wait on a debrid download is the
+    ///     failure this feature exists to prevent, and it is the same principle
+    ///     `qualityScore` already encodes with its dominant instant bonus.
+    ///     Neutral when nothing is cached (a TorrServer-only setup, where every
+    ///     link is a torrent), so those setups rank on quality as before — and
+    ///     it does NOT lift a 480p link over a higher-resolution one, which is
+    ///     the one trade where waiting is clearly the better answer (an
+    ///     unlabelled link still counts, since plenty of good debrid links
+    ///     carry no resolution at all).
+    ///  2. Resolution, in the BOX's own order (`ResolutionTier.displayOrder` —
+    ///     on an Apple TV HD a 2160p link is the worst pick, not the best).
+    ///  3. `sourceScore`: release ladder, codec, HDR, audio, seeders, size.
+    ///     Cached still wins inside a tier, SD included — its +1000 is there.
+    ///  4. The page's own order, so equals stay in a stable, familiar sequence.
+    private func autoRanked(_ entries: [StreamEntry]) -> [StreamEntry] {
+        guard entries.count > 1 else { return entries }
+        let tierRank = Dictionary(
+            uniqueKeysWithValues: ResolutionTier.displayOrder.enumerated().map { ($1, $0) }
+        )
+        // Keys computed ONCE per entry rather than on every comparison — a
+        // comparator that calls `playsNow` does O(n log n) dictionary lookups
+        // for what is O(n) work.
+        let keyed = entries.enumerated().map { offset, entry -> (entry: StreamEntry, now: Bool, tier: Int, score: Int, offset: Int) in
+            let tier = ResolutionTier.from(resolutionLabel: entry.resolutionLabel)
+            return (entry: entry,
+                    now: playsNow(entry) && tier != .sd480,
+                    tier: tierRank[tier] ?? .max,
+                    score: entry.sourceScore,
+                    offset: offset)
+        }
+        return keyed.sorted { l, r in
+            if l.now != r.now { return l.now }
+            if l.tier != r.tier { return l.tier < r.tier }
+            if l.score != r.score { return l.score > r.score }
+            return l.offset < r.offset
+        }.map(\.entry)
+    }
+
+    /// The best resolution an auto-pick can hope for here: the first tier in
+    /// the box's own display order that still clears the profile's minimum.
+    /// Nothing beats it, so a link that reaches it (and plays now) is worth
+    /// taking immediately instead of waiting out the settle window below.
+    private func topAllowedTier(_ prefs: AutoLinkPreferences) -> ResolutionTier? {
+        let minTier = prefs.minResolution.isEmpty ? nil
+            : ResolutionTier.from(resolutionLabel: prefs.minResolution)
+        return ResolutionTier.displayOrder.first { tier in
+            guard tier != .other else { return false }   // unknown is never "the best"
+            guard let minTier else { return true }
+            return tier.rawValue <= minTier.rawValue     // lower rawValue = higher resolution
+        }
+    }
 
     /// Is this link really the title (and episode) that was asked for?
     /// See `StreamTitleMatcher` — only positive evidence of a MISMATCH rejects.
@@ -342,6 +447,11 @@ final class StreamsViewModel: ObservableObject {
             // always excluded these; the selector and the global auto-play
             // (below) must too. Manual taps still offer them.
             if entry.stream.isExternal { return false }
+            // An addon that answered a byte-range request with an HTTP error
+            // cannot be cached OR seeked — the proxy fails open so the film
+            // plays, and the cache, the scrub previews and seeking are all dead
+            // for the rest of the session with nothing on screen to say so.
+            if Stream.RangeRefusingAddons.contains(entry.addonName) { return false }
             if prefs.cachedOnly && !entry.stream.isCached { return false }
             if prefs.avoidDolbyVision && entry.stream.isDolbyVision { return false }
             if let minTier, let label = entry.resolutionLabel,
@@ -352,13 +462,20 @@ final class StreamsViewModel: ObservableObject {
         // Skip links a recent session walked straight back out of, so pressing
         // Play again moves on instead of re-serving the one that just failed.
         let rejected = RejectedLinks.rejected(for: ProgressStore.key(metaID: meta.id, video: video))
-        guard !rejected.isEmpty else { return titleFiltered(pool) }
+        guard !rejected.isEmpty else { return autoRanked(titleFiltered(pool)) }
         let survivors = pool.filter { !rejected.contains($0.rejectionKey) }
         // If avoiding them leaves nothing, the grudge is worse than the link:
         // play the best match rather than dropping to the manual list.
-        return titleFiltered(survivors.isEmpty ? pool : survivors)
+        return autoRanked(titleFiltered(survivors.isEmpty ? pool : survivors))
     }
 
+    /// Best source for a profile's Auto Link Selector, once the sweep is done:
+    /// the pool filtered by the profile's cached-only / min-resolution /
+    /// max-size prefs and ranked across every addon (`autoRanked`), preferring
+    /// the chosen addon, then the secondary, then the best remaining link.
+    /// Unknown resolution/size never disqualifies a link (missing metadata
+    /// shouldn't hide a possibly-good source).
+    ///
     /// `excluding`: rejection keys of links an auto-pick already tried and
     /// failed to resolve this visit, so the retry moves ON instead of
     /// re-serving the same dead link.
@@ -375,16 +492,19 @@ final class StreamsViewModel: ObservableObject {
             ?? pool.first
     }
 
-    /// First source to auto-play (entries are already sorted best-first),
-    /// honoring cached-only and an optional case-insensitive title regex.
+    /// Best source to auto-play, honoring cached-only and an optional
+    /// case-insensitive title regex. Ranked over the whole field like the
+    /// selector (see `autoRanked`) — "Auto-play best source" used to mean
+    /// "auto-play the first installed addon's best source".
     func autoPlayPick(cachedOnly: Bool, regex: String, excluding: Set<String> = []) -> StreamEntry? {
         let trimmed = regex.trimmingCharacters(in: .whitespaces)
         let re = trimmed.isEmpty ? nil
             : try? NSRegularExpression(pattern: trimmed, options: [.caseInsensitive])
         // Same name check the Auto Link Selector uses: an auto-play that
         // starts the wrong episode is worse than one that starts nothing.
-        return titleFiltered(allEntries).first { entry in
+        return autoRanked(titleFiltered(allEntries)).first { entry in
             if entry.stream.isExternal { return false }   // see autoLinkPool
+            if Stream.RangeRefusingAddons.contains(entry.addonName) { return false }
             if excluding.contains(entry.rejectionKey) { return false }
             if cachedOnly && !entry.stream.isCached { return false }
             if let re {
@@ -404,7 +524,19 @@ final class StreamsViewModel: ObservableObject {
     func bestResumeMatch(signature: StreamSignature?) -> StreamEntry? {
         // Never auto-resume into an external hand-off (a "cast to DMM" style
         // entry opens another app) — resume must play a real stream here.
-        let candidates = titleFiltered(allEntries.filter { !$0.stream.isExternal })
+        //
+        // NOR INTO AN ADDON THAT HAS ALREADY PROVED IT REFUSES BYTE RANGES.
+        // The auto-pick pool has excluded those for a while; this path did not,
+        // and this is the path a Continue Watching resume takes — which is how
+        // the same cast endpoint was landed on three times in one evening after
+        // being blacklisted the first time. It plays and nothing else works:
+        // no caching, no seeking, no scrub preview.
+        //
+        // Ranked, so the "base rank" the tiebreak below falls back to is the
+        // best link of the FIELD rather than of the first installed addon.
+        let candidates = autoRanked(titleFiltered(allEntries.filter {
+            !$0.stream.isExternal && !Stream.RangeRefusingAddons.contains($0.addonName)
+        }))
         guard !candidates.isEmpty else { return nil }
         guard let sig = signature else { return candidates.first }
         func matchScore(_ e: StreamEntry) -> Int {
@@ -417,8 +549,8 @@ final class StreamsViewModel: ObservableObject {
             if let a = sig.addonName, e.addonName.caseInsensitiveCompare(a) == .orderedSame { s += 4 }
             return s
         }
-        // Entries are already sorted best-first; pick the highest signature
-        // match, breaking ties toward that existing (better) base rank.
+        // Candidates are ranked best-first; pick the highest signature match,
+        // breaking ties toward that existing (better) base rank.
         return candidates.enumerated().max { lhs, rhs in
             let l = matchScore(lhs.element), r = matchScore(rhs.element)
             return l != r ? l < r : lhs.offset > rhs.offset
@@ -430,9 +562,10 @@ final class StreamsViewModel: ObservableObject {
     func reload(addonManager: AddonManager, debridEnabled: Bool, perTier: Int, filtersEnabled: Bool = true) async {
         groups = []
         pool = []
-        // Entry ids are regenerated by the sweep below, so the cache would
+        // Entry ids are regenerated by the sweep below, so these caches would
         // otherwise grow a dead entry per link on every retry.
         titleVerdicts = [:]
+        cachedFlags = [:]
         addonNames = []
         selectedAddon = nil
         finishedAddons = 0
@@ -511,15 +644,40 @@ final class StreamsViewModel: ObservableObject {
         failedAddons = [:]
         finishedAddonNames = []
         sweepStarted = Date()
+        // The sweep below APPENDS to `pool` and INCREMENTS `finishedAddons`,
+        // so both have to start from zero — `reload()` cleared them and this
+        // path did not. Re-entering Sources (play a link, press Back) ran a
+        // second sweep on top of the first: every source from an addon that
+        // had already answered was listed TWICE, `finishedAddons` counted past
+        // `totalAddons` so the header read "9/6", and the auto-link settle
+        // window was skipped because its `finished >= total` guard was already
+        // true on the first batch.
+        pool = []
+        finishedAddons = 0
+        // Entry ids are regenerated below, so these caches would otherwise
+        // keep a dead entry per link from the previous sweep.
+        titleVerdicts = [:]
+        cachedFlags = [:]
         // Reset per sweep, or a refresh after an early pick could never fire one.
         earlyPickFired = false
-        // The deadline that `preferredAddonWait` was always supposed to be.
+        // The deadlines that `fieldSettleWait` and `preferredAddonWait` were
+        // always supposed to be. BOTH need a timer: the per-batch path only
+        // runs when an addon answers, so a window that expires between two
+        // replies would otherwise mean "when the window is up OR the next
+        // addon replies, whichever is LATER" — one slow addon stretching a 2s
+        // settle to the full 45s stream timeout.
         var autoLinkDeadline: Task<Void, Never>?
         if let prefs = autoLinkPrefs {
             autoLinkDeadline = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(Self.preferredAddonWait * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                self?.evaluateEarlyAutoLink(prefs)
+                var waited: TimeInterval = 0
+                for deadline in [Self.fieldSettleWait, Self.preferredAddonWait] {
+                    let remaining = deadline - waited
+                    guard remaining > 0 else { continue }
+                    try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                    guard !Task.isCancelled else { return }
+                    waited = deadline
+                    self?.evaluateEarlyAutoLink(prefs)
+                }
             }
         }
         defer { autoLinkDeadline?.cancel() }
@@ -654,11 +812,71 @@ struct StreamsView: View {
     /// the source list.
     var onAutoDismiss: () -> Void = {}
 
-    /// Auto Link Selector is resolving: show a loading screen instead of the
-    /// source list so Play goes straight to "loading" with no list flash.
-    @State private var autoLinkResolving = false
+    /// Whether an automatic flow has taken the page over and the source list
+    /// should stay hidden behind the loading screen.
+    ///
+    /// DERIVED, not a plain @State that `.task` switches on. `.task` runs after
+    /// the first frame is on screen, so a stored flag that starts `false` meant
+    /// every auto-linked Play rendered the source page once — the list flashing
+    /// past for a frame before the loading screen replaced it. Reading the
+    /// armed state during `body` instead means the loading screen IS the first
+    /// frame and the list is never built at all.
+    ///
+    /// The latch is the override the auto flows write when they are done with
+    /// the page (nothing matched, resolve failed): `nil` means "still whatever
+    /// the settings say".
+    private var autoLinkResolving: Bool { autoLinkResolvingLatch ?? autoLinkArmed }
+
+    /// Set once an automatic flow has finished with the loading screen; until
+    /// then `autoLinkResolving` follows `autoLinkArmed`.
+    @State private var autoLinkResolvingLatch: Bool?
+
+    /// An automatic pick fired and this page has asked to be popped. The pop is
+    /// deliberately deferred to a runloop turn AFTER the player closes (see
+    /// `onAutoDismiss`), and for that one turn this view is on screen again —
+    /// which used to reveal the source list on the way OUT of an auto-played
+    /// title, the same page the selector exists to skip. Stay covered until the
+    /// pop lands.
+    @State private var didAutoDismiss = false
+
+    /// Request the deferred pop, and cover the page until it happens.
+    private func autoDismiss() {
+        didAutoDismiss = true
+        onAutoDismiss()
+    }
+
+    /// Do the settings arm an automatic pick for this visit? Same condition
+    /// `.task` used to compute, hoisted so the FIRST frame can ask it too.
+    ///
+    /// A RESUME only qualifies when some automatic selection is actually
+    /// switched on.
+    ///
+    /// Deliberately NOT gated on `didAutoAct`. That term belongs to the
+    /// come-back-from-the-player case, which the latch handles below — folding
+    /// it in here would flip `autoLinkResolving` to false the instant a pick
+    /// fires, which is precisely when the rest of the flow reads it to mean
+    /// "the loading screen is up": the deferred pop after a reused last link
+    /// and the dead-link failover in `autoAdvance` both hang off it.
+    ///
+    /// "Auto-play best source" counts on EVERY visit, not just a resume. It
+    /// used to be `resumeAutoPlay &&`, but the block that acts on it (further
+    /// down in `.task`) carries no such condition — so with the selector off
+    /// and auto-play on, pressing Play built the full source list, showed it
+    /// for the length of the addon sweep, and then started playing anyway.
+    /// The two must agree or the page shows for exactly as long as the
+    /// decision takes.
+    private var autoLinkArmed: Bool {
+        guard !forceManual else { return false }
+        if profiles.activeAutoLink.enabled { return true }
+        return playerSettings.settings.autoPlaySourceEnabled
+    }
 
     @State private var resolving = false
+    /// The in-flight debrid/P2P resolve, so Back can CANCEL it. Without this
+    /// a hung provider left the viewer parked on the resolve spinner with no
+    /// way to try another source — the only exit was popping the whole page
+    /// and re-running the entire addon sweep.
+    @State private var resolveTask: Task<Void, Never>?
     @State private var resolveError: String?
     /// Links an auto-pick already tried and failed to RESOLVE this visit —
     /// the retry pool excludes them so a failed pick moves on to the next
@@ -701,13 +919,23 @@ struct StreamsView: View {
 
     var body: some View {
         ZStack {
+            // Popped-but-still-on-screen (see `didAutoDismiss`): a bare cover,
+            // NOT the loading screen — its spinner and "Finding the best
+            // source" have already faded in by now, so reusing it here would
+            // flash a search that finished minutes ago onto the way out.
+            // …but NOT while a resolve is still running. An auto-picked
+            // torrent asks debrid for a link before the player can open, which
+            // is seconds of work, and the bare cover says nothing about it —
+            // the loading screen below carries "Resolving via Real-Debrid".
+            if didAutoDismiss, !resolving {
+                AutoPickHandoffScreen(meta: viewModel.meta)
             // Auto Link Selector armed: the source page is an implementation
             // detail the viewer never asked to see. Show the title's own
             // loading screen — the SAME one the player is about to put up — and
             // let the addon sweep finish behind it, so pressing Play reads as
             // one continuous "opening the movie" rather than a detour through a
             // list that flashes past.
-            if autoLinkResolving {
+            } else if autoLinkResolving {
                 AutoLinkLoadingScreen(
                     meta: viewModel.meta,
                     status: resolving
@@ -715,6 +943,17 @@ struct StreamsView: View {
                         : "Finding the best source"
                 )
                 .transition(.opacity)
+                // Back during a slow sweep/resolve = "let me pick myself":
+                // cancel whatever is in flight, disarm further auto-picks
+                // this visit, and reveal the manual list. This screen owns
+                // the whole view for up to the 45s stream deadline, and
+                // Back used to pop clear off the page — there was no way to
+                // reach the list a stuck auto-select was sitting on top of.
+                .onExitCommand {
+                    cancelResolve()
+                    didAutoAct = true
+                    autoLinkResolvingLatch = false
+                }
             } else {
             ATVBackground()
             backdrop
@@ -748,31 +987,58 @@ struct StreamsView: View {
             if resolving {
                 ZStack {
                     Color.black.opacity(0.6).ignoresSafeArea()
-                    OrivioLoadingView(label: "Resolving via \(debrid.resolverProvider?.displayName ?? (torrent.settings.isConfigured ? "TorrServer" : "debrid"))")
+                    VStack(spacing: OrivioSpacing.md) {
+                        // holdsFocus so Menu lands on the `.onExitCommand`
+                        // below (cancel) instead of on whatever list row is
+                        // buried under this dim — a press there could fire a
+                        // SECOND source while one is already resolving.
+                        OrivioLoadingView(
+                            label: "Resolving via \(debrid.resolverProvider?.displayName ?? (torrent.settings.isConfigured ? "TorrServer" : "debrid"))",
+                            holdsFocus: true
+                        )
+                        .frame(maxHeight: 220)
+                        Text("Press Back to cancel and pick another source")
+                            .font(.system(size: 21))
+                            .foregroundStyle(theme.palette.textTertiary)
+                    }
                 }
+                // Back CANCELS the resolve and returns to the list. It used
+                // to bubble up and pop the whole page — a hung provider cost
+                // the entire sweep.
+                .onExitCommand { cancelResolve() }
             }
             }
         }
         .animation(.easeOut(duration: 0.2), value: autoLinkResolving)
         .task {
+            // Waiting on the deferred pop: this task re-runs when the player
+            // cover comes down, and a page one runloop turn from being removed
+            // has no business standing the whole addon sweep back up. The sleep
+            // is a safety net only — if the pop never lands (nothing to pop on
+            // this stack), uncover the list rather than strand the viewer on a
+            // black screen.
+            if didAutoDismiss {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, !isGone else { return }
+                autoLinkResolvingLatch = false   // uncover, or nothing ever would
+                didAutoDismiss = false
+                return
+            }
             let s = playerSettings.settings
             viewModel.streamFilters = s.streamFilterOptions
-            // Auto Link Selector on (and not forced manual): show the loading
-            // screen instead of the source list from the very first frame.
-            //
             // A RESUME only qualifies when some automatic selection is actually
             // switched on. It used to qualify unconditionally, so a Continue
             // Watching row opened onto "Finding the best source…" and then
             // played something the viewer never picked, with both auto-select
             // settings off.
             let autoSelects = profiles.activeAutoLink.enabled || s.autoPlaySourceEnabled
-            // Not after an automatic pick already fired: this task re-runs when
-            // the player cover comes down (`onDisappear`/`onAppear` on the view
-            // beneath it), and re-raising the loading screen then left the
+            // Fresh visit: hand the loading screen back to `autoLinkArmed`.
+            // AFTER a pick has fired, force the list instead: this task re-runs
+            // when the player cover comes down (`onDisappear`/`onAppear` on the
+            // view beneath it), and re-raising the loading screen then left the
             // page stuck on "Finding the best source…" — nothing picks again
             // (`didAutoAct` is @State) and the safety net below cannot clear it.
-            autoLinkResolving = (profiles.activeAutoLink.enabled
-                                 || (resumeAutoPlay && autoSelects)) && !forceManual && !didAutoAct
+            autoLinkResolvingLatch = didAutoAct ? false : nil
             viewModel.openedAt = Date()
             viewModel.stage("sources page opened")
             autoTriedKeys = []   // fresh visit, fresh failover budget
@@ -798,7 +1064,7 @@ struct StreamsView: View {
                     guard !isGone, !didAutoAct else { return }
                     didAutoAct = true
                     handleSelection(pick, viewModel.allEntries)
-                    onAutoDismiss()
+                    autoDismiss()
                 }
             }
 
@@ -871,7 +1137,7 @@ struct StreamsView: View {
                 onSelect(last, [last])
                 // Signals a deferred pop (handled when the player closes); does
                 // NOT tear down this view now, so the in-flight resolve is safe.
-                if autoLinkResolving { onAutoDismiss() }
+                if autoLinkResolving { autoDismiss() }
                 return
             }
             await loadTask.value
@@ -911,9 +1177,9 @@ struct StreamsView: View {
                 if let pick = viewModel.bestResumeMatch(signature: resumeSignature) {
                     didAutoAct = true
                     handleSelection(pick, viewModel.allEntries)
-                    onAutoDismiss()
+                    autoDismiss()
                 } else {
-                    autoLinkResolving = false   // nothing found → reveal the list
+                    autoLinkResolvingLatch = false   // nothing found → reveal the list
                 }
             }
 
@@ -928,27 +1194,33 @@ struct StreamsView: View {
                     // Request a pop AFTER the player closes (not now) so backing
                     // out lands on the title page, not the source list — popping
                     // here would tear this view down mid-resolve and crash.
-                    onAutoDismiss()
+                    autoDismiss()
                 } else {
                     // No source matched the prefs — reveal the list as a manual
                     // fallback instead of leaving the loading screen up.
-                    autoLinkResolving = false
+                    autoLinkResolvingLatch = false
                 }
             }
 
             // Auto-play best source: once the sweep is done, start the best
             // matching link without waiting for a manual pick.
+            //
+            // Dismisses like every other automatic pick. It used not to, which
+            // is what made the source page reappear on the way OUT of an
+            // auto-played title: the list was revealed behind the player and
+            // was the first thing Back landed on.
             if !didAutoAct, !forceManual, s.autoPlaySourceEnabled,
                let best = viewModel.autoPlayPick(
                    cachedOnly: s.autoPlaySourceCachedOnly, regex: s.autoPlaySourceRegex
                ) {
                 didAutoAct = true
                 handleSelection(best, viewModel.allEntries)
+                autoDismiss()
             }
 
             // Safety net: if we opened in auto-loading mode but nothing acted,
             // drop the loading screen so the user isn't stuck on it.
-            if autoLinkResolving && !didAutoAct { autoLinkResolving = false }
+            if autoLinkResolving && !didAutoAct { autoLinkResolvingLatch = false }
         }
         // The player cover triggers `onDisappear` on this view too, so the
         // latch below must be RESET on every appearance — without it every
@@ -965,7 +1237,7 @@ struct StreamsView: View {
         }
         .alert("Couldn't resolve stream", isPresented: Binding(
             get: { resolveError != nil },
-            set: { if !$0 { resolveError = nil; autoLinkResolving = false } }
+            set: { if !$0 { resolveError = nil; autoLinkResolvingLatch = false } }
         )) {
             Button("OK", role: .cancel) {
                 resolveError = nil
@@ -973,7 +1245,7 @@ struct StreamsView: View {
                 // the loading screen so the manual list is reachable — without
                 // this, dismissing the alert stranded the user on
                 // "Finding the best source…" forever.
-                autoLinkResolving = false
+                autoLinkResolvingLatch = false
             }
         } message: {
             Text(resolveError ?? "")
@@ -1159,21 +1431,44 @@ struct StreamsView: View {
             return
         }
         resolving = true
-        Task {
+        resolveTask?.cancel()
+        resolveTask = Task {
             // Try every configured debrid, preferred first — a torrent the
             // preferred provider doesn't have cached still resolves via the
             // others (TorBox / RD / PM / AD).
-            let (result, resolvedBy) = await DebridService.resolveAcross(
-                stream: entry.stream,
-                providers: await debrid.resolversRefreshingIfNeeded(),
-                season: viewModel.video?.season,
-                episode: viewModel.video?.episode,
-                // The addon told us WHICH file of the pack this row is. Without
-                // it every row of a season pack resolved to the same (largest)
-                // episode — the rows the fileIdx-aware dedupe now surfaces were
-                // all playing the same file.
-                fileIdx: entry.stream.fileIdx
-            )
+            //
+            // Under a DEADLINE. The chain is unbounded by construction: each
+            // provider is up to ~9 sequential requests (30s timeout each)
+            // plus poll sleeps, × every configured provider — a bad candidate
+            // could grind for minutes before the auto flow's `autoAdvance`
+            // even got to try the NEXT link ("auto link selector can take a
+            // long time"). A timeout is reported as .failed, so the auto
+            // flow advances to another candidate and a manual pick shows the
+            // normal alert. Tighter when auto-select is driving: its promise
+            // is "plays now", and 20s of grinding is already a broken one.
+            let stream = entry.stream
+            let season = viewModel.video?.season
+            let episode = viewModel.video?.episode
+            let providers = await debrid.resolversRefreshingIfNeeded()
+            let budget: TimeInterval = autoLinkResolving ? 20 : 60
+            let outcome = await Self.withDeadline(seconds: budget) {
+                await DebridService.resolveAcross(
+                    stream: stream,
+                    providers: providers,
+                    season: season,
+                    episode: episode,
+                    // The addon told us WHICH file of the pack this row is.
+                    // Without it every row of a season pack resolved to the
+                    // same (largest) episode — the rows the fileIdx-aware
+                    // dedupe now surfaces were all playing the same file.
+                    fileIdx: stream.fileIdx
+                )
+            }
+            let (result, resolvedBy) = outcome
+                ?? (.failed("Timed out after \(Int(budget))s"), nil)
+            // The viewer cancelled from the resolve spinner — a late success
+            // must not shove the player over the list they went back to.
+            guard !Task.isCancelled else { return }
             let provider = resolvedBy ?? provider
             resolving = false
             // Back popped the page during the resolve (this Task isn't cancelled
@@ -1208,6 +1503,36 @@ struct StreamsView: View {
         }
     }
 
+    /// Run `work` with a hard wall-clock deadline; nil on timeout. The losing
+    /// task is cancelled (URLSession calls unwind cooperatively; provider
+    /// cleanup like RD's torrent delete runs in its own unstructured task).
+    private static func withDeadline<T: Sendable>(
+        seconds: TimeInterval,
+        _ work: @escaping @Sendable () async -> T
+    ) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await work() }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// Abort an in-flight debrid/P2P resolve (Back from the resolve spinner
+    /// or the auto-link screen). The task's own completions check
+    /// `Task.isCancelled`, so a late answer can't present the player.
+    private func cancelResolve() {
+        guard resolving || resolveTask != nil else { return }
+        resolveTask?.cancel()
+        resolveTask = nil
+        resolving = false
+        viewModel.stage("resolve cancelled by viewer")
+    }
+
     /// Play a torrent via the user's TorrServer instance (P2P) — no debrid.
     private func resolveViaP2P(_ entry: StreamEntry, _ all: [StreamEntry]) {
         guard let magnet = entry.stream.magnetURI
@@ -1216,15 +1541,28 @@ struct StreamsView: View {
             return
         }
         resolving = true
-        Task {
-            let result = await TorrServerService.resolve(
-                magnet: magnet, settings: torrent.settings,
-                season: viewModel.video?.season, episode: viewModel.video?.episode,
-                // TorrServer's file id IS the torrent-relative index, so unlike
-                // most debrid providers it can honour the addon's pick directly
-                // instead of guessing by filename or size.
-                fileIdx: entry.stream.fileIdx
-            )
+        resolveTask?.cancel()
+        resolveTask = Task {
+            // Same deadline as the debrid path (see handleSelection): a dead
+            // TorrServer must fail over / alert, not hold the spinner.
+            let season = viewModel.video?.season
+            let episode = viewModel.video?.episode
+            let stream = entry.stream
+            let settings = torrent.settings
+            let budget: TimeInterval = autoLinkResolving ? 20 : 60
+            let outcome = await Self.withDeadline(seconds: budget) {
+                await TorrServerService.resolve(
+                    magnet: magnet, settings: settings,
+                    season: season, episode: episode,
+                    // TorrServer's file id IS the torrent-relative index, so
+                    // unlike most debrid providers it can honour the addon's
+                    // pick directly instead of guessing by filename or size.
+                    fileIdx: stream.fileIdx
+                )
+            }
+            let result = outcome ?? .failed("TorrServer timed out after \(Int(budget))s")
+            // Cancelled from the resolve spinner — see the debrid path.
+            guard !Task.isCancelled else { return }
             resolving = false
             // Back popped the page during the P2P resolve — don't present the
             // player over a torn-down navigation entry.
@@ -1407,6 +1745,7 @@ struct StreamsView: View {
 struct StreamRowView: View {
     @ObservedObject private var perf = PerformanceSettingsStore.shared
     @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var homeCatalogSettings: HomeCatalogSettingsStore
     @Environment(\.isFocused) private var isFocused
 
     let entry: StreamEntry
@@ -1415,6 +1754,12 @@ struct StreamRowView: View {
     var badges: [StreamBadge] = []
 
     var body: some View {
+        // Layout → "Full stream names": rows grow to fit the whole release
+        // string instead of truncating it. `fixedSize` matters as much as the
+        // lifted line limits — inside the list's lazy stack a Text is happy to
+        // truncate at its proposed height unless told the full height is
+        // required.
+        let fullNames = homeCatalogSettings.fullStreamTitles
         HStack(spacing: OrivioSpacing.lg) {
             Image(systemName: entry.stream.isTorrent ? "bolt.horizontal.circle.fill" : "play.circle.fill")
                 .font(.system(size: 34))
@@ -1424,12 +1769,14 @@ struct StreamRowView: View {
                 Text(entry.displayName)
                     .font(.system(size: 25, weight: .semibold))
                     .foregroundStyle(theme.palette.textPrimary)
-                    .lineLimit(1)
+                    .lineLimit(fullNames ? nil : 1)
+                    .fixedSize(horizontal: false, vertical: fullNames)
                 if !entry.displayDetail.isEmpty {
                     Text(entry.displayDetail)
                         .font(.system(size: 20))
                         .foregroundStyle(theme.palette.textSecondary)
-                        .lineLimit(2)
+                        .lineLimit(fullNames ? nil : 2)
+                        .fixedSize(horizontal: false, vertical: fullNames)
                 }
                 if !badges.isEmpty {
                     StreamBadgeChips(badges: badges)
@@ -1549,6 +1896,28 @@ private struct AddonFilterChipLabel: View {
     }
 }
 
+
+/// The cover held over the source page between an automatic pick handing off to
+/// the player and this page actually being popped (`didAutoDismiss`). Just the
+/// title's backdrop: no spinner, no status, nothing that reads as a search
+/// starting up again on the way out of a title.
+private struct AutoPickHandoffScreen: View {
+    let meta: MetaItem
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            // Nothing else here is focusable, and with NOTHING focused a Menu
+            // press falls through to tvOS and suspends the app — the same
+            // reason AutoLinkLoadingScreen anchors focus.
+            FocusAnchor()
+            RemoteImage(url: meta.background ?? meta.poster,
+                        maxPixels: PerformanceProfile.backdropPixelCap)
+                .ignoresSafeArea()
+            Color.black.opacity(0.6).ignoresSafeArea()
+        }
+    }
+}
 
 /// The title's loading screen, shown while the Auto Link Selector picks a
 /// source. Deliberately a near-copy of `PlayerLoadingOverlay`: the player puts

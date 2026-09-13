@@ -221,10 +221,41 @@ struct InfuseInfoPanel: View {
                 .allowsHitTesting(false)
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(viewModel.infoCardTitle)
-                        .font(.system(size: 27, weight: .bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
+                    // The title, then what identifies the TITLE rather than
+                    // the file: score, certificate, genre. Score and
+                    // certificate are fixed-size, so the genre is the only one
+                    // that gives way when the column is narrow — "if there's
+                    // room", in that order of importance.
+                    HStack(alignment: .center, spacing: 16) {
+                        Text(viewModel.infoCardTitle)
+                            .font(.system(size: 27, weight: .bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .layoutPriority(2)
+                        if let imdb = viewModel.displayMeta.imdbRating, !imdb.isEmpty {
+                            ImdbBadge(rating: imdb).fixedSize()
+                        }
+                        // From the view model, resolved when the player opened —
+                        // fetching it here made the badge appear mid-slide.
+                        if let contentRating = viewModel.contentRating, !contentRating.isEmpty {
+                            ContentRatingBadge(rating: contentRating).fixedSize()
+                        }
+                        if let genres = infoGenres {
+                            Text(genres)
+                                .font(.system(size: 22, weight: .regular))
+                                .foregroundStyle(.white.opacity(0.7))
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    if let synopsis = infoSynopsis {
+                        Text(synopsis)
+                            .font(.system(size: 23, weight: .regular))
+                            .foregroundStyle(.white.opacity(0.8))
+                            .lineLimit(4)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     // WRAPPING, not clipped. As one `HStack … lineLimit(1)`
                     // everything past the width of the column simply vanished —
                     // on a well-described file that was the codec, the HDR tag,
@@ -234,6 +265,9 @@ struct InfuseInfoPanel: View {
                     InfuseWrapRow(spacing: 20, lineSpacing: 8) {
                         if let runtime = summary.runtime {
                             Text(runtime)
+                        }
+                        if let year = viewModel.displayMeta.releaseInfo, !year.isEmpty {
+                            Text(year)
                         }
                         ForEach(Array(summary.details.enumerated()), id: \.offset) { _, item in
                             Text(item)
@@ -285,15 +319,109 @@ struct InfuseInfoPanel: View {
         }
     }
 
+    /// An episode's card is about the EPISODE, so its own overview wins;
+    /// otherwise the title's.
+    private var infoSynopsis: String? {
+        if let overview = viewModel.currentVideo?.overview, !overview.isEmpty { return overview }
+        guard let description = viewModel.displayMeta.description, !description.isEmpty else { return nil }
+        return description
+    }
+
+    /// Three at most — past that it stops being a genre and starts being a
+    /// list, and it is the first thing to lose the width fight anyway.
+    private var infoGenres: String? {
+        guard let genres = viewModel.displayMeta.genres?.prefix(3), !genres.isEmpty else { return nil }
+        return genres.joined(separator: ", ")
+    }
+
     // MARK: Video tab
 
+    /// THE THREE COLUMNS MUST FIT 1748pt.
+    ///
+    /// The sheet is padded by `FusionMetrics.sideInset` (86) on each side of a
+    /// 1920pt screen, so the card has 1748pt — and this is the only tab whose
+    /// columns are fixed widths (Audio and Subtitles go through `twoColumns`,
+    /// which is `maxWidth: .infinity` and simply compresses). Fixed children
+    /// cannot compress, so when the total exceeded the card the HStack
+    /// overran, the ZStack that hosts BOTH this sheet and the video grew wider
+    /// than the screen, and `PlayerVideoView` — which fills that ZStack — took
+    /// the video's container with it. A `.resizeAspect` layer in an
+    /// oversized frame scales the picture up: opening the Video tab visibly
+    /// ZOOMED the film behind it, and the Status column was being clipped off
+    /// the right edge at the same time.
+    ///
+    /// 580 + 530 + 450 + (40 × 2 spacing) + (40 × 2 padding) = 1720, i.e.
+    /// 28pt of slack. Keep the sum under 1748 when touching any of these.
     private var videoTab: some View {
-        HStack(alignment: .top, spacing: 48) {
+        HStack(alignment: .top, spacing: 40) {
             formatColumn
             videoOptions
+            statusColumn
         }
         .padding(.vertical, 22)
         .padding(.horizontal, 40)
+    }
+
+    /// Live session health, right of Options: download speed, cache lead,
+    /// how much is on disk, connections — "why is this stuttering", answered
+    /// from the couch. Read-only and non-focusable, like Format. Refreshes
+    /// once a second via TimelineView, so only THIS column re-renders.
+    private var statusColumn: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            let h = MediaCacheServer.shared.health
+            let bufferAhead = max(viewModel.clock.buffered - viewModel.clock.position, 0)
+            VStack(alignment: .leading, spacing: 0) {
+                InfuseColumnHeader(text: "Status")
+                if h.hasSession {
+                    InfuseOptionRow(label: "Download",
+                                    value: h.downloadRate > 0 ? Self.rate(h.downloadRate) : "idle",
+                                    interactive: false)
+                    InfuseOptionRow(label: "Cache ahead",
+                                    value: h.leadSeconds > 0
+                                        ? "\(Int(h.leadSeconds))s (\(Self.bytes(h.leadBytes)))"
+                                        : Self.bytes(h.leadBytes),
+                                    interactive: false)
+                    InfuseOptionRow(label: "On disk",
+                                    value: h.totalBytes > 0
+                                        ? "\(Self.bytes(h.onDiskBytes)) of \(Self.bytes(h.totalBytes)) (\(Int(Double(h.onDiskBytes) / Double(h.totalBytes) * 100))%)"
+                                        : Self.bytes(h.onDiskBytes),
+                                    interactive: false)
+                    InfuseOptionRow(label: "Connections",
+                                    value: "\(h.busyWorkers)/\(h.workerLimit)"
+                                        + (h.originCap.map { " · capped at \($0)" } ?? ""),
+                                    interactive: false)
+                    if h.windowed {
+                        InfuseOptionRow(label: "Cache window",
+                                        value: h.pausedForSpace
+                                            ? "paused for space"
+                                            : "sliding · \(Self.bytes(h.evictedBytes)) evicted",
+                                        interactive: false)
+                    }
+                } else if let failure = h.failure {
+                    InfuseOptionRow(label: "Cache", value: failure, interactive: false)
+                } else {
+                    InfuseOptionRow(label: "Cache", value: "off (direct stream)", interactive: false)
+                }
+                InfuseOptionRow(label: "Engine buffer",
+                                value: bufferAhead > 0 ? "\(Int(bufferAhead))s" : "—",
+                                interactive: false)
+            }
+        }
+        .frame(width: 450, alignment: .leading)   // see videoTab's width budget
+        .allowsHitTesting(false)
+    }
+
+    private static func rate(_ bytesPerSecond: Double) -> String {
+        let mbps = bytesPerSecond / 1_048_576
+        return mbps >= 10 ? String(format: "%.0f MB/s", mbps)
+            : mbps >= 1 ? String(format: "%.1f MB/s", mbps)
+            : String(format: "%.0f KB/s", bytesPerSecond / 1024)
+    }
+
+    private static func bytes(_ count: Int64) -> String {
+        let mb = Double(count) / 1_048_576
+        return mb >= 1024 ? String(format: "%.1f GB", mb / 1024)
+            : String(format: "%.0f MB", mb)
     }
 
     /// What the stream IS, beside the controls that change how it's shown.
@@ -311,7 +439,7 @@ struct InfuseInfoPanel: View {
                 }
             }
         }
-        .frame(width: 620, alignment: .leading)
+        .frame(width: 580, alignment: .leading)   // see videoTab's width budget
         .allowsHitTesting(false)
     }
 
@@ -378,7 +506,7 @@ struct InfuseInfoPanel: View {
                 InfuseOptionRow(label: "Dolby Vision", value: dolby, interactive: false)
             }
         }
-        .frame(width: 560, alignment: .leading)
+        .frame(width: 530, alignment: .leading)   // see videoTab's width budget
     }
 
     private static let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
@@ -405,6 +533,26 @@ struct InfuseInfoPanel: View {
             }
         } trailing: {
             optionsColumn(header: "Options") {
+                // Lip-sync offset ("voices don't line up with the mouths") —
+                // per-title, remembered like speed. FFmpeg + VLC engines only;
+                // the native/DV paths have no adjustable clock, so the row
+                // stays out of the way there rather than lying.
+                if viewModel.audioSyncAdjustable {
+                    optionRow("audio.sync", label: "Audio Sync",
+                              value: PlayerViewModel.audioSyncLabel(viewModel.audioSyncOffset)) {
+                        InfusePickerSpec(title: "Audio Sync", content: .items(
+                            PlayerViewModel.audioSyncOptions.map { offset in
+                                InfusePickerItem(
+                                    id: "sync-\(Int(offset * 1000))",
+                                    title: PlayerViewModel.audioSyncLabel(offset),
+                                    selected: viewModel.audioSyncOffset == offset
+                                ) {
+                                    viewModel.setAudioSync(offset)
+                                }
+                            }
+                        ))
+                    }
+                }
                 actionRow("audio.speaker", label: "Speaker", value: speakerName) {
                     routePickerToken += 1
                 }
@@ -446,6 +594,11 @@ struct InfuseInfoPanel: View {
         } trailing: {
             optionsColumn(header: "Options") {
                 let s = store.settings
+                // Fetches the addon tracks again and puts the current one
+                // back — for captions that stopped showing or never loaded.
+                actionRow("sub.reload", label: "Reload Subtitles") {
+                    viewModel.reloadSubtitles()
+                }
                 optionRow("sub.font", label: "Font", value: fontLabel(s.subtitleFontName)) {
                     InfusePickerSpec(title: "Font", content: .items(
                         PlayerSettings.subtitleFontOptions.map { option in
@@ -762,7 +915,12 @@ struct InfuseColumnHeader: View {
     }
 }
 
-/// Label left, value right. Focus brightens both — there is no platter.
+/// Label left, value right. Focus brightens both — there is no platter, so
+/// contrast is the whole signal: an unfocused control sits well back and the
+/// focused one is pure white and semibold. `interactive: false` rows are the
+/// read-outs (the Video tab's Format column and its Dolby Vision line) — they
+/// are not controls, nothing ever focuses them, and they keep their own
+/// brightness rather than being dimmed as if they were dimmable.
 struct InfuseOptionRow: View {
     @Environment(\.isFocused) private var isFocused
     let label: String
@@ -773,13 +931,13 @@ struct InfuseOptionRow: View {
         HStack(spacing: 20) {
             Text(label)
                 .font(.system(size: InfuseRowMetrics.font, weight: isFocused ? .semibold : .regular))
-                .foregroundStyle(isFocused ? .white : .white.opacity(interactive ? 0.85 : 0.6))
+                .foregroundStyle(isFocused ? .white : .white.opacity(interactive ? 0.55 : 0.6))
                 .lineLimit(1)
             Spacer(minLength: 0)
             if let value {
                 Text(value)
-                    .font(.system(size: InfuseRowMetrics.font, weight: .regular))
-                    .foregroundStyle(isFocused ? .white : .white.opacity(0.45))
+                    .font(.system(size: InfuseRowMetrics.font, weight: isFocused ? .semibold : .regular))
+                    .foregroundStyle(isFocused ? .white : .white.opacity(interactive ? 0.42 : 0.45))
                     .lineLimit(1)
             }
         }
@@ -805,7 +963,7 @@ struct InfuseTrackRow: View {
                 .lineLimit(1)
             Spacer(minLength: 0)
         }
-        .foregroundStyle(isFocused ? .white : .white.opacity(selected ? 0.85 : 0.7))
+        .foregroundStyle(isFocused ? .white : .white.opacity(selected ? 0.62 : 0.5))
         .frame(height: InfuseRowMetrics.height)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.leading, -38)   // checkmark hangs in the gutter, text aligns with the header
@@ -819,6 +977,19 @@ struct InfusePickerItem: Identifiable {
     let id: String
     let title: String
     var subtitle: String? = nil
+    /// Badger badge chips for this link, drawn the way the pre-play Sources
+    /// list draws them. Carried as DATA rather than flattened into `subtitle`:
+    /// a badge's whole point is that it is recognisable at a glance from the
+    /// sofa, and `" · HDR · Atmos"` buried at the end of a grey subtitle line
+    /// is none of that.
+    var badges: [StreamBadge] = []
+    /// Debrid-cached torrent — instant play. The single most consequential
+    /// fact about a link and the one this list did not show at all: an
+    /// uncached source streams from a file the provider is still downloading,
+    /// which cannot report a length, so the hybrid cache refuses the session
+    /// and the title buffers its way through with no read-ahead at all.
+    var instant: Bool = false
+    var debridName: String? = nil
     let selected: Bool
     let action: () -> Void
 }
@@ -842,6 +1013,9 @@ struct InfusePickerSpec {
 struct InfusePickerScreen: View {
     @ObservedObject var viewModel: PlayerViewModel
     @EnvironmentObject private var streamBadges: StreamBadgeStore
+    /// Only for a torrent link's provider chip ("RD", "TB"), matching the
+    /// pre-play list. Injected app-wide, so the player's cover inherits it.
+    @EnvironmentObject private var debrid: DebridStore
     let spec: InfusePickerSpec
     let onClose: () -> Void
     @FocusState private var focus: String?
@@ -856,11 +1030,14 @@ struct InfusePickerScreen: View {
                 if !entry.displayDetail.isEmpty { detail += " · \(entry.displayDetail)" }
                 let tags = [entry.resolutionLabel, entry.fileSizeLabel].compactMap { $0 }
                 if !tags.isEmpty { detail += " · " + tags.joined(separator: " · ") }
-                let badges = streamBadges.badges(for: entry).map(\.name)
-                if !badges.isEmpty { detail += " · " + badges.joined(separator: " · ") }
-                return InfusePickerItem(id: entry.id.uuidString, title: entry.displayName,
-                                        subtitle: detail,
-                                        selected: entry.id == viewModel.currentEntry.id) {
+                return InfusePickerItem(
+                    id: entry.id.uuidString, title: entry.displayName,
+                    subtitle: detail,
+                    badges: streamBadges.badges(for: entry),
+                    instant: entry.stream.isTorrent && entry.isInstant,
+                    debridName: entry.stream.isTorrent ? debrid.resolverProvider?.shortName : nil,
+                    selected: entry.id == viewModel.currentEntry.id
+                ) {
                     viewModel.switchSource(entry)
                 }
             }
@@ -879,22 +1056,35 @@ struct InfusePickerScreen: View {
         }
     }
 
-    private var emptyLabel: String? {
+    /// Takes the rows the body already projected — `items` is expensive
+    /// enough that it is built once per pass and handed down (see `body`).
+    private func emptyLabel(for rows: [InfusePickerItem]) -> String? {
         switch spec.content {
         case .sources:
             if viewModel.isLoadingSources { return "Searching sources…" }
             return viewModel.allEntries.isEmpty ? "No sources found" : nil
         case .episodes:
-            return items.isEmpty ? "The episode list hasn't loaded yet" : nil
+            return rows.isEmpty ? "The episode list hasn't loaded yet" : nil
         case .items(let items):
             return items.isEmpty ? "Nothing to choose" : nil
         }
     }
 
-    private var hasSubtitles: Bool { items.contains { $0.subtitle != nil } }
-    private var rowWidth: CGFloat { hasSubtitles ? 1100 : 600 }
-
     var body: some View {
+        // `items` projects the WHOLE list — a uuidString, several string
+        // appends and a badge lookup per source, and for episodes a
+        // filter+sort over every video on the show. It was rebuilt on every
+        // pass by ForEach, defaultFocus (twice), the onChange key and the
+        // empty label, and — because `rowWidth` reached back through it —
+        // once more for every row the LazyVStack realized, so a 150-source
+        // list was rebuilt a dozen times on the main thread for a single Down
+        // press, while the video decoded underneath. Project once and pass it
+        // down. The onAppear and onChange ACTIONS deliberately still read
+        // `items` live: they run after this pass, and landing focus on a
+        // snapshot that no longer matches the rows on screen is how the
+        // remote goes dead.
+        let rows = items
+        let rowWidth: CGFloat = rows.contains { $0.subtitle != nil } ? 1100 : 600
         ZStack {
             Group {
                 if PerformanceProfile.isLowPower || PerformanceProfile.isMidPower {
@@ -916,7 +1106,7 @@ struct InfusePickerScreen: View {
 
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 12) {
-                        if let emptyLabel {
+                        if let emptyLabel = emptyLabel(for: rows) {
                             // Focusable so Menu still has somewhere to land.
                             Button {} label: {
                                 InfusePickerRow(title: emptyLabel, subtitle: nil, selected: false,
@@ -925,12 +1115,14 @@ struct InfusePickerScreen: View {
                             .buttonStyle(PlainCardButtonStyle())
                             .focused($focus, equals: "empty")
                         }
-                        ForEach(items) { item in
+                        ForEach(rows) { item in
                             Button {
                                 item.action()
                                 onClose()
                             } label: {
                                 InfusePickerRow(title: item.title, subtitle: item.subtitle,
+                                                badges: item.badges, instant: item.instant,
+                                                debridName: item.debridName,
                                                 selected: item.selected, width: rowWidth)
                             }
                             .buttonStyle(PlainCardButtonStyle())
@@ -943,9 +1135,20 @@ struct InfusePickerScreen: View {
                 .scrollClipDisabled()
             }
         }
-        .defaultFocus($focus, items.first { $0.selected }?.id ?? items.first?.id ?? "empty")
+        .defaultFocus($focus, rows.first { $0.selected }?.id ?? rows.first?.id ?? "empty")
         .onAppear {
             focus = items.first { $0.selected }?.id ?? items.first?.id ?? "empty"
+        }
+        // Sources and Episodes arrive AFTER the screen opens — a Continue
+        // Watching session has to fetch its alternatives first, and the
+        // episode list comes in with the enriched metadata. Focus was parked
+        // on the "Searching sources…" placeholder, which is removed the
+        // instant the real rows land, taking focus out of the hierarchy with
+        // it: a full screen of rows and a dead remote. Re-land it on the row
+        // the picker would have opened on.
+        .onChange(of: rows.map(\.id)) { _, ids in
+            if let current = focus, ids.contains(current) { return }
+            focus = items.first { $0.selected }?.id ?? ids.first ?? "empty"
         }
     }
 }
@@ -954,6 +1157,9 @@ private struct InfusePickerRow: View {
     @Environment(\.isFocused) private var isFocused
     let title: String
     let subtitle: String?
+    var badges: [StreamBadge] = []
+    var instant: Bool = false
+    var debridName: String? = nil
     let selected: Bool
     let width: CGFloat
 
@@ -969,8 +1175,30 @@ private struct InfusePickerRow: View {
                         .foregroundStyle(isFocused ? .black.opacity(0.6) : .white.opacity(0.55))
                         .lineLimit(2)
                 }
+                if !badges.isEmpty {
+                    StreamBadgeChips(badges: badges)
+                        .padding(.top, 3)
+                }
             }
             Spacer(minLength: 0)
+            // Cached-vs-not, the fact that decides whether this link plays now
+            // or buffers its way through. Same chip, same wording and the same
+            // trailing position as the pre-play Sources list, so the two lists
+            // read as one thing rather than two.
+            if instant {
+                MetaBadge(
+                    text: "⚡︎ Cached",
+                    tint: OrivioPrimitives.success.opacity(isFocused ? 0.30 : 0.22),
+                    textColor: OrivioPrimitives.success
+                )
+            }
+            if let debridName {
+                MetaBadge(
+                    text: debridName,
+                    tint: OrivioPrimitives.success.opacity(isFocused ? 0.30 : 0.22),
+                    textColor: OrivioPrimitives.success
+                )
+            }
             if selected {
                 Image(systemName: "checkmark")
                     .font(.system(size: 24, weight: .medium))
@@ -979,7 +1207,7 @@ private struct InfusePickerRow: View {
         }
         .foregroundStyle(isFocused ? .black : .white)
         .padding(.horizontal, 24)
-        .padding(.vertical, subtitle == nil ? 0 : 10)
+        .padding(.vertical, subtitle == nil && badges.isEmpty ? 0 : 10)
         .frame(width: width)
         .frame(minHeight: 67)
         .background(

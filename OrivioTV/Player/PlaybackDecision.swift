@@ -64,6 +64,11 @@ struct PlaybackDecisionLog {
     /// Record a decision. A repeat for the same stage REPLACES the earlier
     /// line (the DV path upgrades mid-session: detect → remux → switched).
     mutating func record(_ stage: String, _ choice: String, because reason: String) {
+        // Mirrored to the live probe: this log is WHY the session looks the
+        // way it does — engine, container, cache, colour — and it was only
+        // readable from inside the player's own info panel, which is not
+        // where anyone is looking when the picture is wrong.
+        PlayerProbe.event("decide", "\(stage): \(choice) — \(reason)")
         entries.removeAll { $0.stage == stage }
         entries.append(PlaybackDecisionEntry(stage: stage, choice: choice, reason: reason))
         NSLog("[OrivioDecision] %@ -> %@ (%@)", stage, choice, reason)

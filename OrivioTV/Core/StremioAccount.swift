@@ -604,14 +604,18 @@ enum StremioSync {
             .map { AddonManager.RemoteAddonState(manifestURL: $0.transportUrl, enabled: true) }
 
         if !addonStates.isEmpty {
-            _ = await addonManager.applyRemote(addons: addonStates, reconcile: false)
+            // Anything new here has to reach the Orivio account too: the full
+            // sync no longer re-uploads every store unconditionally.
+            if await addonManager.applyRemote(addons: addonStates, reconcile: false) > 0 {
+                addonManager.requestSyncPush()
+            }
         }
         let playing = await MainActor.run { OrivioSyncManager.playbackActive }
         if !saved.isEmpty {
             // Metadata lookups are a run of add-on requests: skipped while a
             // stream plays, filled in by the next idle pass.
             if !playing { saved = await enrichLibraryItems(saved, addonManager: addonManager) }
-            library.mergeRemote(saved, reconcile: false)
+            if library.mergeRemote(saved, reconcile: false) { library.requestSyncPush() }
         }
         OrivioSyncDiagnostics.record(
             .info, area: "Stremio",
@@ -632,7 +636,9 @@ enum StremioSync {
             }
             progress.mergeExternal(continueWatching)
         }
-        if !watchedItems.isEmpty { watched.mergeRemote(watchedItems, reconcile: false) }
+        if !watchedItems.isEmpty, watched.mergeRemote(watchedItems, reconcile: false) {
+            watched.requestSyncPush()
+        }
 
         if addonStates.isEmpty && saved.isEmpty && continueWatching.isEmpty && watchedItems.isEmpty {
             return "Nothing to sync"
@@ -691,26 +697,42 @@ enum StremioSync {
         let rawLibrary = library.allForSync()
         let savedLibrary = playing ? rawLibrary : await enrichLibraryItems(rawLibrary, addonManager: addonManager)
         if savedLibrary != rawLibrary { library.mergeRemote(savedLibrary, reconcile: false) }
-        let items = makeLibraryPutPayload(
-            library: savedLibrary,
-            progress: serviceProgress,
-            watched: watched.allForSync(),
-            clearedProgressIDs: clearedProgressIDs,
-            removedLibraryItems: removedLibraryItems
-        )
+        let watchedRows = watched.allForSync()
+        let cleared = clearedProgressIDs
+        let removed = removedLibraryItems
+        let lastHashes = lastPushedRowHashes
         // Only rows whose content changed since the last successful put. The
         // whole library used to go up every thirty seconds whether or not a
         // byte of it had moved; now a film in progress is a one-row put.
-        var changed: [[String: Any]] = []
-        var changedHashes: [String: String] = [:]
-        for row in items {
-            guard let id = row["_id"] as? String else { continue }
-            let hash = rowHash(row)
-            if lastPushedRowHashes[id] != hash {
-                changed.append(row)
-                changedHashes[id] = hash
+        //
+        // Built + hashed OFF the main actor: the wire is one row, but the
+        // BUILD is O(total rows) — a payload dictionary and one sorted-keys
+        // JSONSerialization per library/progress/watched row, every 30s tick,
+        // including mid-playback. At Trakt-import scale (thousands of watched
+        // rows) that was a steady main-thread hiccup beside video decode on
+        // the A8. Inputs are value-type snapshots taken above.
+        let (changed, changedHashes, totalRows) = await Task.detached(
+            priority: .utility
+        ) { () -> ([[String: Any]], [String: String], Int) in
+            let items = makeLibraryPutPayload(
+                library: savedLibrary,
+                progress: serviceProgress,
+                watched: watchedRows,
+                clearedProgressIDs: cleared,
+                removedLibraryItems: removed
+            )
+            var changed: [[String: Any]] = []
+            var changedHashes: [String: String] = [:]
+            for row in items {
+                guard let id = row["_id"] as? String else { continue }
+                let hash = rowHash(row)
+                if lastHashes[id] != hash {
+                    changed.append(row)
+                    changedHashes[id] = hash
+                }
             }
-        }
+            return (changed, changedHashes, items.count)
+        }.value
         if !changed.isEmpty {
             do {
                 try await StremioAccountService.putLibrary(authKey: authKey, items: changed)
@@ -726,9 +748,9 @@ enum StremioSync {
         if changed.isEmpty && !addonsSent {
             summary = "Stremio up to date"
         } else {
-            summary = "Pushed \(changed.count) changed of \(items.count) rows"
+            summary = "Pushed \(changed.count) changed of \(totalRows) rows"
                 + (addonsSent ? " · \(addonManager.addons.count) add-ons" : "")
-                + " (\(library.allForSync().count) library · \(serviceProgress.count) in-progress · \(watched.allForSync().count) watched)"
+                + " (\(savedLibrary.count) library · \(serviceProgress.count) in-progress · \(watchedRows.count) watched)"
         }
         guard !warnings.isEmpty else {
             return PushOutcome(summary: summary, libraryPushed: libraryPushed, changedRows: changed.count)
@@ -751,6 +773,7 @@ enum StremioSync {
         lastPushedAddonSignature = nil
         lastPulledStates = [:]
         lastPulledItemMeta = [:]
+        enrichmentAttempted = []
     }
 
     private static func rowHash(_ row: [String: Any]) -> String {
@@ -802,6 +825,15 @@ enum StremioSync {
         return nil
     }
 
+    /// Keys already attempted this session. Cinemeta simply HAS no art for
+    /// some items, and without the memo the same ≤30 candidates were
+    /// re-fetched — serially — on every 30s Stremio tick, forever: thirty
+    /// round trips per sync keeping the radio and main actor busy against
+    /// playback. OrivioSyncManager fixed the identical bug in its own copy
+    /// with `artworkBackfillAttempted`; this is that memo for the Stremio
+    /// copy. Reset on account change (resetPushCache).
+    private static var enrichmentAttempted: Set<String> = []
+
     @MainActor
     private static func enrichLibraryItems(
         _ items: [SavedLibraryItem],
@@ -812,11 +844,13 @@ enum StremioSync {
         let artworkItems = items.filter { item in
             !rawTitleKeys.contains(item.key) && (item.poster == nil || item.background == nil)
         }
-        let candidates = rawTitleItems + Array(artworkItems.prefix(30))
+        let candidates = (rawTitleItems + Array(artworkItems.prefix(30)))
+            .filter { !enrichmentAttempted.contains($0.key) }
         guard !candidates.isEmpty else { return items }
 
         var metaByKey: [String: MetaItem] = [:]
         for item in candidates {
+            enrichmentAttempted.insert(item.key)
             guard metaByKey[item.key] == nil else { continue }
             if let meta = await resolveSyncMetadata(id: item.id, type: item.type, addonManager: addonManager) {
                 metaByKey[item.key] = meta
@@ -1068,7 +1102,7 @@ enum StremioSync {
                 streamSignature: entry.streamSignature,
                 updatedAt: entry.updatedAt,
                 syncSource: entry.syncSource,
-                hasNewEpisode: entry.hasNewEpisode
+                newEpisodeCount: entry.newEpisodeCount
             )
     }
 

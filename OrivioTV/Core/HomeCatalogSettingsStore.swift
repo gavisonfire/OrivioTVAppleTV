@@ -88,6 +88,11 @@ struct HomePresentationSnapshot: Codable, Equatable {
     var showFullReleaseDate = true
     var detailPageTrailerButtonEnabled = true
     var showFeaturedBar = true
+    var pinnedHero = false
+    var autoHideSidebar = false
+    var fullStreamTitles = false
+    var heroTrailersEnabled = true
+    var heroTrailerSound = false
 }
 
 /// Tolerant decoding (in an extension so the memberwise init survives): a blob
@@ -114,6 +119,11 @@ extension HomePresentationSnapshot {
         showFullReleaseDate = (try? c.decode(Bool.self, forKey: .showFullReleaseDate)) ?? d.showFullReleaseDate
         detailPageTrailerButtonEnabled = (try? c.decode(Bool.self, forKey: .detailPageTrailerButtonEnabled)) ?? d.detailPageTrailerButtonEnabled
         showFeaturedBar = (try? c.decode(Bool.self, forKey: .showFeaturedBar)) ?? d.showFeaturedBar
+        pinnedHero = (try? c.decode(Bool.self, forKey: .pinnedHero)) ?? d.pinnedHero
+        autoHideSidebar = (try? c.decode(Bool.self, forKey: .autoHideSidebar)) ?? d.autoHideSidebar
+        fullStreamTitles = (try? c.decode(Bool.self, forKey: .fullStreamTitles)) ?? d.fullStreamTitles
+        heroTrailersEnabled = (try? c.decode(Bool.self, forKey: .heroTrailersEnabled)) ?? d.heroTrailersEnabled
+        heroTrailerSound = (try? c.decode(Bool.self, forKey: .heroTrailerSound)) ?? d.heroTrailerSound
     }
 }
 
@@ -207,6 +217,33 @@ final class HomeCatalogSettingsStore: ObservableObject {
     /// catalog rows. Off removes it from Home entirely.
     @Published var showFeaturedBar: Bool = true {
         didSet { guard showFeaturedBar != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Pin the hero to the top of Home and let it FOLLOW the focused card,
+    /// instead of a banner that scrolls away and rotates on a timer. The
+    /// spotlight rotation is switched off while this is on — the two are
+    /// alternative answers to the same question ("what is the hero showing?")
+    /// and running both means the art changes under the viewer's hands.
+    @Published var pinnedHero: Bool = false {
+        didSet { guard pinnedHero != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Keep the glass rail off screen until it's wanted. It reappears on a
+    /// sideways press from the leftmost content (and on Menu), so the rows run
+    /// the full width of the screen the rest of the time.
+    @Published var autoHideSidebar: Bool = false {
+        didSet { guard autoHideSidebar != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Sources page: let every link's release name wrap in full instead of
+    /// truncating — the whole point of a remux hunt is reading the whole name.
+    @Published var fullStreamTitles: Bool = false {
+        didSet { guard fullStreamTitles != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Netflix-style billboard preview on the home hero (HeroTrailerLayer).
+    @Published var heroTrailersEnabled: Bool = true {
+        didSet { guard heroTrailersEnabled != oldValue else { return }; save(); notifyPresentationChange() }
+    }
+    /// Play that preview with sound instead of muted.
+    @Published var heroTrailerSound: Bool = false {
+        didSet { guard heroTrailerSound != oldValue else { return }; save(); notifyPresentationChange() }
     }
     /// Continue Watching row ordering.
     @Published var continueWatchingSortMode: ContinueWatchingSortMode = .recentlyWatched {
@@ -503,11 +540,15 @@ final class HomeCatalogSettingsStore: ObservableObject {
     /// Apply a remote payload (pull). Suppresses the local-change push echo.
     func applyRemote(_ payload: SyncHomeCatalogPayload) {
         suppressChange = true
-        defer { suppressChange = false }
         orderKeys = payload.orderKeys
         disabledKeys = Set(payload.disabledKeys)
         customTitles = payload.customTitles.filter { !$0.value.isEmpty }
         hideUnreleasedContent = payload.hideUnreleasedContent
+        // Lift the suppression BEFORE the write: `save()` now early-returns
+        // while suppressed (so a bulk assign writes once, not once per
+        // property), and this is the one write that has to land. Matches
+        // `applyRemotePresentation` below.
+        suppressChange = false
         save()
     }
 
@@ -535,6 +576,11 @@ final class HomeCatalogSettingsStore: ObservableObject {
         var showFullReleaseDate: Bool?
         var detailPageTrailerButtonEnabled: Bool?
         var showFeaturedBar: Bool?
+        var pinnedHero: Bool?
+        var autoHideSidebar: Bool?
+        var fullStreamTitles: Bool?
+        var heroTrailersEnabled: Bool?
+        var heroTrailerSound: Bool?
     }
 
     private func notifyLocalChange() {
@@ -566,7 +612,12 @@ final class HomeCatalogSettingsStore: ObservableObject {
             catalogTypeSuffixEnabled: catalogTypeSuffixEnabled,
             showFullReleaseDate: showFullReleaseDate,
             detailPageTrailerButtonEnabled: detailPageTrailerButtonEnabled,
-            showFeaturedBar: showFeaturedBar
+            showFeaturedBar: showFeaturedBar,
+            pinnedHero: pinnedHero,
+            autoHideSidebar: autoHideSidebar,
+            fullStreamTitles: fullStreamTitles,
+            heroTrailersEnabled: heroTrailersEnabled,
+            heroTrailerSound: heroTrailerSound
         )
     }
 
@@ -592,6 +643,11 @@ final class HomeCatalogSettingsStore: ObservableObject {
         showFullReleaseDate = d.showFullReleaseDate
         detailPageTrailerButtonEnabled = d.detailPageTrailerButtonEnabled
         showFeaturedBar = d.showFeaturedBar
+        pinnedHero = d.pinnedHero
+        autoHideSidebar = d.autoHideSidebar
+        fullStreamTitles = d.fullStreamTitles
+        heroTrailersEnabled = d.heroTrailersEnabled
+        heroTrailerSound = d.heroTrailerSound
     }
 
     /// Apply presentation prefs pulled from the account without echoing back up.
@@ -615,6 +671,11 @@ final class HomeCatalogSettingsStore: ObservableObject {
         showFullReleaseDate = s.showFullReleaseDate
         detailPageTrailerButtonEnabled = s.detailPageTrailerButtonEnabled
         showFeaturedBar = s.showFeaturedBar
+        pinnedHero = s.pinnedHero
+        autoHideSidebar = s.autoHideSidebar
+        fullStreamTitles = s.fullStreamTitles
+        heroTrailersEnabled = s.heroTrailersEnabled
+        heroTrailerSound = s.heroTrailerSound
         suppressChange = false
         save()
     }
@@ -666,10 +727,22 @@ final class HomeCatalogSettingsStore: ObservableObject {
         showFullReleaseDate = decoded.showFullReleaseDate ?? true
         detailPageTrailerButtonEnabled = decoded.detailPageTrailerButtonEnabled ?? true
         showFeaturedBar = decoded.showFeaturedBar ?? true
+        pinnedHero = decoded.pinnedHero ?? false
+        autoHideSidebar = decoded.autoHideSidebar ?? false
+        fullStreamTitles = decoded.fullStreamTitles ?? false
+        heroTrailersEnabled = decoded.heroTrailersEnabled ?? true
+        heroTrailerSound = decoded.heroTrailerSound ?? false
         suppressChange = false
     }
 
     private func save() {
+        // Bulk assigns (`load`, `applyRemotePresentation`) set `suppressChange`
+        // and then write all ~22 published properties in a row, each with a
+        // `didSet { save() }`. Without this the store re-encoded and re-wrote
+        // the entire settings blob 22 times per apply — at launch, on every
+        // profile switch, and on every sync that carried a preference change.
+        // Both bulk paths call `save()` once themselves at the end.
+        guard !suppressChange else { return }
         let persisted = Persisted(
             orderKeys: orderKeys,
             disabledKeys: Array(disabledKeys),
@@ -691,7 +764,12 @@ final class HomeCatalogSettingsStore: ObservableObject {
             catalogTypeSuffixEnabled: catalogTypeSuffixEnabled,
             showFullReleaseDate: showFullReleaseDate,
             detailPageTrailerButtonEnabled: detailPageTrailerButtonEnabled,
-            showFeaturedBar: showFeaturedBar
+            showFeaturedBar: showFeaturedBar,
+            pinnedHero: pinnedHero,
+            autoHideSidebar: autoHideSidebar,
+            fullStreamTitles: fullStreamTitles,
+            heroTrailersEnabled: heroTrailersEnabled,
+            heroTrailerSound: heroTrailerSound
         )
         guard let data = try? JSONEncoder().encode(persisted) else { return }
         UserDefaults.standard.set(data, forKey: storageKey)

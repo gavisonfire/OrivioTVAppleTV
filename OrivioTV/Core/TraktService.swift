@@ -818,6 +818,40 @@ enum TraktService {
         let isMovie: Bool
     }
 
+    /// Items from one of Trakt's BROWSE endpoints — `movies/trending`,
+    /// `shows/popular` — with an optional filter query (`networks=Netflix`,
+    /// `years=$YEAR`; `$YEAR` is the current year at request time). Trending
+    /// and anticipated rows wrap the media in `{movie:…}` / `{show:…}`;
+    /// popular rows ARE the media object, so both shapes are read.
+    static func endpointItems(path: String, query: String?, type: String) async -> [PublicListItem] {
+        struct IDs: Decodable { let imdb: String?; let tmdb: Int? }
+        struct Media: Decodable { let title: String?; let year: Int?; let ids: IDs? }
+        struct Row: Decodable {
+            let movie: Media?; let show: Media?
+            let title: String?; let year: Int?; let ids: IDs?
+        }
+        var full = "/" + path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var params = ["limit=60"]
+        if let query, !query.isEmpty {
+            let year = String(Calendar.current.component(.year, from: Date()))
+            params.append(query.replacingOccurrences(of: "$YEAR", with: year))
+        }
+        full += (full.contains("?") ? "&" : "?") + params.joined(separator: "&")
+        guard let req = request(full) else { return [] }
+        guard let (data, response) = try? await session.data(for: req),
+              let http = response as? HTTPURLResponse else { return [] }
+        if http.statusCode != 200 { NSLog("[OrivioTrakt] GET %@ → HTTP %d", full, http.statusCode) }
+        guard let rows = try? JSONDecoder().decode([Row].self, from: data) else { return [] }
+        return rows.compactMap { row in
+            let isMovie = row.movie != nil || (row.show == nil && type == "movie")
+            let media = row.movie ?? row.show
+                ?? (row.title != nil ? Media(title: row.title, year: row.year, ids: row.ids) : nil)
+            guard let media, let title = media.title else { return nil }
+            return PublicListItem(imdb: media.ids?.imdb, tmdb: media.ids?.tmdb, title: title,
+                                  year: media.year, isMovie: isMovie)
+        }
+    }
+
     /// Items in a public Trakt list. `type` is "movie" or "show".
     static func publicListItems(traktListId: Int64, type: String, sortBy: String, sortHow: String) async -> [PublicListItem] {
         struct Row: Decodable {
@@ -826,7 +860,11 @@ enum TraktService {
             let type: String?; let movie: Media?; let show: Media?
         }
         let path = "/lists/\(traktListId)/items/\(type)"
-        guard let req = request(path + "?extended=full&limit=200&sort_by=\(sortBy)&sort_how=\(sortHow)") else {
+        // No `extended=full`: Row reads only type/title/year/ids, and the
+        // extended payload (overview, votes, translation metadata…) multiplied
+        // the response size of a 200-item page for nothing — decoded per
+        // folder open on the A8's CPU.
+        guard let req = request(path + "?limit=200&sort_by=\(sortBy)&sort_how=\(sortHow)") else {
             return []
         }
         guard let (data, response) = try? await session.data(for: req),

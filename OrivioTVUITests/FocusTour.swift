@@ -125,6 +125,118 @@ final class FocusTour: XCTestCase {
         for _ in 0..<5 { r.press(.right); sleep(3) }
     }
 
+    /// The detail page's Play button: where opening focus lands, and whether a
+    /// held Select opens the Play Manually menu. Both are reported as counts so
+    /// a run either proves or disproves the report without anyone watching.
+    ///
+    /// `XCUIRemote.press(_:forDuration:)` DOES deliver a held Select in the
+    /// simulator — the note that hold menus are device-only to test is wrong.
+    func testDetailPlayHold() {
+        app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
+        app.launchEnvironment["MTL_SHADER_VALIDATION"] = "0"
+        app.launchArguments = ["-detailDemo"]
+        holdOnPlay(label: "movie")
+    }
+
+    /// The same page for a SHOW — the case the hold menu still works on.
+    func testDetailPlayHoldSeries() {
+        app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
+        app.launchEnvironment["MTL_SHADER_VALIDATION"] = "0"
+        app.launchArguments = ["-detailDemo", "-detailSeries"]
+        holdOnPlay(label: "series")
+    }
+
+    /// A movie again, but focus is moved OFF Play and back ON before the hold.
+    /// If the menu opens here but not in `testDetailPlayHold`, the defect is in
+    /// the page's opening focus, not in the menu.
+    func testDetailPlayHoldAfterMove() {
+        app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
+        app.launchEnvironment["MTL_SHADER_VALIDATION"] = "0"
+        app.launchArguments = ["-detailDemo"]
+        holdOnPlay(label: "moved", nudgeFocus: true)
+    }
+
+    private func holdOnPlay(label: String, nudgeFocus: Bool = false) {
+        app.launch()
+        let r = XCUIRemote.shared
+        sleep(10)
+        if nudgeFocus {
+            r.press(.right); sleep(2)     // off Play, onto the + icon
+            r.press(.left); sleep(2)      // back onto Play the normal way
+            log("\(label)_00_after_nudge")
+        }
+        log("\(label)_01_detail_opened")
+        // Opening focus: 1 when the Play/Resume pill holds it.
+        let focused = focusedDesc()
+        attach("OPENS_ON_PLAY", focused.contains("Play") || focused.contains("Resume") ? 1 : 0)
+        let t = XCTAttachment(string: focused)
+        t.name = "\(label)_focused_desc"; t.lifetime = .keepAlways; add(t)
+
+        attach("MENU_BEFORE_HOLD", menuCount())
+        r.press(.select, forDuration: 2.0); sleep(3)
+        log("\(label)_02_after_hold")
+        attach("MENU_AFTER_HOLD", menuCount())
+    }
+
+    /// Leaving the rail with Right lands on the FIRST card of the row the
+    /// viewer left (ContentFocusRouter), not on whichever card the engine
+    /// finds nearest the rail's centre. Reported as RAIL_EXIT_FIRST (1 = the
+    /// same element that held focus at the row start before the rail opened).
+    func testRailExitLandsOnRowStart() {
+        app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
+        app.launchEnvironment["MTL_SHADER_VALIDATION"] = "0"
+        app.launchArguments = ["-homeDemo"]
+        app.launch()
+        let r = XCUIRemote.shared
+        sleep(12); log("re_00_home")
+        r.press(.down); sleep(2); log("re_01_first_row")
+        r.press(.down); sleep(2); log("re_02_second_row")
+        r.press(.right); sleep(1); r.press(.right); sleep(2); log("re_03_third_card")
+        r.press(.menu); sleep(2); log("re_04_back_to_start")   // Back → first card of the row
+        let atStart = focusedDesc()
+        r.press(.menu); sleep(2); log("re_05_rail")            // Back on the first card → rail
+        let onRail = focusedDesc()
+        r.press(.right); sleep(2); log("re_06_after_right")    // Right → back into content
+        let landed = focusedDesc()
+        attach("RAIL_OPENED", onRail != atStart ? 1 : 0)
+        attach("RAIL_EXIT_FIRST", landed == atStart ? 1 : 0)
+        let t = XCTAttachment(string: "start=\(atStart)\nrail=\(onRail)\nlanded=\(landed)")
+        t.name = "re_focus_summary"; t.lifetime = .keepAlways; add(t)
+    }
+
+    /// The transport bar at rest: the dark playhead line between the white
+    /// watched run and the cached band, and the band's contrast.
+    func testPlayerBarSnapshot() {
+        app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
+        app.launchEnvironment["MTL_SHADER_VALIDATION"] = "0"
+        app.launchArguments = ["-playerDemo"]
+        app.launch()
+        let r = XCUIRemote.shared
+        sleep(20); log("pb_00_playing")
+        r.press(.select); sleep(2); log("pb_01_controls")
+        r.press(.down); sleep(2); log("pb_02_down")
+        sleep(6); log("pb_03_later")
+    }
+
+    /// Press-driven scrubbing: click the bar to enter scrub, hop with edge
+    /// presses (these must HOP, not commit), then Select to commit. Screenshots
+    /// carry the readout so the target's motion is verifiable.
+    func testScrubPressFlow() {
+        app.launchEnvironment["MTL_DEBUG_LAYER"] = "0"
+        app.launchEnvironment["MTL_SHADER_VALIDATION"] = "0"
+        app.launchArguments = ["-playerDemo"]
+        app.launch()
+        let r = XCUIRemote.shared
+        sleep(18); log("sp_00_playing")
+        r.press(.select); sleep(2); log("sp_01_paused_controls")   // click video: pause + controls
+        r.press(.select); sleep(2); log("sp_02_scrub_open")        // click bar: enter scrub
+        r.press(.right); sleep(2); log("sp_03_hop_right")          // must hop, not commit
+        r.press(.right); sleep(2); log("sp_04_hop_right_2")
+        r.press(.left); sleep(2); log("sp_05_hop_left")
+        r.press(.select); sleep(3); log("sp_06_committed")         // commit + resume
+        sleep(3); log("sp_07_after")
+    }
+
     private func attach(_ name: String, _ value: Int) {
         let t = XCTAttachment(string: "\(name): \(value)")
         t.name = name; t.lifetime = .keepAlways; add(t)

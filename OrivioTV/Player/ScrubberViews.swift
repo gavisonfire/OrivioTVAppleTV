@@ -2,9 +2,8 @@ import SwiftUI
 
 /// Wall-clock time-of-day when the movie STARTED (now − elapsed) and when it
 /// will END (now + remaining), formatted like "8:34 PM". Recomputed every tick
-/// so it stays live. Used by the Fusion controls timeline (the peek bar and
-/// the old scrub HUDs that shared it are gone — this is all that remains of
-/// this file).
+/// so it stays live. Used by the Fusion controls timeline (the old scrub HUDs
+/// that shared it are gone — this is all that remains of this file).
 enum WatchClock {
     static func started(position: Double) -> String {
         Self.format(Date().addingTimeInterval(-position))

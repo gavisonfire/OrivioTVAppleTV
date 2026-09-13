@@ -55,10 +55,22 @@ struct ProfileAvatarView: View {
             image = cached
             return
         }
-        guard let (data, _) = try? await URLSession.shared.data(from: url),
-              !Task.isCancelled,
-              let decoded = UIImage(data: data) else { return }
-        ImageCache.shared.insert(decoded, for: urlString)
+        // Through the pipeline, not URLSession.shared + UIImage(data:): the
+        // avatar renders at ≤120pt, and the raw path decoded the original
+        // full-size (lazily, ON the render path) and then re-encoded it to
+        // JPEG on the main actor inside insert(). Downsampled decode happens
+        // off-main; the original bytes go to disk as-is.
+        if let disk = await ImageCache.shared.diskImage(for: urlString, budget: 256) {
+            if !Task.isCancelled { image = disk }
+            return
+        }
+        guard let data = try? await ImageCache.shared.download(url),
+              !Task.isCancelled else { return }
+        let decoded = await Task.detached(priority: .userInitiated) {
+            ImageCache.decodeDownsampled(data, budget: 256)
+        }.value
+        guard let decoded, !Task.isCancelled else { return }
+        ImageCache.shared.insert(decoded, for: urlString, data: data)
         image = decoded
     }
 
@@ -176,6 +188,11 @@ struct ProfileGateView: View {
         if let created = profiles.addProfile(name: "") {
             profiles.setActive(created.id)
             onSelected()
+        } else {
+            // Every free slot has a deletion still syncing — say so instead
+            // of a button that visibly does nothing.
+            ToastCenter.shared.show("Can't add a profile just yet — try again in a moment",
+                                    icon: "person.crop.circle.badge.exclamationmark")
         }
     }
 }
@@ -402,20 +419,20 @@ struct ProfileManageView: View {
     // Without an explicit focus binding the tiles' `@Environment(\.isFocused)`
     // ring didn't light up inside this fullScreenCover — the "nothing is
     // highlighted" bug. Driving focus explicitly (like the Who's-watching gate)
-    // makes the highlight reliable and lands focus on a tile, not "Done".
+    // makes the highlight reliable and lands focus on a tile.
     @FocusState private var focusedTile: Int?
 
     var body: some View {
         ZStack {
             ATVBackground()
             VStack(alignment: .leading, spacing: OrivioSpacing.xl) {
-                HStack {
-                    Text("Manage Profiles")
-                        .font(.system(size: 44, weight: .bold))
-                        .foregroundStyle(theme.palette.textPrimary)
-                    Spacer()
-                    Button("Done") { onDone() }
-                }
+                // No Done button: Menu/Back already dismisses this screen
+                // (`onExitCommand` below), and having it here put a focusable
+                // control above the tiles that the viewer had to step past.
+                Text("Manage Profiles")
+                    .font(.system(size: 44, weight: .bold))
+                    .foregroundStyle(theme.palette.textPrimary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack(alignment: .top, spacing: OrivioSpacing.xl) {
                     ForEach(profiles.profiles) { profile in
@@ -428,7 +445,12 @@ struct ProfileManageView: View {
                         .focused($focusedTile, equals: profile.id)
                     }
                     if profiles.canAddProfile {
-                        Button { profiles.addProfile(name: "") } label: {
+                        Button {
+                            if profiles.addProfile(name: "") == nil {
+                                ToastCenter.shared.show("Can't add a profile just yet — try again in a moment",
+                                                        icon: "person.crop.circle.badge.exclamationmark")
+                            }
+                        } label: {
                             GateTile(title: "Add") { DashedCircle(systemName: "plus") }
                         }
                         .buttonStyle(PlainCardButtonStyle())

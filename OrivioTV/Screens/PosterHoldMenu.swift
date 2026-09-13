@@ -92,6 +92,43 @@ extension View {
     }
 }
 
+// MARK: - Live TV channel hold menu (Favourite / Add to Home)
+
+/// Hold-Select on a Live TV channel: favourite it, and once it IS a favourite,
+/// pin it to the home screen as well. Two steps on purpose — "Add to Home"
+/// only appears on a channel you have already said you care about, which is
+/// what keeps the home row short.
+struct ChannelHoldMenu: ViewModifier {
+    @ObservedObject private var favorites = LiveChannelFavorites.shared
+    let channel: FavoriteChannel
+
+    func body(content: Content) -> some View {
+        content.contextMenu {
+            let _ = HoldProbe.log("MENU BUILT — channel \(channel.name)")
+            let isFavorite = favorites.isFavorite(channel.id)
+            Button { favorites.toggleFavorite(channel) } label: {
+                Label(isFavorite ? "Remove from Favorites" : "Favorite",
+                      systemImage: isFavorite ? "star.slash" : "star")
+            }
+            // NO `role: .destructive` anywhere in here — tvOS refuses to
+            // present a context menu that contains one (see ContinueHoldMenu).
+            if isFavorite {
+                Button { favorites.toggleOnHome(channel) } label: {
+                    Label(favorites.isOnHome(channel.id) ? "Remove from Home Page" : "Add to Home Page",
+                          systemImage: favorites.isOnHome(channel.id) ? "house.slash" : "house")
+                }
+            }
+        }
+    }
+}
+
+extension View {
+    /// Live TV channel hold-Select menu (Favorite / Add to Home Page).
+    func channelHoldMenu(_ channel: FavoriteChannel) -> some View {
+        modifier(ChannelHoldMenu(channel: channel))
+    }
+}
+
 // MARK: - Continue Watching hold menu (Details / Play Manually / Restart / Remove)
 
 struct ContinueHoldMenu: ViewModifier {

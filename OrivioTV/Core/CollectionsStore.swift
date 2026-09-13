@@ -32,6 +32,13 @@ struct CollectionSourceDTO: Codable, Hashable {
     var tmdbId: Int?
     // trakt provider (preserved, not yet rendered on tvOS)
     var traktListId: Int64?
+    /// tvOS-only: a Trakt BROWSE endpoint instead of a list — `movies/trending`,
+    /// `shows/popular` — with an optional filter query (`networks=Netflix`,
+    /// `years=$YEAR`). This is how the community categories resolve through a
+    /// Trakt sign-in when TMDB isn't set up. Other platforms drop the fields;
+    /// `resyncPresetSources` puts them back on the next launch here.
+    var traktEndpoint: String?
+    var traktQuery: String?
     // shared tmdb/trakt fields
     var mediaType: String?
     var sortBy: String?
@@ -51,6 +58,8 @@ struct CollectionSourceDTO: Codable, Hashable {
         title = try c.decodeIfPresent(String.self, forKey: .title)
         tmdbId = try c.decodeIfPresent(Int.self, forKey: .tmdbId)
         traktListId = try c.decodeIfPresent(Int64.self, forKey: .traktListId)
+        traktEndpoint = try c.decodeIfPresent(String.self, forKey: .traktEndpoint)
+        traktQuery = try c.decodeIfPresent(String.self, forKey: .traktQuery)
         mediaType = try c.decodeIfPresent(String.self, forKey: .mediaType)
         sortBy = try c.decodeIfPresent(String.self, forKey: .sortBy)
         sortHow = try c.decodeIfPresent(String.self, forKey: .sortHow)
@@ -79,6 +88,16 @@ struct CollectionSourceDTO: Codable, Hashable {
         self.filters = filters
     }
 
+    /// A Trakt browse-endpoint source (`movies/trending`, `shows/popular`…)
+    /// with an optional filter query, already percent-encoded.
+    init(traktEndpoint: String, traktQuery: String? = nil, title: String, mediaType: String = "movie") {
+        self.provider = "trakt"
+        self.traktEndpoint = traktEndpoint
+        self.traktQuery = traktQuery
+        self.title = title
+        self.mediaType = mediaType
+    }
+
     /// A Trakt public/personal list source.
     init(traktListId: Int64, title: String, mediaType: String = "movie", sortBy: String = "rank", sortHow: String = "asc") {
         self.provider = "trakt"
@@ -91,6 +110,11 @@ struct CollectionSourceDTO: Codable, Hashable {
 
     var isTMDBSource: Bool { provider.lowercased() == "tmdb" }
     var isTraktSource: Bool { provider.lowercased() == "trakt" }
+    /// A trakt source that can actually RESOLVE. Other platforms strip the
+    /// tvOS-only endpoint fields on a round-trip; a bare `provider: "trakt"`
+    /// row would count as resolvable in the blocker and then return nothing —
+    /// an empty folder with no guidance.
+    var isUsableTraktSource: Bool { isTraktSource && (traktListId != nil || traktEndpoint != nil) }
 
     // Gson omits nulls; match that so the blob compares stable across pushes.
     func encode(to encoder: Encoder) throws {
@@ -104,6 +128,8 @@ struct CollectionSourceDTO: Codable, Hashable {
         try c.encodeIfPresent(title, forKey: .title)
         try c.encodeIfPresent(tmdbId, forKey: .tmdbId)
         try c.encodeIfPresent(traktListId, forKey: .traktListId)
+        try c.encodeIfPresent(traktEndpoint, forKey: .traktEndpoint)
+        try c.encodeIfPresent(traktQuery, forKey: .traktQuery)
         try c.encodeIfPresent(mediaType, forKey: .mediaType)
         try c.encodeIfPresent(sortBy, forKey: .sortBy)
         try c.encodeIfPresent(sortHow, forKey: .sortHow)
@@ -112,7 +138,7 @@ struct CollectionSourceDTO: Codable, Hashable {
 
     private enum CodingKeys: String, CodingKey {
         case provider, addonId, type, catalogId, genre, tmdbSourceType, title
-        case tmdbId, traktListId, mediaType, sortBy, sortHow, filters
+        case tmdbId, traktListId, traktEndpoint, traktQuery, mediaType, sortBy, sortHow, filters
     }
 }
 
@@ -484,7 +510,17 @@ final class CollectionsStore: ObservableObject {
     func add(_ collection: OrivioCollection) {
         // Adding it back is an explicit undo of the delete.
         if removedAt.removeValue(forKey: collection.id) != nil { saveRemoved() }
-        library.append(collection)
+        // An UPSERT, never a blind append. Every caller looked the id up in
+        // the VISIBLE list first and fell through to here when it was
+        // missing — which a collection switched off in Settings always is —
+        // so each visit to a switched-off collection's editor appended
+        // another copy of it to the library: the "duplicates at the bottom",
+        // and a `ForEach` over non-unique ids on top.
+        if let index = library.firstIndex(where: { $0.id == collection.id }) {
+            library[index] = collection
+        } else {
+            library.append(collection)
+        }
         save()
         recomputeVisible()
         notifyLocalChange()
@@ -544,6 +580,11 @@ final class CollectionsStore: ObservableObject {
               let json = String(data: data, encoding: .utf8) else { return "[]" }
         return json
     }
+
+    /// Value snapshot of the whole library for callers that encode it
+    /// OFF the main actor (the sync push): the copy is cheap (CoW), the
+    /// encode of ~700 KB / hundreds of folders is not.
+    var librarySnapshotForSync: [OrivioCollection] { library }
 
     /// This profile's hidden ids, for the per-profile side of the sync.
     var hiddenIDsForSync: [String] { Array(hiddenIDs).sorted() }
@@ -608,11 +649,18 @@ final class CollectionsStore: ObservableObject {
         return true
     }
 
-    /// Merge a remote library into the shared one, de-duplicated by title with
-    /// the richer copy winning — the same rule the local migration uses. Used
-    /// when pulling the per-profile collection rows that predate the shared
-    /// library, so a pack that only ever lived on one profile is adopted
-    /// account-wide instead of being dropped.
+    /// Merge a remote library into the shared one, keyed by ID — the account
+    /// copy of a collection replaces the local one, and anything only one
+    /// side holds is kept.
+    ///
+    /// This used to key by TITLE with the "richer" copy winning (the legacy
+    /// per-profile migration's rule). Live, that deleted collections: a
+    /// freshly installed community group titled "Streaming Services" lost to
+    /// any older same-named collection on the account with more folders, and
+    /// removing a category made the local copy poorer, so the next pull put
+    /// it back. Local edits are flushed to the account before every pull
+    /// (`syncPreferencesChain`), so for the same id the incoming copy is the
+    /// current one.
     @discardableResult
     func mergeIntoLibrary(_ remote: [OrivioCollection]) -> Bool {
         guard !remote.isEmpty else { return false }
@@ -620,21 +668,16 @@ final class CollectionsStore: ObservableObject {
         // semantics of its own, so a tombstone is the only thing standing
         // between a removed collection and its return on the next sync.
         expireRemovedTombstones()
+        // …and retire tombstones the account no longer argues with: once a
+        // snapshot arrives WITHOUT the deleted id, the delete has propagated
+        // and the tombstone has done its job. Left in place, it also blocked a
+        // genuine re-add for its whole 30-day life. (This prune used to live
+        // only on a code path nothing calls.)
+        pruneRemovedTombstones(against: remote)
         let suppressed = removedIDs
         let incoming = suppressed.isEmpty ? remote : remote.filter { !suppressed.contains($0.id) }
         guard !incoming.isEmpty else { return false }
-        var byTitle: [String: OrivioCollection] = [:]
-        var order: [String] = []
-        for c in library + incoming {
-            let key = c.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if let existing = byTitle[key] {
-                if Self.richness(c) > Self.richness(existing) { byTitle[key] = c }
-            } else {
-                byTitle[key] = c
-                order.append(key)
-            }
-        }
-        let merged = order.compactMap { byTitle[$0] }
+        let merged = Self.uniqueByID(library + incoming)
         guard merged != library else { return false }
         suppressChange = true
         defer { suppressChange = false }
@@ -797,7 +840,9 @@ final class CollectionsStore: ObservableObject {
             let migrated = (persisted == nil && !legacyMigrated) ? Self.migrateLegacyProfileCollections() : nil
             await MainActor.run { [weak self] in
                 guard let self, self.library.isEmpty else { return }
-                let decoded = persisted ?? (migrated ?? []).filter { self.removedAt[$0.id] == nil }
+                let decoded = Self.uniqueByID(
+                    persisted ?? (migrated ?? []).filter { self.removedAt[$0.id] == nil }
+                )
                 self.library = decoded
                 self.recomputeVisible()
                 // Persist only if this came from the legacy per-profile
@@ -865,6 +910,19 @@ final class CollectionsStore: ObservableObject {
             NSLog("[OrivioCollections] migrated %d per-profile collections into a shared library", merged.count)
         }
         return merged
+    }
+
+    /// One entry per id, the LAST occurrence winning (a later write is the
+    /// fresher one). Also the repair for libraries that already carry the
+    /// duplicates an older `add` appended.
+    nonisolated static func uniqueByID(_ collections: [OrivioCollection]) -> [OrivioCollection] {
+        var byID: [String: OrivioCollection] = [:]
+        var order: [String] = []
+        for c in collections {
+            if byID[c.id] == nil { order.append(c.id) }
+            byID[c.id] = c
+        }
+        return order.compactMap { byID[$0] }
     }
 
     /// How much presentation data a collection carries — the tie-break when the

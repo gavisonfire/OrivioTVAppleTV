@@ -22,6 +22,8 @@ enum FusionMetrics {
     /// The scrub playhead slit.
     static let slitWidth: CGFloat = 4
     static let slitHeight: CGFloat = 20
+    /// The at-rest playhead dot (black, white hairline) riding the bar.
+    static let dotSize: CGFloat = 16
     /// Preview frame above the playhead while scrubbing.
     static let sceneWidth: CGFloat = 400
     static let sceneHeight: CGFloat = 225
@@ -50,14 +52,12 @@ enum FusionBarMode {
     case idle
     /// A left/right press is accumulating a skip that hasn't committed yet.
     case nudging
-    /// Fast-forward / rewind preview sweeping.
-    case scanning
     /// Scrubbing with the trackpad.
     case scrubbing
     /// Scrubbing with the fine-tune wheel engaged.
     case fineTuning
 
-    var showsScene: Bool { self == .scanning || self == .scrubbing || self == .fineTuning }
+    var showsScene: Bool { self == .scrubbing || self == .fineTuning }
     var showsReadout: Bool { self != .idle }
 }
 
@@ -149,11 +149,19 @@ struct FusionPlayerControlsOverlay: View {
         .defaultFocus($focusedControl, .bar)
         .onAppear {
             focusedControl = .bar
-            viewModel.controlsFocusOnBar = true
+            if !viewModel.controlsFocusOnBar { viewModel.controlsFocusOnBar = true }
         }
-        .onChange(of: focusedControl) { _, new in
+        .onChange(of: focusedControl) { old, new in
+            // Every hop, in order — which is how a single Up press showing as
+            // two moves (bar → subtitles → audio) is readable at all.
+            PlayerProbe.event("focus", "\(String(describing: old)) -> \(String(describing: new))")
             viewModel.restartHideTimer()
-            viewModel.controlsFocusOnBar = (new == .bar)
+            // Deduped: @Published publishes on equal-value assignment, and the
+            // onAppear write above plus this onChange used to land two full
+            // PlayerScreen passes inside the presentation frame itself.
+            if viewModel.controlsFocusOnBar != (new == .bar) {
+                viewModel.controlsFocusOnBar = (new == .bar)
+            }
             // Moving off the popover's rows (down onto a glyph or the bar)
             // dismisses it, the way leaving any menu does.
             if popoverGlyph != nil, let new, new != popoverGlyph {
@@ -163,7 +171,14 @@ struct FusionPlayerControlsOverlay: View {
         }
         .onChange(of: viewModel.overlay) { old, new in
             // Closing a popover hands focus back to its glyph, never to
-            // nothing (which would leave the remote dead).
+            // nothing (which would leave the remote dead) — but NOT when focus
+            // has already been placed somewhere deliberate.
+            //
+            // Pressing Down from a glyph moves focus to the bar, and moving off
+            // the popover is what closes it; this then fired and dragged focus
+            // straight back up to the glyph. One press, two visible hops, and
+            // the viewer ended up where they started.
+            guard focusedControl == nil || focusedControl == popoverGlyph else { return }
             if new == .controls, old == .audio { focusedControl = .audioGlyph }
             if new == .controls, old == .subtitles { focusedControl = .subtitlesGlyph }
         }
@@ -198,6 +213,7 @@ struct FusionPlayerControlsOverlay: View {
                                          @ViewBuilder icon: @escaping () -> Icon,
                                          action: @escaping () -> Void) -> some View {
         Button {
+            viewModel.noteSelectPressed()   // so the lift isn't also a tap
             action()
             viewModel.restartHideTimer()
         } label: {
@@ -209,14 +225,37 @@ struct FusionPlayerControlsOverlay: View {
         .onMoveCommand { direction in
             viewModel.noteInput("move \(direction) (\(label))")
             if viewModel.moveSuppressed { return }
+            viewModel.noteSelectPressed()   // a press's lift is not also a tap
             move(direction, from: control)
         }
+    }
+
+    /// The row Up from `control` lands on: the active track in that glyph's
+    /// popover, when that popover is the one on screen.
+    private func popoverEntryRow(for control: Control) -> Control? {
+        guard popoverGlyph == control else { return nil }
+        let options: [TrackOption]
+        let selected: String?
+        switch control {
+        case .subtitlesGlyph: options = viewModel.subtitleOptions; selected = viewModel.selectedSubtitleID
+        case .audioGlyph: options = viewModel.audioOptions; selected = viewModel.selectedAudioID
+        default: return nil
+        }
+        let id = options.first { $0.id == selected }?.id ?? options.first?.id
+        return id.map { Control.popoverRow($0) }
     }
 
     private func move(_ direction: MoveCommandDirection, from control: Control) {
         switch direction {
         case .down: focusedControl = .bar
-        case .up: viewModel.restartHideTimer()
+        case .up:
+            // With this glyph's popover open, Up steps INTO its rows. The
+            // panel sits above the glyph line, but `onMoveCommand` consumes
+            // the press before the focus engine sees it — so Up on a glyph
+            // whose popover was showing did nothing at all, and coming back
+            // down from the rows onto the glyph was a one-way trip.
+            if let row = popoverEntryRow(for: control) { focusedControl = row }
+            viewModel.restartHideTimer()
         case .left, .right:
             let order = glyphOrder
             guard let index = order.firstIndex(of: control) else { return }
@@ -232,17 +271,11 @@ struct FusionPlayerControlsOverlay: View {
     private var barInputTarget: some View {
         Button {
             viewModel.noteInput("click (bar)")
-            if viewModel.scanPreview != nil {
-                // A fast-forward preview is up — the press commits it.
-                viewModel.togglePlayPause()
-                viewModel.restartHideTimer()
-            } else {
-                // Clicking the bar pauses the picture and drops into scrub
-                // mode: the preview frame and the target time ride the
-                // playhead until the next click seeks and resumes (Menu puts
-                // it back where it was).
-                viewModel.beginScrub(pausing: true)
-            }
+            viewModel.noteSelectPressed()   // so the lift isn't also a tap
+            // Clicking the bar pauses the picture and drops into scrub mode:
+            // the preview frame and the target time ride the playhead until the
+            // next click seeks and resumes (Menu puts it back where it was).
+            viewModel.beginScrub(pausing: true)
         } label: {
             Color.clear
                 .frame(height: 60)
@@ -255,11 +288,20 @@ struct FusionPlayerControlsOverlay: View {
         .onMoveCommand { direction in
             viewModel.noteInput("move \(direction) (bar)")
             if viewModel.moveSuppressed { return }
+            viewModel.noteSelectPressed()   // a press's lift is not also a tap
             switch direction {
             case .left: viewModel.barDirectionalPress(forward: false)
             case .right: viewModel.barDirectionalPress(forward: true)
             case .up:
-                if let last = glyphOrder.last { focusedControl = last }
+                // The FIRST glyph (Subtitles), not the last. The focus engine
+                // also acts on this press — the bar spans the screen, so by
+                // centre distance it picks the leftmost glyph — and an
+                // assignment to the rightmost one then landed on top of it:
+                // focus visibly stepped onto Subtitles and jumped straight
+                // past to Audio. Agreeing with the engine is what makes it one
+                // move, and Subtitles is the near edge of the cluster anyway;
+                // Right walks along it.
+                if let first = glyphOrder.first { focusedControl = first }
                 else { viewModel.restartHideTimer() }
             case .down:
                 viewModel.restartHideTimer()
@@ -320,7 +362,7 @@ struct InfuseAudioGlyph: View {
     }
 }
 
-// MARK: - Scrub / peek presentation
+// MARK: - Scrub / quick-seek presentation
 //
 // `beginScrub()` clears the overlay and raises `isScrubbing`, so the controls
 // above are gone by then. This draws the same bar in the same place, without
@@ -362,15 +404,21 @@ private struct FusionBottomBlock<Trailing: View>: View {
 
     private var mode: FusionBarMode {
         if forcedScrub { return viewModel.wheelEngaged ? .fineTuning : .scrubbing }
-        if clock.scanPreview != nil { return .scanning }
         if viewModel.pendingSeekDelta != 0 { return .nudging }
         return .idle
+    }
+
+    /// Easing for the cache band's growth — nil (a step) on the 2–3 GB boxes,
+    /// where a continuous width animation over live video costs real frames.
+    static var bandMotion: Animation? {
+        (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower)
+            ? nil : .linear(duration: 0.7)
     }
 
     /// The position the bar is POINTING at: a scan preview, a scrub target, or
     /// playback plus any pending nudge.
     private var target: Double {
-        let raw = clock.scanPreview ?? clock.scrubTarget
+        let raw = clock.scrubTarget
             ?? (clock.position + viewModel.pendingSeekDelta)
         return min(max(raw, 0), duration)
     }
@@ -499,13 +547,56 @@ private struct FusionBottomBlock<Trailing: View>: View {
             // track took the playhead's height on the device (a fat capsule
             // the moment scrubbing began).
             ZStack(alignment: .leading) {
-                Rectangle().fill(.white.opacity(0.3))
-                // Cache band: from the playhead to the end of what's on
-                // hand. Grows across the film as the download runs.
-                if cached > live {
-                    Rectangle().fill(.white.opacity(0.28))
+                Rectangle().fill(.white.opacity(0.22))
+                // EVERY cached stretch, wherever it is. The archive fills the
+                // film from the beginning and around each place the viewer has
+                // jumped to, so a session ends up holding several disjoint
+                // runs; drawing only the one in front of the playhead showed a
+                // fraction of what was actually on disk.
+                //
+                // The band used to sit at 0.28 over a 0.3 groove — DARKER than
+                // the empty track, so what was on disk was invisible. And it
+                // stepped: the spans are published every 700ms with nothing
+                // easing the change, so the fill lurched forward in blocks
+                // (or, when a publish happened to share a transaction with a
+                // controls flip, rode that animation instead). Each stretch
+                // now eases across the same 0.7s the ticker takes, so the
+                // fill reads as one continuous advance.
+                // Identity is the span's own START, not its index: keyed by
+                // offset, a merge or a new span at the front handed every
+                // later rectangle a DIFFERENT span's geometry and the 0.7s
+                // animation slid them sideways across the bar. Keyed by start,
+                // a span keeps its identity while its end grows (the common
+                // "filling up" case animates smoothly) and a reshuffle just
+                // redraws (.identity — no per-publish fade flicker).
+                // A8/A10X: the bands STEP instead of easing. The 0.7s linear
+                // width animation ran continuously for as long as the
+                // transport was visible while the cache downloaded — a
+                // perpetual layout+composite over live video whose frames
+                // come off the same main run loop (see the presentation
+                // animation note in PlayerScreen).
+                ForEach(clock.cachedSpans, id: \.lowerBound) { span in
+                    let a = w * CGFloat(span.lowerBound)
+                    let b = w * CGFloat(span.upperBound)
+                    if b > a {
+                        Rectangle().fill(.white.opacity(0.45))
+                            .frame(width: b - a)
+                            .offset(x: a)
+                            .transition(.identity)
+                            .animation(Self.bandMotion, value: clock.cachedSpans)
+                    }
+                }
+                // With no per-span picture (KSPlayer/VLC sessions with no
+                // hybrid cache), the engine's own read-ahead is the band.
+                // Never drawn ON TOP of the spans: the two measures disagree
+                // slightly (contiguous-from-playhead vs everything on disk),
+                // and layering them painted a brightness seam mid-band that
+                // read as the cache being "split up".
+                if clock.cachedSpans.isEmpty, cached > live {
+                    Rectangle().fill(.white.opacity(0.45))
                         .frame(width: cached - live)
                         .offset(x: live)
+                        .animation(Self.bandMotion, value: clock.cacheEnd)
                 }
                 // Played — up to the pointed-at position.
                 Rectangle().fill(.white).frame(width: max(x, h))
@@ -534,14 +625,27 @@ private struct FusionBottomBlock<Trailing: View>: View {
                         .shadow(color: .black.opacity(0.6), radius: 3)
                         .offset(x: min(max(x - FusionMetrics.slitWidth / 2, 0),
                                        w - FusionMetrics.slitWidth))
+                } else {
+                    // At rest: a dark dot riding the bar at the playhead —
+                    // Infuse-style — so where you ARE is unmistakable against
+                    // both the white watched run and the cached band. Drawn
+                    // out here, not inside the track's clip, so it can stand
+                    // taller than the 6pt bar. A hairline ring keeps it
+                    // visible over the dark groove of an uncached stretch.
+                    Circle()
+                        .fill(.black)
+                        .frame(width: FusionMetrics.dotSize, height: FusionMetrics.dotSize)
+                        .overlay(Circle().strokeBorder(.white.opacity(0.85), lineWidth: 1.5))
+                        .shadow(color: .black.opacity(0.5), radius: 3)
+                        .offset(x: min(max(x - FusionMetrics.dotSize / 2, 0),
+                                       w - FusionMetrics.dotSize))
                 }
             }
             .overlay(alignment: .topLeading) {
                 // No frame rather than an empty one: the thumbnail pass is
                 // skipped on the A8, on HLS, and on huge remuxes.
                 if mode.showsScene, let preview = viewModel.thumbnail(at: target) {
-                    FusionSceneWindow(image: preview,
-                                      rate: mode == .scanning ? viewModel.scanRate : 0)
+                    FusionSceneWindow(image: preview)
                         .offset(x: clampedX(x, width: FusionMetrics.sceneWidth, in: w)
                                    - FusionMetrics.sceneWidth / 2,
                                 y: -(FusionMetrics.sceneHeight + FusionMetrics.sceneGap)
@@ -563,8 +667,6 @@ private struct FusionBottomBlock<Trailing: View>: View {
 /// still with a hairline edge and a soft shadow.
 private struct FusionSceneWindow: View {
     let image: UIImage
-    /// Scan speed; 0 hides the chip.
-    let rate: Int
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -579,19 +681,6 @@ private struct FusionSceneWindow: View {
                 )
                 .shadow(color: .black.opacity(0.7), radius: 14, y: 6)
 
-            if rate != 0 {
-                HStack(spacing: 5) {
-                    Image(systemName: rate > 0 ? "forward.fill" : "backward.fill")
-                        .font(.system(size: 18, weight: .bold))
-                    Text("\(abs(rate))×")
-                        .font(.system(size: 20, weight: .bold).monospacedDigit())
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(.black.opacity(0.7), in: Capsule())
-                .padding(8)
-            }
         }
         .frame(width: FusionMetrics.sceneWidth, height: FusionMetrics.sceneHeight)
     }

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import UIKit
 
 /// Two-way sync between the app and SIMKL: watch history (WatchedStore ↔ SIMKL
 /// history), the Library (↔ SIMKL's plan-to-watch list) and star ratings.
@@ -12,10 +13,14 @@ import Foundation
 ///
 /// Deliberately narrower than the Trakt manager in two places:
 ///
-/// * **No Continue Watching.** SIMKL has no playback-position API — nothing
-///   equivalent to Trakt's `/sync/playback` — so there is no partial position
-///   to pull in or push out. Marking something watched still flows through the
-///   history phase.
+/// * **Continue Watching is one-way, and approximate.** SIMKL has no
+///   playback-position API — nothing equivalent to Trakt's `/sync/playback` —
+///   so there is no partial position to pull in or push out. What its
+///   "watching" bucket does give is the episode you are up to, and that seeds
+///   Continue Watching at the START of the next episode (see
+///   `syncContinueWatching`). Positions flow out through the history phase
+///   instead: finishing an episode marks it watched, which is how SIMKL
+///   advances a show.
 /// * **No token refresh.** SIMKL access tokens do not expire, so there is no
 ///   refresh token to rotate and none of the single-use-refresh contention the
 ///   Trakt manager has to guard against.
@@ -26,6 +31,10 @@ final class SimklSyncManager: ObservableObject {
     private let library: LibraryStore
     private let ratings: RatingsStore
     private let addonManager: AddonManager
+    /// Continue Watching. SIMKL cannot supply a playback POSITION, but its
+    /// "watching" bucket says which episode you are up to — see
+    /// `SimklStore.syncContinueWatching` and `syncContinueWatching(remote:)`.
+    private let progress: ProgressStore
 
     private var cancellables = Set<AnyCancellable>()
     private var syncTask: Task<Void, Never>?
@@ -45,12 +54,13 @@ final class SimklSyncManager: ObservableObject {
     private var pushRetryNeeded = false
 
     init(simkl: SimklStore, watched: WatchedStore, library: LibraryStore,
-         ratings: RatingsStore, addonManager: AddonManager) {
+         ratings: RatingsStore, addonManager: AddonManager, progress: ProgressStore) {
         self.simkl = simkl
         self.watched = watched
         self.library = library
         self.ratings = ratings
         self.addonManager = addonManager
+        self.progress = progress
 
         // LOCAL → SIMKL: immediate push on each kind of local change.
         watched.onTrackerMark.append { [weak self] item in self?.pushMark(item) }
@@ -92,6 +102,50 @@ final class SimklSyncManager: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+
+        // Signed in is enough — no Orivio account required. See `startAutoSync`.
+        simkl.$accessToken
+            .map { $0 != nil }
+            .removeDuplicates()
+            .sink { [weak self] signedIn in
+                if signedIn { self?.startAutoSync() } else { self?.stopAutoSync() }
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in
+                guard self?.simkl.isSignedIn == true else { return }
+                self?.syncNow()   // throttled
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Auto sync
+
+    /// How often a signed-in SIMKL account reconciles on its own. Like Trakt,
+    /// SIMKL had no periodic sync at all — only sign-in, local changes and
+    /// setting flips — so a title watched elsewhere never turned up here until
+    /// the next launch. Cheap in practice: `runSync` asks `/sync/activities`
+    /// first and returns immediately when nothing has moved.
+    private static let autoSyncInterval: TimeInterval = 5 * 60
+    private var autoSyncTask: Task<Void, Never>?
+
+    private func startAutoSync() {
+        autoSyncTask?.cancel()
+        autoSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.autoSyncInterval * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                guard simkl.isSignedIn else { continue }
+                guard !OrivioSyncManager.playbackActive else { continue }
+                syncNow()
+            }
+        }
+    }
+
+    private func stopAutoSync() {
+        autoSyncTask?.cancel()
+        autoSyncTask = nil
     }
 
     // MARK: - Full sync
@@ -207,6 +261,10 @@ final class SimklSyncManager: ObservableObject {
             guard profileStillActive(profile) else { return }
             parts.append("\(await syncRatings(remote: remote, token: token)) ratings")
         }
+        if simkl.syncContinueWatching {
+            guard profileStillActive(profile) else { return }
+            parts.append("\(await syncContinueWatching(remote: remote, profile: profile)) continue watching")
+        }
         NSLog("[OrivioSimkl] runSync done: %@", parts.joined(separator: ", "))
         simkl.setSyncStatus(parts.isEmpty
                             ? "SIMKL: nothing to sync"
@@ -267,9 +325,18 @@ final class SimklSyncManager: ObservableObject {
                 return item.watchedAt > clearedAt
             }
         // Additive — never delete local history from a partial SIMKL response.
-        if !remoteItems.isEmpty { watched.mergeRemote(remoteItems, reconcile: false) }
+        // Anything new goes on to the Orivio account as well.
+        if !remoteItems.isEmpty, watched.mergeRemote(remoteItems, reconcile: false) {
+            watched.requestSyncPush()
+        }
 
-        let remoteKeys = Set(remoteItems.map(\.key))
+        // Built from EVERY remote row, not just the ones that survived the
+        // history filter above. A row SIMKL holds but this filter drops (an
+        // anime entry, a bucket we don't import) is still a row SIMKL has —
+        // treating it as missing is what re-uploaded it on every sync.
+        let remoteKeys = Set(remote.flatMap { s in
+            localIDs(from: s).map { WatchedItem.key(contentID: $0, season: s.season, episode: s.episode) }
+        })
         let pushable = watched.allForSync()
             .filter { !remoteKeys.contains($0.key) }
             .compactMap(syncItem(from:))
@@ -293,31 +360,39 @@ final class SimklSyncManager: ObservableObject {
         let known = remote.filter { $0.season == nil && $0.episode == nil }
         let titles = known.filter { $0.status == "plantowatch" }
 
+        let missing: [(item: SimklService.SyncItem, id: String)] = titles.compactMap { s in
+            guard let id = localID(from: s), !library.contains(id: id, type: s.type) else { return nil }
+            return (s, id)
+        }
+        // Same budget as the Trakt manager: artwork for the first 25 so a
+        // large watchlist can't turn one sync into hundreds of meta calls —
+        // fetched a few at a time, not one after another.
+        let metas = await TraktSyncManager.fetchMetas(missing.enumerated().map { index, entry in
+            (index < 25 ? addonManager.metaAddon(for: entry.item.type, id: entry.id) : nil,
+             entry.item.type, entry.id)
+        })
         var added: [SavedLibraryItem] = []
-        var enriched = 0
-        for s in titles {
-            guard let id = localID(from: s), !library.contains(id: id, type: s.type) else { continue }
+        for (index, entry) in missing.enumerated() {
+            let s = entry.item
             var name = s.title
             var poster: String?
             var background: String?
-            // Same budget as the Trakt manager: artwork for the first 25 so a
-            // large watchlist can't turn one sync into hundreds of meta calls.
-            if enriched < 25, let addon = addonManager.metaAddon(for: s.type, id: id),
-               let meta = try? await StremioAPI.meta(addon: addon, type: s.type, id: id) {
-                enriched += 1
+            if let meta = metas[index] {
                 if !meta.name.isEmpty { name = meta.name }
                 poster = meta.poster
                 background = meta.background
             }
-            added.append(SavedLibraryItem(id: id, type: s.type, name: name,
+            added.append(SavedLibraryItem(id: entry.id, type: s.type, name: name,
                                           poster: poster, background: background))
         }
         guard profileStillActive(profile) else { return 0 }   // the meta enrichment awaits
-        if !added.isEmpty { library.mergeRemote(added, reconcile: false) }
+        if !added.isEmpty, library.mergeRemote(added, reconcile: false) {
+            library.requestSyncPush()   // on to the Orivio account too
+        }
 
         // Everything SIMKL has, under any status — not just plan-to-watch.
-        let remoteKeys = Set(known.compactMap { s -> String? in
-            localID(from: s).map { "\(s.type)|\($0)" }
+        let remoteKeys = Set(known.flatMap { s in
+            localIDs(from: s).map { "\(s.type)|\($0)" }
         })
         let localOnly = library.allForSync()
             .filter { !remoteKeys.contains($0.key) && safeToPush.allows($0.type) }
@@ -341,7 +416,13 @@ final class SimklSyncManager: ObservableObject {
         }
         if !mapped.isEmpty { ratings.mergeRemote(mapped) }
 
-        let remoteIDs = Set(mapped.map(\.metaID))
+        // Every id form of every title SIMKL already has a RATING for.
+        // Deliberately not every title it knows: a title in the library with
+        // no rating SHOULD receive ours. The only change here from `mapped` is
+        // that both id forms are covered, so a locally `tmdb:`-keyed rating
+        // isn't re-pushed forever because SIMKL answered with the IMDb id.
+        let remoteIDs = Set(remote.filter { $0.season == nil && $0.rating != nil }
+                                  .flatMap(localIDs(from:)))
         let pushable = ratings.allForSync()
             .filter { !remoteIDs.contains($0.metaID) }
             .compactMap { syncItem(metaID: $0.metaID, type: $0.type, rating: $0.rating) }
@@ -390,6 +471,120 @@ final class SimklSyncManager: ObservableObject {
 
     // MARK: - ID mapping
 
+    // MARK: Continue Watching
+
+    /// Seed Continue Watching from SIMKL's "watching" bucket.
+    ///
+    /// One-way, and it has to be: SIMKL stores no playback position, so there
+    /// is nothing to push back that it doesn't already learn from the history
+    /// phase (finishing an episode marks it watched, which moves the show
+    /// along on SIMKL's side by itself).
+    ///
+    /// What it CAN say is which episode you are up to. For every show sitting
+    /// in "watching", the highest watched episode of the highest watched
+    /// season names the next one, and that episode goes in at position 0 —
+    /// "start this one", not "resume 14 minutes in", which is the honest
+    /// reading of the data.
+    ///
+    /// `mergeExternal` only advances a row when the incoming one is further
+    /// along and meaningfully newer, so a local row with a real position is
+    /// never overwritten by a position-less SIMKL row for the same episode.
+    private func syncContinueWatching(remote: [SimklService.SyncItem], profile: Int) async -> Int {
+        let clearedAt = WatchHistoryClearState.clearedAt
+        // Show-level rows carry the bucket; episode rows carry the progress.
+        var watchingShows: [String: SimklService.SyncItem] = [:]
+        for item in remote where item.type == "series" && item.status == "watching" {
+            guard item.season == nil, let id = localID(from: item) else { continue }
+            watchingShows[id] = item
+        }
+        guard !watchingShows.isEmpty else { return 0 }
+
+        /// The furthest episode SIMKL has seen for each show.
+        var furthest: [String: (season: Int, episode: Int, at: Date?)] = [:]
+        for item in remote where item.type == "series" {
+            guard let season = item.season, let episode = item.episode,
+                  let id = localID(from: item), watchingShows[id] != nil else { continue }
+            let current = furthest[id]
+            if current == nil || (season, episode) > (current!.season, current!.episode) {
+                furthest[id] = (season, episode, item.watchedAt)
+            }
+        }
+
+        // Newest first, and capped. A long-standing SIMKL account can have
+        // dozens of shows parked in "watching"; all of them at once would bury
+        // what this device is actually mid-way through, and each one costs an
+        // add-on meta round trip for its art. The cap is the enrichment budget,
+        // so every row that does appear is a complete card.
+        let ordered = watchingShows
+            .sorted { (furthest[$0.key]?.at ?? .distantPast) > (furthest[$1.key]?.at ?? .distantPast) }
+            .prefix(25)
+
+        // Nothing watched yet is a "plan to start", not a resume — that
+        // belongs in the Library, which the watchlist phase handles.
+        let candidates: [(id: String, show: SimklService.SyncItem, seen: (season: Int, episode: Int, at: Date?), updatedAt: Date)] =
+            ordered.compactMap { id, show in
+                guard let seen = furthest[id] else { return nil }
+                let updatedAt = seen.at ?? show.watchedAt ?? Date()
+                if let clearedAt, updatedAt <= clearedAt { return nil }
+                return (id, show, seen, updatedAt)
+            }
+        // Same budget the Trakt pull uses (the list is already capped at 25):
+        // a full meta fetch per show, a few at a time rather than in series.
+        let metas = await TraktSyncManager.fetchMetas(candidates.map {
+            (addonManager.metaAddon(for: "series", id: $0.id), "series", $0.id)
+        })
+        var rows: [WatchProgress] = []
+        for (index, candidate) in candidates.enumerated() {
+            let id = candidate.id
+            let show = candidate.show
+            let seen = candidate.seen
+            let updatedAt = candidate.updatedAt
+            var name = show.title
+            var poster: String?
+            var background: String?
+            var runtimeMin: Int?
+            var nextEpisode: (season: Int, episode: Int)?
+            if let meta = metas[index] {
+                if !meta.name.isEmpty { name = meta.name }
+                poster = meta.poster
+                background = meta.background
+                runtimeMin = Self.parseRuntimeMinutes(meta.runtime)
+                // Don't invent an episode past the end of the show. Choose the
+                // first known episode after the last one SIMKL reported, so a
+                // season finale correctly advances to next season's episode 1.
+                if let videos = meta.videos, !videos.isEmpty {
+                    nextEpisode = videos
+                        .compactMap { video -> (season: Int, episode: Int)? in
+                            guard let season = video.season, let episode = video.episode else { return nil }
+                            return (season, episode)
+                        }
+                        .filter { ($0.season, $0.episode) > (seen.season, seen.episode) }
+                        .sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
+                        .first
+                }
+            }
+            guard let nextEpisode else { continue }
+            // Already watched locally? Then it isn't next up here either.
+            if watched.isWatched(contentID: id, season: nextEpisode.season, episode: nextEpisode.episode) { continue }
+            let duration = Double((runtimeMin ?? 45) * 60)
+            rows.append(WatchProgress(
+                id: "\(id):\(nextEpisode.season):\(nextEpisode.episode)", metaID: id, type: "series",
+                name: name, poster: poster, background: background, logo: nil,
+                season: nextEpisode.season, episode: nextEpisode.episode, episodeTitle: nil,
+                positionSeconds: 0, durationSeconds: duration, streamURL: nil,
+                updatedAt: updatedAt, syncSource: "simkl"))
+        }
+        guard profileStillActive(profile), !rows.isEmpty else { return 0 }
+        progress.mergeExternal(rows)
+        return rows.count
+    }
+
+    /// Runtime string → minutes. Delegates to the Trakt manager's parser so
+    /// the two Continue Watching pulls estimate durations identically.
+    private static func parseRuntimeMinutes(_ raw: String?) -> Int? {
+        TraktSyncManager.parseRuntimeMinutes(raw)
+    }
+
     private func syncItem(from w: WatchedItem) -> SimklService.SyncItem? {
         let (imdb, tmdb) = Self.ids(from: w.contentID)
         guard imdb != nil || tmdb != nil else { return nil }
@@ -403,6 +598,20 @@ final class SimklSyncManager: ObservableObject {
         return WatchedItem(contentID: cid, contentType: s.type, title: s.title,
                            season: s.season, episode: s.episode,
                            watchedAt: s.watchedAt ?? Date())
+    }
+
+    /// EVERY local id form this remote row could correspond to.
+    ///
+    /// `localID` picks one (IMDb first), but the local store may hold the
+    /// title under the other. A row saved as `tmdb:438631` never matched a
+    /// SIMKL row returned as `tt1160419`, so it counted as "SIMKL doesn't have
+    /// this" on every sync and was re-uploaded forever — and the pull added a
+    /// SECOND local row under the IMDb id, so one film showed twice.
+    private func localIDs(from s: SimklService.SyncItem) -> [String] {
+        var out: [String] = []
+        if let imdb = s.imdb, imdb.hasPrefix("tt") { out.append(imdb) }
+        if let tmdb = s.tmdb { out.append("tmdb:\(tmdb)") }
+        return out
     }
 
     private func localID(from s: SimklService.SyncItem) -> String? {

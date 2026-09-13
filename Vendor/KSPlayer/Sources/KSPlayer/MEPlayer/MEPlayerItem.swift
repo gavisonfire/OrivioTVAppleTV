@@ -58,6 +58,12 @@ public final class MEPlayerItem: Sendable {
         }
     }
 
+    // ORIVIO PATCH (wedged seek): true only while the read thread is inside
+    // av_read_frame. Read/written on the read thread only — FFmpeg invokes
+    // the interrupt callback on the thread executing the blocking call, so
+    // no lock is needed. Lets the callback abort a BLOCKED read when a seek
+    // is pending without ever aborting the seek's own I/O.
+    private var inAVRead = false
     private var state = MESourceState.idle {
         didSet {
             switch state {
@@ -178,6 +184,16 @@ extension MEPlayerItem {
             switch formatContext.state {
             case .finished, .closed, .failed:
                 return 1
+            case .seeking:
+                // ORIVIO PATCH (wedged seek): seeks are serviced BY the read
+                // thread between reads, and a read blocked on a stalled
+                // connection (no rw_timeout + reconnect=1 means potentially
+                // minutes inside one av_read_frame) never yields — so a seek
+                // to a region the local cache could serve instantly sat
+                // queued forever ("scrubbing to another cached part doesn't
+                // work"). Abort the BLOCKED READ so the thread can run the
+                // seek; `inAVRead` keeps the seek's own I/O uninterrupted.
+                return formatContext.inAVRead ? 1 : 0
             default:
                 return 0
             }
@@ -534,7 +550,11 @@ extension MEPlayerItem {
         guard let corePacket = packet.corePacket else {
             return 0
         }
+        // ORIVIO PATCH (wedged seek): see the interrupt callback — the flag
+        // scopes its .seeking abort to exactly this blocking call.
+        inAVRead = true
         let readResult = av_read_frame(formatCtx, corePacket)
+        inAVRead = false
         if state == .closed {
             return 0
         }
@@ -585,6 +605,11 @@ extension MEPlayerItem {
                     allPlayerItemTracks.forEach { $0.isEndOfFile = true }
                     state = .finished
                 }
+            } else if state == .seeking {
+                // ORIVIO PATCH (wedged seek): this read was aborted by the
+                // interrupt callback because a seek is pending — not a source
+                // failure. The seek resets the demuxer; if the source really
+                // is dead, the first read AFTER the seek reports it.
             } else {
                 //                        if IS_AVERROR_INVALIDDATA(readResult)
                 error = .init(errorCode: .readFrame, avErrorCode: readResult)

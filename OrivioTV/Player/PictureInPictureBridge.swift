@@ -24,11 +24,14 @@ import UIKit
 /// by `resolveInstanceMethod` with a zero and written to the PiP trail, so a
 /// selector this build never saw shows up by name instead of as a crash.
 enum GenericPictureInPicture {
-    static var isAvailable: Bool {
+    /// `static let`, not a computed var: the runtime's answer cannot change
+    /// within a process, and this is read from the player's 10 Hz tick — an
+    /// NSClassFromString + class_getInstanceMethod pair per tick, for the
+    /// whole film, on the main actor.
+    static let isAvailable: Bool =
         NSClassFromString("AVPictureInPictureContentViewController") != nil
             && class_getInstanceMethod(AVPictureInPictureController.ContentSource.self,
                                        initSelector) != nil
-    }
 
     private static let initSelector = NSSelectorFromString(
         "initWithSourceView:contentViewController:playerController:")

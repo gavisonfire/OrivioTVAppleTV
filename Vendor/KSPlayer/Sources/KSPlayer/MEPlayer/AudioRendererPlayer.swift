@@ -90,6 +90,14 @@ public class AudioRendererPlayer: AudioOutput {
             }
             self.request()
         }
+        // ORIVIO PATCH: a play() landing while already playing (autoplay after
+        // a seek racing a user press) stacked a SECOND periodic observer —
+        // and pause() removes only the last one, so the stale observer kept
+        // re-stamping the clock forever.
+        if let periodicTimeObserver {
+            synchronizer.removeTimeObserver(periodicTimeObserver)
+            self.periodicTimeObserver = nil
+        }
         periodicTimeObserver = synchronizer.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.01), queue: .main) { [weak self] time in
             guard let self else {
                 return

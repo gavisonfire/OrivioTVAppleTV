@@ -69,12 +69,27 @@ final class TouchHostView: UIView, UIGestureRecognizerDelegate {
     }
 
     @objc private func handlePan(_ g: UIPanGestureRecognizer) {
-        guard isActive() else { return }
         let t = g.translation(in: g.view)
         switch g.state {
-        case .began: onBegan()
-        case .changed: onMoved(t.x, t.y)
-        case .ended, .cancelled, .failed: onEnded(t.x, t.y)
+        case .began:
+            // Probe the GATE, not just the delivery. "I swiped and nothing
+            // happened" has two completely different causes — the recognizer
+            // never fired, or it fired and `isActive` refused it because some
+            // overlay was up — and they are indistinguishable downstream.
+            PlayerProbe.event("remote", "pad DOWN (active=\(isActive().probe))")
+            if isActive() { onBegan() } else { PlayerProbe.count("input.pan-rejected") }
+        case .changed: if isActive() { onMoved(t.x, t.y) }
+        // The END is delivered UNCONDITIONALLY. `isActive` reads the live
+        // overlay, so a gesture that began over active UI and ended after an
+        // overlay opened mid-swipe (Up Next arriving, a glyph popover) had its
+        // `.ended` swallowed — `panInFlight` then stayed true for the rest of
+        // the session, and everything keyed on "a drag is in flight" (the
+        // scrub commit-click, gesture adoption) misread every later press.
+        case .ended, .cancelled, .failed:
+            PlayerProbe.event("remote", String(format: "pad UP %@ (%+.0f,%+.0f)",
+                                               g.state == .ended ? "ended" : "cancelled",
+                                               t.x, t.y))
+            onEnded(t.x, t.y)
         default: break
         }
     }
@@ -145,6 +160,8 @@ final class MenuHostView: UIView, UIGestureRecognizerDelegate {
     }
 
     @objc private func handleMenu() {
+        PlayerProbe.event("remote", "MENU (window recognizer)")
+        PlayerProbe.count("input.menu")
         onMenu()
     }
 }

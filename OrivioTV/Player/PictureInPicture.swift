@@ -56,13 +56,18 @@ final class PictureInPictureController: NSObject, ObservableObject {
     /// Diagnostics ring buffer, persisted so it can be read back from the app
     /// container after the fact — a console session cannot be attached to a
     /// player the viewer drives themselves. Read with the `dev.pipTrail` key.
-    private static let trailKey = "dev.pipTrail"
+    nonisolated private static let trailKey = "dev.pipTrail"
     /// Appends go to an in-memory ring and are flushed to UserDefaults on a
     /// utility queue at most once a second. The first version rewrote the
     /// whole 800-line array synchronously on every call, on whichever thread
     /// called — the player's clock tick included — which showed up as a
     /// periodic hitch in full-screen playback whenever the probe was on.
     nonisolated static func trail(_ line: String) {
+        // Mirrored into the live probe for the reason dvTrail is: the PiP
+        // trail is written from lifecycle callbacks that fire exactly when
+        // the app is going away, and reading it afterwards (pulling the
+        // container) BACKGROUNDS the app, which fires more of them.
+        PlayerProbe.event("pip", line)
         NSLog("[OrivioPiP] %@", line)
         let stamped = "\(Date().formatted(date: .omitted, time: .standard)) \(line)"
         trailQueue.async {
@@ -76,7 +81,7 @@ final class PictureInPictureController: NSObject, ObservableObject {
             }
         }
     }
-    private static let trailQueue = DispatchQueue(label: "orivio.pip.trail", qos: .utility)
+    nonisolated private static let trailQueue = DispatchQueue(label: "orivio.pip.trail", qos: .utility)
     nonisolated(unsafe) private static var trailBuffer: [String] =
         UserDefaults.standard.stringArray(forKey: "dev.pipTrail") ?? []
     nonisolated(unsafe) private static var trailFlushScheduled = false
@@ -93,6 +98,14 @@ final class PictureInPictureController: NSObject, ObservableObject {
     /// Where the video view came from, so `stop`/restore can put it back
     /// before the player screen rebuilds its container.
     private weak var genericViewHome: UIView?
+    /// The view actually parented in the content view controller right now.
+    /// Deliberately NOT the same field as `attachedGenericView`, which stays
+    /// the view the ContentSource was BUILT for: a re-host under a live window
+    /// swaps this one, and the identity guard in `attach(genericView:)` must
+    /// still see a mismatch once the session ends and rebuild the source. Left
+    /// pointing at the retired view, AVKit would be measuring a `sourceView`
+    /// that is in no window, and PiP could never start again this session.
+    private weak var hostedGenericView: UIView?
 
     /// Point at whatever the engine renders into.
     ///
@@ -141,11 +154,19 @@ final class PictureInPictureController: NSObject, ObservableObject {
 
     /// Point at a render view no `AVPlayerLayer` backs. Same idempotence
     /// contract as `attach(_:)`; the bridge is created once per view.
-    func attach(genericView view: UIView?, bridge makeBridge: () -> PiPPlaybackBridge) {
+    /// The KSOptions host hooks are process-wide and identical for every
+    /// session, but this attach runs from the 10 Hz tick — installing a
+    /// fresh escaping closure per tick was a small, permanent main-actor
+    /// allocation cost for the whole film. Install once.
+    private static let hostHooksInstalled: Void = {
         KSOptions.hostPictureInPictureActive = { PiPHandoff.shared.isActive }
-        if ProcessInfo.processInfo.arguments.contains("-pipProbe") {
+        if PlayerDevFlags.pipProbe {
             KSOptions.hostTrail = { PictureInPictureController.trail($0) }
         }
+    }()
+
+    func attach(genericView view: UIView?, bridge makeBridge: () -> PiPPlaybackBridge) {
+        _ = Self.hostHooksInstalled
         guard AVPictureInPictureController.isPictureInPictureSupported(),
               GenericPictureInPicture.isAvailable, let view else {
             if !loggedUnavailable {
@@ -156,7 +177,11 @@ final class PictureInPictureController: NSObject, ObservableObject {
             return
         }
         guard view !== attachedGenericView else { return }
-        guard !isActive else { return }   // see attach(_:)
+        // The controller and its ContentSource must outlive a source change
+        // under a live window (see attach(_:)) — but the view the window is
+        // SHOWING still has to follow the engine, or it goes on drawing the
+        // retired one.
+        guard !isActive else { rehostGenericView(view); return }
         Self.trail("attach generic \(type(of: view)) \(Unmanaged.passUnretained(view).toOpaque())")
         reset()
         // Recorded BEFORE the fallible steps: a failed attach is otherwise
@@ -205,13 +230,46 @@ final class PictureInPictureController: NSObject, ObservableObject {
         view.frame = host.bounds
         view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         host.addSubview(view)
+        hostedGenericView = view
         Self.trail("generic: routed \(type(of: view)) into content VC, host bounds=\(Int(host.bounds.width))x\(Int(host.bounds.height)) inWindow=\(host.window != nil)")
+    }
+
+    /// Swap the view the live window is hosting for the one the engine renders
+    /// into NOW, leaving the controller and its ContentSource alone.
+    ///
+    /// A load that builds a new render view under a running window retires the
+    /// engine that was drawing into the one parented here: the same-URL reopen
+    /// (audio-route change, seek-fault recovery) drops the `KSPlayerLayer` and
+    /// builds a fresh one, and `startDVFirst` / `loadViaVLC` retire it for an
+    /// engine with its own view. Nothing else re-parents — `PlayerVideoView`
+    /// is unmounted for the whole handoff, and both `attach` overloads refuse
+    /// to re-point while `isActive` — so the window sat on the retired
+    /// stream's last frame (or black) while the new one's audio played, with
+    /// no way out but restoring to full screen. Same framing as
+    /// `routeGenericViewIntoPiP()`; the controller is untouched on purpose,
+    /// because rebuilding it mid-session takes the window down with no
+    /// `didStop` and strands `isActive` (see attach(_:)).
+    private func rehostGenericView(_ view: UIView) {
+        guard let hosted = hostedGenericView, hosted !== view,
+              let host = contentViewController?.view,
+              hosted.superview === host else { return }
+        hosted.removeFromSuperview()
+        hostedGenericView = view
+        view.removeFromSuperview()
+        view.translatesAutoresizingMaskIntoConstraints = true
+        view.frame = host.bounds
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        host.addSubview(view)
+        Self.trail("generic: re-hosted \(type(of: view)) into the live window")
     }
 
     /// PiP is over: hand the view back to whatever container is live (the
     /// re-presented player screen re-parents it itself on its next update).
     private func routeGenericViewHome() {
-        guard let view = attachedGenericView, view.superview === contentViewController?.view else { return }
+        // The HOSTED view, not the attached one — after a re-host they are
+        // different, and it is the one in the window that has to come home.
+        guard let view = hostedGenericView, view.superview === contentViewController?.view else { return }
+        hostedGenericView = nil
         view.removeFromSuperview()
         view.translatesAutoresizingMaskIntoConstraints = false
         Self.trail("generic: view returned from content VC")
@@ -255,8 +313,7 @@ final class PictureInPictureController: NSObject, ObservableObject {
     private var probeTimer: Timer?
     private let probeStartedAt = Date()
     func probe() {
-        guard ProcessInfo.processInfo.arguments.contains("-pipProbe"),
-              let controller else { return }
+        guard PlayerDevFlags.pipProbe, let controller else { return }
         if probeTimer == nil {
             // Keep probing even when the engine's clock stops ticking.
             probeTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] timer in
@@ -328,14 +385,14 @@ final class PictureInPictureController: NSObject, ObservableObject {
         Self.collectLogs(since: probeStartedAt.addingTimeInterval(-30))
         // `-pipForce`: start it even though AVKit says impossible, purely to
         // capture the error it answers with.
-        if ProcessInfo.processInfo.arguments.contains("-pipForce"), !forcedStart, !isActive {
+        if PlayerDevFlags.pipForce, !forcedStart, !isActive {
             forcedStart = true
             Self.trail("forcing start as soon as possible")
             startWhenPossible()
         }
     }
 
-    private static let logQueue = DispatchQueue(label: "orivio.pip.logs", qos: .utility)
+    nonisolated private static let logQueue = DispatchQueue(label: "orivio.pip.logs", qos: .utility)
     nonisolated(unsafe) private static var seenLogLines = Set<String>()
     nonisolated(unsafe) private static var logCollecting = false
     nonisolated(unsafe) private static var logPosition: OSLogPosition?
@@ -369,7 +426,19 @@ final class PictureInPictureController: NSObject, ObservableObject {
         }
     }
 
+    /// Tear the controller down. IDEMPOTENT AND CHEAP WHEN ALREADY CLEAR —
+    /// both `attach` overloads call this from their unavailable path, and that
+    /// path is taken on every clock tick whenever there is nothing to attach
+    /// to: the whole load phase before the engine has a view, and the entire
+    /// film in the Simulator (where `isPictureInPictureSupported()` is false).
+    /// `isPossible` is `@Published`, and Combine publishes on every assignment
+    /// whether or not the value changed, so the unguarded version was firing
+    /// `objectWillChange` ten times a second to re-nil eight fields that were
+    /// already nil.
     private func reset() {
+        guard controller != nil || attachedLayer != nil || attachedGenericView != nil
+            || contentViewController != nil || bridge != nil || probeTimer != nil
+            || possibleObservation != nil || isPossible else { return }
         probeTimer?.invalidate()
         probeTimer = nil
         possibleObservation = nil
@@ -412,6 +481,17 @@ extension PictureInPictureController: AVPictureInPictureControllerDelegate {
             // Never leave `isActive` set on a failure: the host would keep the
             // player dismissed for a PiP window that never appeared.
             self.isActive = false
+            self.routeGenericViewHome()
+            // AND UNPARK THE SESSION. AVKit sends `willStart` before it sends
+            // this, so by now the host has already dismissed the full-screen
+            // cover and parked the view model in `PiPHandoff` — and
+            // `PlayerScreen.onDisappear` deliberately skipped teardown because
+            // a handoff was in flight. Without this the engine, its buffers and
+            // the whole view model stay alive with no window and no UI: the
+            // film keeps decoding, audio keeps playing, and nothing can reach
+            // it. Telling the host it stopped runs the teardown that was
+            // skipped; it is a no-op when nothing was parked.
+            self.onDidStop?()
         }
     }
 

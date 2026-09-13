@@ -68,6 +68,18 @@ struct TraktDetail: View {
                         // Rebuild when the code changes (auto-refresh) so the QR
                         // + code + countdown all reset to the new code.
                         .id(code.userCode)
+                } else {
+                    // While the device code loads the page was BLANK with
+                    // nothing focusable — and with no focus, Menu falls
+                    // through to the system and suspends the app instead of
+                    // cancelling. The anchor keeps onExitCommand reachable.
+                    VStack(spacing: OrivioSpacing.md) {
+                        FocusAnchor()
+                        ProgressView().tint(theme.palette.secondary)
+                        Text("Contacting Trakt…")
+                            .font(.system(size: 22))
+                            .foregroundStyle(theme.palette.textSecondary)
+                    }
                 }
             }
             .environmentObject(theme)
@@ -79,6 +91,16 @@ struct TraktDetail: View {
                 if let code = simklCode {
                     SimklConnectPage(code: code, expiresAt: simklExpiresAt ?? Date())
                         .id(code.userCode)
+                } else {
+                    // Same as the Trakt cover: focus must live SOMEWHERE or
+                    // Menu suspends the app instead of cancelling.
+                    VStack(spacing: OrivioSpacing.md) {
+                        FocusAnchor()
+                        ProgressView().tint(theme.palette.secondary)
+                        Text("Contacting SIMKL…")
+                            .font(.system(size: 22))
+                            .foregroundStyle(theme.palette.textSecondary)
+                    }
                 }
             }
             .environmentObject(theme)
@@ -122,6 +144,14 @@ struct TraktDetail: View {
                 isOn: Binding(
                     get: { simkl.syncWatchHistory },
                     set: { simkl.syncWatchHistory = $0; simkl.onSyncSettingChange?() }
+                )
+            )
+            SettingsToggleCard(
+                title: "Sync Continue Watching",
+                subtitle: "Put the next episode of every show on SIMKL's \"watching\" list into your Continue Watching row. SIMKL stores no playback position, so those start at the beginning of the episode.",
+                isOn: Binding(
+                    get: { simkl.syncContinueWatching },
+                    set: { simkl.syncContinueWatching = $0; simkl.onSyncSettingChange?() }
                 )
             )
             SettingsToggleCard(

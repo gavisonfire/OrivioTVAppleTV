@@ -69,7 +69,23 @@ struct WatchProgress: Codable, Identifiable, Hashable {
     var streamSignature: StreamSignature? = nil
     var updatedAt: Date
     var syncSource: String? = nil
-    var hasNewEpisode: Bool? = nil
+    /// How many episodes have aired SINCE this viewer started the show that
+    /// they haven't watched — the "+2" badge on the Continue Watching card.
+    ///
+    /// Deliberately a count of NEW episodes, not of unwatched ones: a back
+    /// catalogue that was already out when you started is not something you
+    /// are "behind" on, so only episodes whose air date falls after your first
+    /// watch of the show count. Optional so rows written before this existed
+    /// (and rows from other clients) decode as "unknown", not "zero".
+    ///
+    /// Derived, never synced as a field: the backend stores no column for it,
+    /// and it is a pure function of watch history (which DOES sync to the
+    /// account, Trakt, SIMKL and Stremio) plus episode air dates, so every
+    /// device arrives at the same number on its own.
+    var newEpisodeCount: Int? = nil
+
+    /// Whether to show the new-episode badge at all.
+    var hasNewEpisode: Bool { (newEpisodeCount ?? 0) > 0 }
 
     var fraction: Double {
         guard durationSeconds > 0 else { return 0 }
@@ -118,14 +134,22 @@ struct WatchProgress: Codable, Identifiable, Hashable {
             streamSignature: streamSignature,
             updatedAt: updatedAt,
             syncSource: syncSource,
-            hasNewEpisode: hasNewEpisode
+            newEpisodeCount: newEpisodeCount
         )
     }
 }
 
 @MainActor
 final class ProgressStore: ObservableObject {
-    @Published private(set) var items: [String: WatchProgress] = [:]
+    @Published private(set) var items: [String: WatchProgress] = [:] {
+        didSet { continueWatchingMemo.removeAll(keepingCapacity: true) }
+    }
+
+    /// Memoized `continueWatching(sortMode:)` results, cleared on any items
+    /// change. The derivation builds a per-show dictionary and sorts, and
+    /// Home's body touches it more than once per pass — one sort per mutation
+    /// instead of several per render.
+    private var continueWatchingMemo: [ContinueWatchingSortMode: [WatchProgress]] = [:]
 
     /// Rows written by `updateTransient` (the periodic in-playback save) that
     /// are NOT yet reflected in `items` — by design, since publishing them
@@ -259,6 +283,7 @@ final class ProgressStore: ObservableObject {
 
     /// Playing the show again undoes the dismissal.
     private func clearNextUpDismissal(metaID: String) {
+        clearRemoval(metaID: metaID)
         guard dismissedNextUpShows.remove(metaID) != nil else { return }
         if dismissedNextUpShows.isEmpty {
             UserDefaults.standard.removeObject(forKey: dismissedNextUpKey)
@@ -267,9 +292,117 @@ final class ProgressStore: ObservableObject {
         }
     }
 
+    // MARK: - Removed from Continue Watching (persisted, per profile)
+
+    /// Shows the user removed from Continue Watching → when they removed them.
+    ///
+    /// The per-key tombstones above protect a removal for three minutes and
+    /// die with the process. That is not enough, because a removal has to
+    /// outlast every source that can hand the title back:
+    ///
+    /// * the ACCOUNT, when the server delete is still retrying, when an
+    ///   in-flight push captured the row before the removal and re-upserted it
+    ///   right after the delete landed, or when the key the server holds is
+    ///   not one this device ever knew (another client keys episodes
+    ///   differently);
+    /// * TRAKT, whose playback-row delete runs concurrently with the full sync
+    ///   the same removal kicks off — the pull can read the row before the
+    ///   delete has gone through;
+    /// * SIMKL, which cannot be told at all: it re-seeds "the next episode" of
+    ///   every show in its watching bucket on every five-minute sync, so a
+    ///   removed show came back on the first sync after the tombstone expired.
+    ///
+    /// So every merge path consults this: an incoming row for a removed show
+    /// is dropped unless it is NEWER than the removal, which means the title
+    /// was watched again elsewhere and the removal is over. Watching the show
+    /// here clears it too. Persisted per profile (the `.p<id>` suffix is what
+    /// a profile deletion sweeps), never synced — it is this device's memory of
+    /// what its user asked for, and the other devices hear about the removal
+    /// through the server delete.
+    private var removedShows: [String: Date] = [:]
+    private var removedShowsKey: String {
+        profileID == 1 ? "orivio.progress.removedShows.v1" : "orivio.progress.removedShows.v1.p\(profileID)"
+    }
+    /// A removal older than this has nothing left to block — any row that
+    /// still carries an older timestamp is stale beyond caring — so the map
+    /// cannot grow without bound.
+    private static let removalLife: TimeInterval = 180 * 24 * 60 * 60
+
+    private func loadRemovedShows() {
+        let raw = UserDefaults.standard.dictionary(forKey: removedShowsKey) as? [String: Double] ?? [:]
+        let cutoff = Date().addingTimeInterval(-Self.removalLife).timeIntervalSince1970
+        removedShows = raw.filter { $0.value > cutoff }
+            .mapValues { Date(timeIntervalSince1970: $0) }
+    }
+
+    private func saveRemovedShows() {
+        if removedShows.isEmpty {
+            UserDefaults.standard.removeObject(forKey: removedShowsKey)
+        } else {
+            UserDefaults.standard.set(removedShows.mapValues { $0.timeIntervalSince1970 },
+                                      forKey: removedShowsKey)
+        }
+    }
+
+    private func recordRemoval(metaID: String, at date: Date = Date()) {
+        removedShows[metaID] = date
+        saveRemovedShows()
+    }
+
+    private func clearRemoval(metaID: String) {
+        guard removedShows.removeValue(forKey: metaID) != nil else { return }
+        saveRemovedShows()
+    }
+
+    /// Whether an incoming row is one the user removed and has not watched
+    /// since. A row newer than the removal WITH real progress is a re-watch
+    /// elsewhere: it lifts the removal and is accepted.
+    ///
+    /// The progress requirement is load-bearing: SIMKL's Continue Watching
+    /// seeds are synthesized "start the next episode" rows at position 0, and
+    /// their timestamp can fall back to now() when SIMKL reports no date — so
+    /// without it the very source this record exists to block could lift the
+    /// removal on its first sync.
+    private func isBlockedByRemoval(_ entry: WatchProgress) -> Bool {
+        guard let removedAt = removedShows[entry.metaID] else { return false }
+        if entry.updatedAt > removedAt, entry.positionSeconds > 0 {
+            clearRemoval(metaID: entry.metaID)
+            return false
+        }
+        return true
+    }
+
+    /// How long after a removal this device may still DELETE matching rows on
+    /// the account. Deliberately far shorter than `removalLife`.
+    ///
+    /// Suppressing a row locally is this device's own business and can last as
+    /// long as the record does. Deleting it from the ACCOUNT reaches every
+    /// other device, and the only evidence here is a timestamp comparison —
+    /// which is not a reliable ordering signal: a Stremio import carries the
+    /// ORIGINAL watch time, so a title legitimately re-added on a phone months
+    /// later can arrive stamped older than the removal. Left unbounded, this
+    /// device would keep deleting it from everyone's account for half a year.
+    /// A week is long enough to converge an account that was simply offline.
+    private static let removalDeleteWindow: TimeInterval = 7 * 24 * 60 * 60
+
+    /// The keys of `remote` rows a removal would block, WITHOUT lifting any
+    /// removal. The sync manager asks this of a server snapshot so it can
+    /// queue those keys for deletion: hiding them here is not enough, the
+    /// account has to converge too or every other device keeps the card.
+    /// Bounded by `removalDeleteWindow` — see above.
+    func remoteKeysBlockedByRemoval(_ remote: [WatchProgress]) -> [String] {
+        let deleteCutoff = Date().addingTimeInterval(-Self.removalDeleteWindow)
+        return remote.compactMap { entry in
+            guard let removedAt = removedShows[entry.metaID],
+                  entry.updatedAt <= removedAt,
+                  removedAt >= deleteCutoff else { return nil }
+            return entry.id
+        }
+    }
+
     private static let maxProgressSeconds: Double = 30 * 24 * 60 * 60
 
-    private static func sanitized(_ entry: WatchProgress) -> WatchProgress? {
+    private nonisolated static func sanitized(_ entry: WatchProgress) -> WatchProgress? {
         guard entry.positionSeconds.isFinite,
               entry.durationSeconds.isFinite,
               entry.updatedAt.timeIntervalSince1970.isFinite,
@@ -304,7 +437,7 @@ final class ProgressStore: ObservableObject {
         tombstones = tombstonesByProfile[id] ?? [:]
         externallyMerged.removeAll()
         awaitingServerAck.removeAll()
-        load()
+        load()   // also re-reads this profile's removal record
         suppressChange = false
     }
     private var tombstonesByProfile: [Int: [String: Date]] = [:]
@@ -324,7 +457,18 @@ final class ProgressStore: ObservableObject {
     /// All entries, for a full push to the account backend.
     func allForSync() -> [WatchProgress] { Array(items.values) }
 
-    private static let serviceSyncSources: Set<String> = ["local", "nuvio", "stremio", "trakt"]
+    /// Sources whose rows are real, syncable Continue Watching — as opposed to
+    /// a device-local scratch row. A row whose source is NOT in this set is
+    /// dropped by `removeLocalOnlyProgress`, never uploaded to the account,
+    /// and not preserved by a first-pull snapshot merge.
+    ///
+    /// `"simkl"` was missing here for as long as the SIMKL manager has been
+    /// seeding Continue Watching. Every card it produced was invisible to the
+    /// account push AND deleted outright by the next Stremio tick (which calls
+    /// `removeLocalOnlyProgress` on every successful sync) — so SIMKL cards
+    /// appeared, vanished within thirty seconds, came back on SIMKL's next
+    /// five-minute sync, and never reached any other device.
+    private static let serviceSyncSources: Set<String> = ["local", "nuvio", "stremio", "trakt", "simkl"]
 
     func serviceBackedForSync() -> [WatchProgress] {
         // Fold in the periodic in-playback saves, exactly as `save()` does.
@@ -342,6 +486,11 @@ final class ProgressStore: ObservableObject {
         }
         return merged.values.filter { item in
             guard let source = item.syncSource else { return false }
+            // A row for a show the user removed is never uploaded again — the
+            // periodic override of the title that was playing when they
+            // removed it, or a row an external merge slipped in, would
+            // otherwise re-create on the server what the delete just retired.
+            if let removedAt = removedShows[item.metaID], item.updatedAt <= removedAt { return false }
             return Self.serviceSyncSources.contains(source)
         }
     }
@@ -364,6 +513,8 @@ final class ProgressStore: ObservableObject {
             guard let entry = Self.sanitized(entry) else { continue }
             if let local = items[entry.id], local.updatedAt >= entry.updatedAt { continue }
             tombstones.removeValue(forKey: entry.id)
+            // A restore is the user's explicit word: it overrides a removal.
+            clearRemoval(metaID: entry.metaID)
             items[entry.id] = entry
             changed = true
         }
@@ -405,7 +556,7 @@ final class ProgressStore: ObservableObject {
                 ? local.streamSignature : nil,
             updatedAt: entry.updatedAt,
             syncSource: entry.syncSource,
-            hasNewEpisode: entry.hasNewEpisode ?? local.hasNewEpisode
+            newEpisodeCount: entry.newEpisodeCount ?? local.newEpisodeCount
         )
     }
 
@@ -455,6 +606,7 @@ final class ProgressStore: ObservableObject {
 
         for rawEntry in remote {
             guard let entry = Self.sanitized(rawEntry) else { continue }
+            if isBlockedByRemoval(entry) { continue }
             // A just-removed item may still be in the server snapshot (its
             // delete is slower than the poll). Don't resurrect it — unless the
             // remote row is NEWER than our removal, which means it was
@@ -467,6 +619,15 @@ final class ProgressStore: ObservableObject {
                 }
             }
             if let local = items[entry.id], local.updatedAt >= entry.updatedAt { continue }
+            // The row CURRENTLY PLAYING: its live position rides
+            // `transientOverrides` (published to `items` only at start/exit,
+            // by design — a publish re-renders Home behind the player). The
+            // server row here is usually the ECHO of the position this device
+            // pushed thirty seconds ago, and upserting it into `items` was
+            // republishing the whole Home tree mid-film at sync cadence —
+            // the periodic playback hiccup, reintroduced via the round trip.
+            if let transient = transientOverrides[entry.id],
+               transient.updatedAt >= entry.updatedAt { continue }
             // Remote wins on position/timestamps, but synced rows arrive bare
             // (the backend stores no title/artwork/stream URL) and enrichment
             // is best-effort — so keep whatever presentation fields the local
@@ -532,6 +693,9 @@ final class ProgressStore: ObservableObject {
 
         var next: [String: WatchProgress] = [:]
         for entry in sanitizedRemote {
+            // A show the user removed stays removed until it is watched again
+            // somewhere — see `removedShows`.
+            if isBlockedByRemoval(entry) { continue }
             // Respect tombstones exactly as `mergeRemote` does. This path used
             // to ignore them entirely, so a row whose server delete was still
             // retrying came straight back on the next pull and the card the
@@ -630,7 +794,7 @@ final class ProgressStore: ObservableObject {
                 streamSignature: existing.streamSignature,
                 updatedAt: existing.updatedAt,
                 syncSource: existing.syncSource,
-                hasNewEpisode: existing.hasNewEpisode
+                newEpisodeCount: existing.newEpisodeCount
             )
             if merged != existing {
                 items[row.id] = merged
@@ -725,6 +889,10 @@ final class ProgressStore: ObservableObject {
         let index = identityIndex()
         for rawEntry in remote {
             guard let entry = Self.sanitized(rawEntry) else { continue }
+            // Trakt's playback list and SIMKL's watching bucket both hand a
+            // removed show straight back; the removal record is what makes
+            // "Remove from Continue Watching" stick against them.
+            if isBlockedByRemoval(entry) { continue }
             let key = mergeKey(for: entry, index: index)
             if let local = items[key] {
                 // Only advance position if external is further and MEANINGFULLY
@@ -781,6 +949,7 @@ final class ProgressStore: ObservableObject {
     ///   recency, then barely-started ones — so you resume what you're actually
     ///   in the middle of.
     func continueWatching(sortMode: ContinueWatchingSortMode) -> [WatchProgress] {
+        if let memo = continueWatchingMemo[sortMode] { return memo }
         var latestPerShow: [String: WatchProgress] = [:]
         for item in items.values where item.fraction < 0.95 {
             if let existing = latestPerShow[item.metaID] {
@@ -805,14 +974,17 @@ final class ProgressStore: ObservableObject {
         let byRecency = latestPerShow.values.sorted {
             ($0.updatedAt, $0.id) > ($1.updatedAt, $1.id)
         }
+        let result: [WatchProgress]
         switch sortMode {
         case .recentlyWatched:
-            return byRecency
+            result = byRecency
         case .streamingStyle:
             let inProgress = byRecency.filter { $0.fraction >= 0.02 }
             let fresh = byRecency.filter { $0.fraction < 0.02 }
-            return inProgress + fresh
+            result = inProgress + fresh
         }
+        continueWatchingMemo[sortMode] = result
+        return result
     }
 
     func progress(for key: String) -> WatchProgress? {
@@ -822,6 +994,43 @@ final class ProgressStore: ObservableObject {
     static func key(metaID: String, video: MetaVideo?) -> String {
         guard let video else { return metaID }
         return video.id
+    }
+
+    /// Retire this episode from Continue Watching and record it as watched.
+    ///
+    /// Extracted from `update`'s 95% branch so the PLAYER can call it directly.
+    /// Position is not the only thing that means "done with this episode": the
+    /// Up Next card arms at the credits chapter, which on a show with long
+    /// credits is well under 95%, so advancing from the card left the outgoing
+    /// episode sitting in Continue Watching at whatever fraction the credits
+    /// happened to start at — and the viewer came back to a card offering the
+    /// episode they had just finished, at its last saved position.
+    ///
+    /// `save` is false for the in-`update` caller, which saves once at the end
+    /// of its own body.
+    func markFinished(meta: MetaItem, video: MetaVideo?, save shouldSave: Bool = true) {
+        let key = Self.key(metaID: meta.id, video: video)
+        // Finishing an episode is watching the show, so it lifts a previous
+        // "remove from Continue Watching" just as an in-progress save does.
+        // Without this, removing a show and later watching a new episode
+        // straight through left the dismissal in place for good and Next Up
+        // never offered that show again.
+        clearNextUpDismissal(metaID: meta.id)
+        let removed = items.removeValue(forKey: key) != nil
+        // Retire the periodic row too. Without this, `save()` folds it back
+        // into the snapshot and the finished title returns to Continue
+        // Watching on the next launch — and `serviceBackedForSync()` pushes it
+        // back to the account right after `onRemove` asked for a delete.
+        transientOverrides.removeValue(forKey: key)
+        if removed { tombstones[key] = Date() }
+        if !suppressChange {
+            if removed { onRemove?([key]) }
+            onFinished?(meta, video)
+        }
+        if shouldSave {
+            self.save()
+            if !suppressChange { onLocalUpdate?() }
+        }
     }
 
     func update(
@@ -839,23 +1048,7 @@ final class ProgressStore: ObservableObject {
               position > 0 else { return }
         let key = Self.key(metaID: meta.id, video: video)
         if position / duration >= 0.95 {
-            // Finishing an episode is watching the show, so it lifts a previous
-            // "remove from Continue Watching" just as an in-progress save does.
-            // Without this, removing a show and later watching a new episode
-            // straight through left the dismissal in place for good and Next Up
-            // never offered that show again.
-            clearNextUpDismissal(metaID: meta.id)
-            let removed = items.removeValue(forKey: key) != nil
-            // Retire the periodic row too. Without this, `save()` below folds it
-            // back into the snapshot and the finished title returns to Continue
-            // Watching on the next launch — and `serviceBackedForSync()` pushes
-            // it back to the account right after `onRemove` asked for a delete.
-            transientOverrides.removeValue(forKey: key)
-            if removed { tombstones[key] = Date() }
-            if !suppressChange {
-                if removed { onRemove?([key]) }
-                onFinished?(meta, video)
-            }
+            markFinished(meta: meta, video: video, save: false)
         } else {
             // Re-watching something you'd removed clears its tombstone so the
             // fresh entry syncs normally.
@@ -915,6 +1108,9 @@ final class ProgressStore: ObservableObject {
         // and the guards in `save()` / `serviceBackedForSync()` would skip its
         // periodic rows — losing the very in-playback progress they persist.
         tombstones.removeValue(forKey: key)
+        // And the show-level removal: this row is newer than any removal, and
+        // `serviceBackedForSync` would otherwise refuse to upload it.
+        clearRemoval(metaID: meta.id)
         var snapshot = items
         snapshot[key] = WatchProgress(
             id: key,
@@ -943,6 +1139,10 @@ final class ProgressStore: ObservableObject {
         guard items.removeValue(forKey: id) != nil else { return }
         transientOverrides.removeValue(forKey: id)
         tombstones[id] = Date()
+        // Deliberately NO show-level removal record here: this path's callers
+        // are internal cleanups (dropping the optimistic row after an external
+        // player failed to start). The user-facing "Remove from Continue
+        // Watching" goes through `removeShow`, which does record.
         save()
         if !suppressChange {
             onRemove?([id])
@@ -967,6 +1167,9 @@ final class ProgressStore: ObservableObject {
             tombstones.removeAll()
             externallyMerged.removeAll()
             awaitingServerAck.removeAll()
+            // Likewise the previous user's Continue Watching removals.
+            removedShows.removeAll()
+            saveRemovedShows()
         }
         guard !removedKeys.isEmpty else { return [] }
         let now = Date()
@@ -1005,7 +1208,7 @@ final class ProgressStore: ObservableObject {
         transientOverrides.removeValue(forKey: oldID)
         tombstones[oldID] = Date()   // stale key is deleted server-side too
         tombstones.removeValue(forKey: newID)   // the canonical key is being (re)created
-        // Carry episodeThumbnail and hasNewEpisode too: rebuilding without them
+        // Carry episodeThumbnail and newEpisodeCount too: rebuilding without them
         // made a tmdb:→tt: migrated card drop back to the show poster (and lose
         // its "new episode" pip) the moment the key was canonicalized.
         items[newID] = WatchProgress(
@@ -1017,7 +1220,7 @@ final class ProgressStore: ObservableObject {
             streamURL: existing.streamURL, streamSignature: existing.streamSignature,
             updatedAt: existing.updatedAt,
             syncSource: existing.syncSource,
-            hasNewEpisode: existing.hasNewEpisode
+            newEpisodeCount: existing.newEpisodeCount
         )
         save()
         if !suppressChange {
@@ -1040,12 +1243,19 @@ final class ProgressStore: ObservableObject {
         // the card the user asked to remove simply stayed on screen.
         // Only for a real user action — an internal merge/cleanup removing rows
         // is not the user saying "stop suggesting this".
-        if !suppressChange { dismissNextUp(metaID: metaID) }
+        if !suppressChange {
+            dismissNextUp(metaID: metaID)
+            // Remembered past the tombstone grace and across launches, so no
+            // source can hand the show back until it is watched again.
+            recordRemoval(metaID: metaID)
+        }
         let removedKeys = items.values.filter { $0.metaID == metaID }.map(\.id)
         guard !removedKeys.isEmpty else {
             if !suppressChange {
+                onRemove?([metaID])
                 if notifyTrakt { for hook in onTrackerProgressRemove { hook(metaID) } }
                 onStremioClearProgress?(metaID)
+                onLocalUpdate?()
             }
             return
         }
@@ -1091,31 +1301,62 @@ final class ProgressStore: ObservableObject {
 
     private func load() {
         dismissedNextUpShows = Set(UserDefaults.standard.stringArray(forKey: dismissedNextUpKey) ?? [])
-        defer {
-            rebuildContinueFractions()
-            // Refresh the Top Shelf snapshot on launch/profile switch so the
-            // tvOS home shelf reflects existing Continue Watching immediately
-            // (save() only fires during playback).
-            let shelf = TopShelfExporter.entries(from: continueWatching)
-            let ticket = TopShelfExporter.nextSequence()
-            Task.detached(priority: .utility) { await TopShelfExporter.writeOrdered(shelf, sequence: ticket) }
-        }
+        loadRemovedShows()
         guard let data = UserDefaults.standard.data(forKey: storageKey) else {
             items = [:]
+            finishLoadHousekeeping()
             return
         }
-        guard let decoded = try? JSONDecoder().decode([String: WatchProgress].self, from: data) else {
-            // An UNREADABLE blob is not an empty one. Treating it as empty let
-            // the first save overwrite the whole history with one row (and the
-            // deletion reconcile then removed the rest from the account). Keep
-            // the bytes recoverable before anything writes over them.
-            UnreadableBlobGuard.preserve(data, key: storageKey)
-            items = [:]
-            return
+        // Decode + sanitize OFF the main actor, publish when it lands — same
+        // rationale and race guards as WatchedStore.load(): the content
+        // stores' init-time decodes ran serially on the main thread before
+        // first frame, the dominant launch cost on the A8.
+        let key = storageKey
+        let expectedProfile = profileID
+        Task.detached(priority: .userInitiated) {
+            let decoded = try? JSONDecoder().decode([String: WatchProgress].self, from: data)
+            let sanitized = decoded.map { raw in
+                raw.compactMapValues { Self.sanitized($0) }
+                    .filter { _, item in item.syncSource != nil }
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.profileID == expectedProfile else { return }
+                guard let decoded, let sanitized else {
+                    // An UNREADABLE blob is not an empty one. Treating it as
+                    // empty let the first save overwrite the whole history
+                    // with one row (and the deletion reconcile then removed
+                    // the rest from the account). Keep the bytes recoverable
+                    // before anything writes over them.
+                    UnreadableBlobGuard.preserve(data, key: key)
+                    if self.items.isEmpty { self.items = [:] }
+                    self.finishLoadHousekeeping()
+                    return
+                }
+                var needsSave = sanitized.count != decoded.count
+                if self.items.isEmpty {
+                    self.items = sanitized
+                } else {
+                    // A write beat the decode (an early playback save, a fast
+                    // merge): keep the newer in-memory rows, fold the
+                    // persisted ones in underneath, re-persist the union.
+                    self.items.merge(sanitized) { current, _ in current }
+                    needsSave = true
+                }
+                // save() redoes the fraction rebuild + Top Shelf export.
+                if needsSave { self.save() } else { self.finishLoadHousekeeping() }
+            }
         }
-        let sanitized = decoded.compactMapValues { Self.sanitized($0) }
-        items = sanitized.filter { _, item in item.syncSource != nil }
-        if items.count != decoded.count { save() }
+    }
+
+    /// The post-load bookkeeping the old synchronous `load()` ran in a defer:
+    /// rebuild the fraction index and refresh the Top Shelf snapshot so the
+    /// tvOS home shelf reflects Continue Watching immediately (save() only
+    /// fires during playback).
+    private func finishLoadHousekeeping() {
+        rebuildContinueFractions()
+        let shelf = TopShelfExporter.entries(from: continueWatching)
+        let ticket = TopShelfExporter.nextSequence()
+        Task.detached(priority: .utility) { await TopShelfExporter.writeOrdered(shelf, sequence: ticket) }
     }
 
     private func save() {
@@ -1175,7 +1416,13 @@ enum UnreadableBlobGuard {
     /// toward the CFPreferences size abort the collections store already met.
     /// One copy per key, kept until a human looks at it.
     static func preserve(_ data: Data, key: String) {
-        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        // CACHES, not Application Support: tvOS does not provide an
+        // Application Support directory, so this whole guard was writing into
+        // a path that never existed and silently preserved NOTHING — on every
+        // store that relies on it (progress, watched, library, ratings, home
+        // layout). Caches is the same directory CollectionsStore moved its
+        // library to for exactly this reason.
+        guard let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
         else { return }
         let dir = base.appendingPathComponent("orivio-unreadable", isDirectory: true)
         let file = dir.appendingPathComponent(key + ".json")

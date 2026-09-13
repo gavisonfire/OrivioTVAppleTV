@@ -218,8 +218,8 @@ struct PlaybackSettingsDetail: View {
 
                 PlaybackToggleRow(
                     icon: "internaldrive.fill",
-                    title: "Hybrid disk cache (beta)",
-                    subtitle: "Download the whole file to the Apple TV's storage at full speed while playing, so seeking anywhere already-downloaded is instant — like Infuse. Needs free space for the file; direct-file streams only (HLS plays normally); the cache is deleted when playback ends.",
+                    title: "Hybrid disk cache",
+                    subtitle: "Download the film to the Apple TV's storage at full speed while playing, so seeking anywhere already-downloaded is instant — like Infuse. A film too big for the free space keeps a sliding window instead, filling in around wherever you have been. Direct-file streams only (HLS plays normally); the cache is deleted when playback ends.",
                     isOn: s.hybridDiskCacheEnabled
                 )
 

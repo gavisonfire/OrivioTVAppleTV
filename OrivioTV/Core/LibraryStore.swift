@@ -173,6 +173,56 @@ final class LibraryStore: ObservableObject {
     }
     private var tombstonesByProfile: [Int: [String: Date]] = [:]
 
+    // MARK: - Removed items (persisted, per profile)
+
+    /// Items the user removed from the Library → when.
+    ///
+    /// The in-memory tombstone above lasts three minutes and dies with the
+    /// process, and it is lifted whenever an incoming row's `addedAt` is
+    /// newer. Both tracker merges build their rows with `addedAt` defaulted to
+    /// NOW (they have no real added-date to carry), so a Trakt watchlist or
+    /// SIMKL plan-to-watch pull lifted the tombstone on the very next sync and
+    /// re-added the title the user had just removed — which `requestSyncPush`
+    /// then propagated to the account and the other trackers. One removal,
+    /// undone everywhere.
+    ///
+    /// So the removal is remembered here instead, and a merge may only lift it
+    /// when the caller is TRUSTED — the Orivio account, whose `addedAt`
+    /// round-trips as the real value, so "newer than the removal" genuinely
+    /// means re-added on another device. A tracker echo never lifts it.
+    /// Persisted per profile, never synced.
+    private var removedItems: [String: Date] = [:]
+    private var removedItemsKey: String {
+        profileID == 1 ? "orivio.library.removed.v1" : "orivio.library.removed.v1.p\(profileID)"
+    }
+    /// A removal older than this has nothing left to block.
+    private static let removalLife: TimeInterval = 180 * 24 * 60 * 60
+
+    private func loadRemovedItems() {
+        let raw = UserDefaults.standard.dictionary(forKey: removedItemsKey) as? [String: Double] ?? [:]
+        let cutoff = Date().addingTimeInterval(-Self.removalLife).timeIntervalSince1970
+        removedItems = raw.filter { $0.value > cutoff }.mapValues { Date(timeIntervalSince1970: $0) }
+    }
+
+    private func saveRemovedItems() {
+        if removedItems.isEmpty {
+            UserDefaults.standard.removeObject(forKey: removedItemsKey)
+        } else {
+            UserDefaults.standard.set(removedItems.mapValues { $0.timeIntervalSince1970 },
+                                      forKey: removedItemsKey)
+        }
+    }
+
+    private func recordRemoval(_ key: String) {
+        removedItems[key] = Date()
+        saveRemovedItems()
+    }
+
+    private func clearRemoval(_ key: String) {
+        guard removedItems.removeValue(forKey: key) != nil else { return }
+        saveRemovedItems()
+    }
+
     /// The saved row for an id/type pair, if any.
     func item(id: String, type: String) -> SavedLibraryItem? {
         items["\(type)|\(id)"]
@@ -199,8 +249,10 @@ final class LibraryStore: ObservableObject {
 
     func add(_ item: SavedLibraryItem) {
         // Re-saving something you'd removed clears its tombstone so the fresh
-        // row survives the next pull's reconcile.
+        // row survives the next pull's reconcile — and its persisted removal
+        // record, or nothing would ever be allowed to sync it back.
         tombstones.removeValue(forKey: item.key)
+        clearRemoval(item.key)
         let isNew = items[item.key] == nil
         items[item.key] = item
         save()
@@ -214,6 +266,9 @@ final class LibraryStore: ObservableObject {
         let key = "\(type)|\(id)"
         guard let removed = items.removeValue(forKey: key) else { return }
         tombstones[key] = Date()
+        // Remembered past the grace window and across launches, so a tracker
+        // echo can't put it back (see `removedItems`).
+        if !suppressChange { recordRemoval(key) }
         save()
         if !suppressChange {
             onRemove?([removed])
@@ -240,6 +295,10 @@ final class LibraryStore: ObservableObject {
         } else {
             // Retiring the previous account: see ProgressStore.clearAllProgress.
             tombstones.removeAll()
+            // The previous user's removals must not suppress the incoming
+            // account's rows sharing those keys.
+            removedItems.removeAll()
+            saveRemovedItems()
         }
         items.removeAll()
         save()
@@ -262,6 +321,7 @@ final class LibraryStore: ObservableObject {
         defer { suppressChange = false }
         for item in imported {
             tombstones.removeValue(forKey: item.key)
+            clearRemoval(item.key)   // a restore is the user's explicit word
             if let local = items[item.key] {
                 items[item.key] = local.withFallbackMetadata(item.metaItem)
             } else {
@@ -280,11 +340,23 @@ final class LibraryStore: ObservableObject {
     /// protected. `reconcile: false` = additive union — used for the FIRST pull
     /// of a profile, so items saved locally before ever signing in survive and
     /// get pushed up rather than treated as remote deletions.
-    func mergeRemote(_ remote: [SavedLibraryItem], reconcile: Bool = true) {
+    /// - Parameter trusted: whether this source's `addedAt` is a REAL added
+    ///   date that round-trips (the Orivio account), as opposed to one the
+    ///   caller fabricated with `Date()` (every tracker merge). Only a trusted
+    ///   source may lift a removal record — otherwise a Trakt watchlist or
+    ///   SIMKL plan-to-watch echo, which always stamps NOW, would re-add the
+    ///   title the user just removed on its very next sync.
+    /// Returns whether anything changed — see `requestSyncPush`.
+    @discardableResult
+    func mergeRemote(_ remote: [SavedLibraryItem], reconcile: Bool = true,
+                     trusted: Bool = false) -> Bool {
         suppressChange = true
         defer { suppressChange = false }
         var changed = false
         pruneTombstones()
+        // id → keys index, built once (see the duplicate sweep below).
+        var keysByID: [String: Set<String>] = [:]
+        for (key, existing) in items { keysByID[existing.id, default: []].insert(key) }
 
         // ── Reconcile deletions ──
         if reconcile {
@@ -300,6 +372,16 @@ final class LibraryStore: ObservableObject {
         }
 
         for item in remote {
+            // The persisted removal outranks the in-memory tombstone: it
+            // survives the 3-minute grace and a relaunch, and an untrusted
+            // source can never lift it (see `removedItems`).
+            if let removedAt = removedItems[item.key] {
+                if trusted, item.addedAt > removedAt {
+                    clearRemoval(item.key)   // genuinely re-saved on another device
+                } else {
+                    continue
+                }
+            }
             if let tomb = tombstones[item.key] {
                 if item.addedAt > tomb {
                     tombstones.removeValue(forKey: item.key)   // re-saved elsewhere
@@ -313,29 +395,81 @@ final class LibraryStore: ObservableObject {
                 items.removeValue(forKey: item.key)
                 items[merged.key] = merged
             } else {
-                for key in Array(items.keys) where key != item.key && items[key]?.id == item.id {
+                // Indexed, not a scan: the per-item sweep over every key was
+                // O(remote × items) on the main actor — millions of dictionary
+                // probes on a first pull of a big watchlist, right after
+                // sign-in, exactly when the app already feels slowest.
+                for key in keysByID[item.id] ?? [] where key != item.key {
                     items.removeValue(forKey: key)
                 }
                 items[item.key] = item
+                keysByID[item.id, default: []].insert(item.key)
             }
             changed = true
         }
         if changed { save() }
+        return changed
+    }
+
+    /// Rows just merged from a tracker (Trakt watchlist, SIMKL plan-to-watch,
+    /// the Stremio library) need to reach the ACCOUNT too — see the note on
+    /// `WatchedStore.requestSyncPush`.
+    func requestSyncPush() {
+        guard !suppressChange else { return }
+        onLocalChange?()
     }
 
     // MARK: - Persistence
 
     private func load() {
+        loadRemovedItems()   // per profile, like the items themselves
         guard let data = UserDefaults.standard.data(forKey: storageKey) else { return }
-        guard let decoded = try? JSONDecoder().decode([String: SavedLibraryItem].self, from: data) else {
-            UnreadableBlobGuard.preserve(data, key: storageKey)   // see ProgressStore
-            return
+        // Decode OFF the main actor, publish when it lands — same rationale
+        // and guards as WatchedStore.load(): store inits run serially on the
+        // main thread before first frame, and a watchlist-scale library
+        // decode was part of the A8's launch stall.
+        let key = storageKey
+        let expectedProfile = profileID
+        Task.detached(priority: .userInitiated) {
+            let decoded = try? JSONDecoder().decode([String: SavedLibraryItem].self, from: data)
+            await MainActor.run { [weak self] in
+                guard let self, self.profileID == expectedProfile else { return }
+                guard let decoded else {
+                    UnreadableBlobGuard.preserve(data, key: key)   // see ProgressStore
+                    return
+                }
+                if self.items.isEmpty {
+                    self.items = decoded
+                } else {
+                    // A write beat the decode: keep the newer in-memory rows,
+                    // fold the persisted ones in underneath, re-persist.
+                    self.items.merge(decoded) { current, _ in current }
+                    self.save()
+                }
+            }
         }
-        items = decoded
     }
 
+    /// Monotonic stamps so overlapping detached writes land in order — PER
+    /// storage key, or a profile switch's first save on the new profile would
+    /// invalidate (and drop) the departing profile's last queued write.
+    private var saveSequences: [String: UInt64] = [:]
+
     private func save() {
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        UserDefaults.standard.set(data, forKey: storageKey)
+        // Encode + write OFF the main actor. Every other content store grew a
+        // detached persister for exactly this stall; the library kept a
+        // synchronous whole-collection encode on main, paid on every sync
+        // pull that changed anything.
+        let key = storageKey
+        let sequence = (saveSequences[key] ?? 0) &+ 1
+        saveSequences[key] = sequence
+        let snapshot = items
+        Task.detached(priority: .utility) { [weak self] in
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            await MainActor.run {
+                guard let self, self.saveSequences[key] == sequence else { return }
+                UserDefaults.standard.set(data, forKey: key)
+            }
+        }
     }
 }

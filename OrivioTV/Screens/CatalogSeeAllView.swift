@@ -21,7 +21,13 @@ final class CatalogSeeAllViewModel: ObservableObject {
         guard !isLoading, !reachedEnd else { return }
         isLoading = true
         defer { isLoading = false }
-        let page = (try? await StremioAPI.catalog(addon: addon, catalog: catalog, skip: items.count)) ?? []
+        // An error is NOT the end of the catalog. `try?` folded a timeout into
+        // an empty page and `reachedEnd` latched: one blip on the FIRST page
+        // showed "no titles" for a full catalog with no way to retry, and one
+        // mid-scroll ended infinite scroll for the visit. A failed page just
+        // leaves the trigger cell in place to try again.
+        guard let page = try? await StremioAPI.catalog(addon: addon, catalog: catalog, skip: items.count)
+        else { return }
         let fresh = page.filter { seenIDs.insert($0.id).inserted }
         if fresh.isEmpty {
             reachedEnd = true

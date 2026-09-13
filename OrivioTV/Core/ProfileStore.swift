@@ -179,6 +179,10 @@ final class ProfileStore: ObservableObject {
 
     init() {
         load()
+        deletedProfileIDs = Set(UserDefaults.standard.array(forKey: Self.deletedKey) as? [Int] ?? [])
+        // A tombstone for a profile that is somehow still in the local list
+        // (a partially applied delete) is stale: the list is the user's view.
+        deletedProfileIDs.subtract(profiles.map(\.id))
         if profiles.isEmpty {
             profiles = [UserProfile(id: 1, name: "Profile 1", avatarColorHex: Self.avatarColors[0])]
             // Persist the synthesised default ONLY when there was nothing
@@ -215,7 +219,23 @@ final class ProfileStore: ObservableObject {
     func addProfile(name: String) -> UserProfile? {
         guard canAddProfile else { return nil }
         let used = Set(profiles.map { $0.id })
-        let newID = (1...Self.maxProfiles).first { !used.contains($0) } ?? profiles.count + 1
+        // Never hand out an id whose deletion the account has not confirmed
+        // yet. The new profile would be filtered out of the next pull as
+        // "deleted"; worse, an in-flight `sync_delete_profile_data` for that
+        // id would wipe the NEW profile's server data, and an undrained one
+        // would be dropped so the old profile's rows are never deleted at all
+        // — the next pull then adopts them into the new profile, which is how
+        // a fresh "Guest" opened onto the deleted "Kids" profile's Continue
+        // Watching, library and history.
+        //
+        // Refusing the add is the safe answer: the deletion drains on the next
+        // sync (seconds), and the caller already handles nil by telling the
+        // user it couldn't add a profile.
+        let free = (1...Self.maxProfiles).filter { !used.contains($0) && !deletedProfileIDs.contains($0) }
+        guard let newID = free.first else {
+            NSLog("[OrivioProfiles] add refused — every free slot has an unconfirmed deletion pending")
+            return nil
+        }
         let color = Self.avatarColors[(newID - 1) % Self.avatarColors.count]
         let profile = UserProfile(
             id: newID,
@@ -249,16 +269,80 @@ final class ProfileStore: ObservableObject {
     /// profile to reuse that id.
     var onProfileDeleted: ((Int) -> Void)?
 
+    /// Profiles deleted on this device whose deletion the account has not
+    /// confirmed yet. `replaceRemote` filters them out of any list the server
+    /// hands back in the meantime.
+    ///
+    /// Deleting a profile used to bring it straight back. Two races, both real:
+    ///
+    /// * `delete` switched away from the deleted profile BEFORE arming the
+    ///   push, and the switch itself starts a full sync — which pulls the
+    ///   profile list first and calls `replaceRemote` with a server copy that
+    ///   still contains the row. Ordering alone fixes that one (see below).
+    /// * Even in the right order, the push is DEBOUNCED by more than a second.
+    ///   Any pull that lands inside that window — the 30s tick, a foreground
+    ///   resume, a sync a different local change kicked off — restores the row
+    ///   from the server just as surely.
+    ///
+    /// So the delete is remembered as a tombstone until the server has
+    /// actually let go of the id, and only then is it allowed to speak for
+    /// that id again.
+    ///
+    /// PERSISTED. It used to be in-memory on the theory that a relaunch meant
+    /// the push had either landed or the profile legitimately still existed —
+    /// but the push RPC never deletes anything (it upserts the rows it is
+    /// given), so the profile ALWAYS still existed server-side, and the first
+    /// pull after a relaunch put it straight back. The deletion itself now
+    /// goes through `sync_delete_profile_data` (the same RPC the Android app
+    /// uses), which the sync manager drains from this set until a pull comes
+    /// back without the id.
+    private(set) var deletedProfileIDs: Set<Int> = [] {
+        didSet {
+            guard deletedProfileIDs != oldValue else { return }
+            if deletedProfileIDs.isEmpty {
+                UserDefaults.standard.removeObject(forKey: Self.deletedKey)
+            } else {
+                UserDefaults.standard.set(Array(deletedProfileIDs).sorted(), forKey: Self.deletedKey)
+            }
+        }
+    }
+    private static let deletedKey = "orivio.profiles.deleted.v1"
+
+    /// A server list just arrived. Any tombstoned id that is NOT in it has
+    /// been accepted by the account, so the tombstone can go.
+    ///
+    /// Deliberately keyed on the PULL, not on the delete RPC returning 200 —
+    /// a pull that no longer mentions the id is proof; nothing else is.
+    func confirmProfileDeletions(remoteIDs: Set<Int>) {
+        // Keep only the tombstones the server STILL reports — those are the
+        // deletions it hasn't accepted yet. The rest are done.
+        deletedProfileIDs.formIntersection(remoteIDs)
+    }
+
+    /// Forget every pending deletion — a DIFFERENT account signed in, and its
+    /// profiles must not be suppressed (or deleted) on the previous user's say.
+    func forgetProfileDeletions() {
+        deletedProfileIDs = []
+    }
+
     func delete(id: Int) {
         guard id != 1, profiles.contains(where: { $0.id == id }) else { return }
         profiles.removeAll { $0.id == id }
+        deletedProfileIDs.insert(id)
         onProfileDeleted?(id)
         saveList()
+        // Arm the push BEFORE switching away. `setActive` runs the account's
+        // profile-switch handler, which starts a full sync — and a full sync
+        // only flushes the profile list when it has been told the list is
+        // dirty. Notifying afterwards meant the sync the delete itself
+        // triggered ran with `profilesDirty` still false: it pulled the
+        // server's list, `replaceRemote` put the profile back, and the push
+        // that followed 1.2s later uploaded the restored list.
+        notifyChange()
         // Switch away BEFORE purging, so no store still pointed at this profile
         // can write its keys back out after the sweep.
         if activeProfileID == id { setActive(1) }
         purgeProfileData(id: id)
-        notifyChange()
     }
 
     /// Retire every per-profile key belonging to a deleted profile.
@@ -403,8 +487,11 @@ final class ProfileStore: ObservableObject {
 
     func allForSync() -> [UserProfile] { profiles }
 
-    /// The server is the source of truth for the profile list; replace ours.
+    /// The server is the source of truth for the profile list; replace ours —
+    /// EXCEPT for profiles this device has just deleted and not yet pushed
+    /// (see `deletedProfileIDs`), which the server hasn't been told about.
     func replaceRemote(_ remote: [UserProfile]) {
+        let remote = remote.filter { !deletedProfileIDs.contains($0.id) }
         guard !remote.isEmpty else { return }
         suppressChange = true
         defer { suppressChange = false }
@@ -558,9 +645,19 @@ enum ProfileScopedDefaults {
             // exactly equals the legacy blob was never this profile's own;
             // drop it once and start fresh. State a profile actually touched
             // differs and is left alone.
-            if profile != 1, scoped == UserDefaults.standard.data(forKey: base) {
-                UserDefaults.standard.removeObject(forKey: key(base, profile))
-                return nil
+            // ONE-SHOT per key+profile. As a standing rule this ran on every
+            // read forever, so a profile that deliberately chose the same
+            // settings as profile 1 (identical bytes out of a deterministic
+            // encoder) had its choice silently wiped on the next read. The
+            // pollution being cleaned was seeded HISTORICALLY — one sweep per
+            // slot is the whole job.
+            let sweepKey = "orivio.profiles.depolluted." + key(base, profile)
+            if profile != 1, !UserDefaults.standard.bool(forKey: sweepKey) {
+                UserDefaults.standard.set(true, forKey: sweepKey)
+                if scoped == UserDefaults.standard.data(forKey: base) {
+                    UserDefaults.standard.removeObject(forKey: key(base, profile))
+                    return nil
+                }
             }
             return scoped
         }

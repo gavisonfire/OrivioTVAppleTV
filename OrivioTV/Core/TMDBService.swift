@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 /// TMDB settings, mirroring the Android `TmdbSettings`. Persisted locally;
 /// governs metadata enrichment and whether TMDB collection sources resolve.
@@ -210,7 +211,12 @@ enum TMDBService {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 20
         config.requestCachePolicy = .useProtocolCachePolicy
-        config.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 128 << 20)
+        // Memory side tier-scaled: 16 MB of cached response bodies held in
+        // RAM is real money on the 2 GB box; the disk side is cheap.
+        config.urlCache = URLCache(
+            memoryCapacity: PerformanceProfile.isLowPower ? (4 << 20)
+                : PerformanceProfile.isMidPower ? (8 << 20) : (16 << 20),
+            diskCapacity: 128 << 20)
         return URLSession(configuration: config)
     }()
 
@@ -224,12 +230,41 @@ enum TMDBService {
     private static var seasonEpisodeCache: [String: [Int: EpisodeExtra]] = [:]
     private static var episodeCastCache: [String: [CastMember]] = [:]
 
+    /// Per-dictionary entry ceilings. These caches used to grow unbounded for
+    /// the process lifetime; the two fat ones (season episode maps with
+    /// overview text + still paths, episode cast lists) accumulate low MBs
+    /// over a long couch session on a 2 GB box. When one hits its cap, half
+    /// of it is dropped (arbitrary half — the entries are cheap to refetch),
+    /// the same policy StremioResponseCache uses. The id maps are tiny per
+    /// row and capped loosely.
+    private static let idCacheLimit = 4096
+    private static let fatCacheLimit = 256
+    private static func capped<K, V>(_ dict: inout [K: V], limit: Int) {
+        guard dict.count > limit else { return }
+        for key in Array(dict.keys.prefix(dict.count - limit / 2)) {
+            dict.removeValue(forKey: key)
+        }
+    }
+
+    /// Emptied on memory warning — each entry is one cheap request away.
+    private static let cachePurgeObserver: NSObjectProtocol = NotificationCenter.default.addObserver(
+        forName: UIApplication.didReceiveMemoryWarningNotification,
+        object: nil, queue: .main
+    ) { _ in
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        seasonEpisodeCache.removeAll()
+        episodeCastCache.removeAll()
+        // The id maps stay: a few bytes per row, and they save the paired
+        // find/rating round trips that make collection loads cheap.
+    }
+
     private static func cachedIMDB(_ key: String) -> String? {
         cacheLock.lock(); defer { cacheLock.unlock() }
         return imdbCache[key]
     }
     private static func storeIMDB(_ value: String, for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
+        capped(&imdbCache, limit: idCacheLimit)
         imdbCache[key] = value
     }
     private static func cachedContentRating(_ key: String) -> String? {
@@ -238,6 +273,7 @@ enum TMDBService {
     }
     private static func storeContentRating(_ value: String?, for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
+        capped(&contentRatingCache, limit: idCacheLimit)
         contentRatingCache[key] = value ?? ""
     }
     private static func cachedSeasonEpisodes(_ key: String) -> [Int: EpisodeExtra]? {
@@ -246,6 +282,8 @@ enum TMDBService {
     }
     private static func storeSeasonEpisodes(_ value: [Int: EpisodeExtra], for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
+        _ = cachePurgeObserver
+        capped(&seasonEpisodeCache, limit: fatCacheLimit)
         seasonEpisodeCache[key] = value
     }
     private static func cachedEpisodeCast(_ key: String) -> [CastMember]? {
@@ -254,6 +292,8 @@ enum TMDBService {
     }
     private static func storeEpisodeCast(_ value: [CastMember], for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
+        _ = cachePurgeObserver
+        capped(&episodeCastCache, limit: fatCacheLimit)
         episodeCastCache[key] = value
     }
     private static func cachedFind(_ key: String) -> (Int, Bool)? {
@@ -262,6 +302,7 @@ enum TMDBService {
     }
     private static func storeFind(_ value: (Int, Bool), for key: String) {
         cacheLock.lock(); defer { cacheLock.unlock() }
+        capped(&findCache, limit: idCacheLimit)
         findCache[key] = value
     }
 
@@ -1298,6 +1339,138 @@ enum TMDBService {
         }
         storeSeasonEpisodes(map, for: cacheKey)
         return map
+    }
+
+    /// Best YouTube trailer key for a title — the hero's billboard preview.
+    ///
+    /// The dedicated /videos endpoint rather than `detail`: a hero rest
+    /// shouldn't pay for credits, recommendations and release dates it will
+    /// never show. Same ranking as `detail` — YouTube only, Trailer/Teaser
+    /// only, official first, Trailer before Teaser.
+    ///
+    /// Cached including MISSES (`.some(nil)`): browsing wanders across the
+    /// same handful of titles all evening, and a title with no trailer would
+    /// otherwise re-ask on every visit.
+    /// Guarded by `cacheLock`, like every other cache in this file — this one
+    /// was the exception. `firstTrailerKey` is a nonisolated async static, so
+    /// the hero-trailer layer calls it OFF the main actor, and stepping across
+    /// a poster row starts the next lookup without awaiting the previous one:
+    /// two concurrent tasks mutating a plain Dictionary is a corrupted hash
+    /// table or EXC_BAD_ACCESS, exactly what the note at the top of this file
+    /// warns about.
+    private static var trailerKeyCache: [String: String?] = [:]
+
+    private static func cachedTrailerKey(_ key: String) -> String?? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return trailerKeyCache[key]
+    }
+
+    private static func storeTrailerKey(_ value: String?, for key: String) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        trailerKeyCache[key] = value
+    }
+
+    static func firstTrailerKey(id: String, type: String) async -> String? {
+        let cacheKey = "\(type):\(id)"
+        if let hit = cachedTrailerKey(cacheKey) { return hit }
+        guard let (tmdbID, isMovie) = await resolveTMDBID(from: id, type: type) else {
+            storeTrailerKey(nil, for: cacheKey)
+            return nil
+        }
+        struct VideosResponse: Decodable {
+            struct Video: Decodable {
+                let key: String?
+                let site: String?
+                let type: String?
+                let official: Bool?
+            }
+            let results: [Video]?
+        }
+        let path = isMovie ? "/movie/\(tmdbID)/videos" : "/tv/\(tmdbID)/videos"
+        let body: VideosResponse? = try? await get(path)
+        let ranked = (body?.results ?? [])
+            .filter {
+                ($0.site?.caseInsensitiveCompare("YouTube") == .orderedSame)
+                    && ["Trailer", "Teaser"].contains($0.type ?? "")
+            }
+            .sorted { a, b in
+                if (a.official ?? false) != (b.official ?? false) { return (a.official ?? false) }
+                return (a.type == "Trailer" ? 0 : 1) < (b.type == "Trailer" ? 0 : 1)
+            }
+        let key = ranked.first?.key
+        // A failed REQUEST is not a miss — leave it uncached so a flaky
+        // network doesn't brand the title trailer-less for the session.
+        if body != nil { storeTrailerKey(key, for: cacheKey) }
+        return key
+    }
+
+    /// The whole episode list for a series, as `MetaVideo`s the detail page
+    /// can render directly.
+    ///
+    /// The LAST RESORT behind the meta add-ons: a catalog-only add-on can hand
+    /// out series whose ids no installed meta provider really serves, and the
+    /// detail page then had a title, a backdrop, and no way to pick an episode.
+    /// TMDB knows the season/episode structure of essentially every series, so
+    /// when every add-on comes back without a `videos` array this fills it in.
+    ///
+    /// Episode ids follow Stremio's `<series id>:<season>:<episode>` shape, so
+    /// everything downstream — progress keys, watched state, the stream search
+    /// — behaves exactly as it does for a Cinemeta series.
+    static func episodes(for seriesID: String, type: String,
+                         language: String = preferredLanguage) async -> [MetaVideo] {
+        guard let (tmdbID, isMovie) = await resolveTMDBID(from: seriesID, type: type), !isMovie else {
+            return []
+        }
+        struct ShowResponse: Decodable {
+            struct SeasonRef: Decodable {
+                let season_number: Int?
+                let episode_count: Int?
+            }
+            let seasons: [SeasonRef]?
+        }
+        guard let show: ShowResponse = try? await get("/tv/\(tmdbID)", query: ["language": language]) else {
+            return []
+        }
+        // Specials (season 0) included — `MetaItem.playbackSeasons` already
+        // knows to prefer the numbered seasons and only fall back to 0.
+        let numbers = (show.seasons ?? [])
+            .compactMap(\.season_number)
+            .filter { $0 >= 0 && ($0 > 0 || (show.seasons?.first { $0.season_number == 0 }?.episode_count ?? 0) > 0) }
+            .sorted()
+        guard !numbers.isEmpty else { return [] }
+
+        struct SeasonResponse: Decodable {
+            struct Episode: Decodable {
+                let episode_number: Int?
+                let name: String?
+                let overview: String?
+                let air_date: String?
+                let still_path: String?
+            }
+            let episodes: [Episode]?
+        }
+        var out: [MetaVideo] = []
+        // Serial, not concurrent: a long-running show is 20+ season requests
+        // and TMDB rate-limits per IP. Capped for the same reason — nobody is
+        // scrolling past fifty seasons, and this only ever runs as a fallback.
+        for season in numbers.prefix(50) {
+            guard let body: SeasonResponse = try? await get(
+                "/tv/\(tmdbID)/season/\(season)", query: ["language": language]
+            ) else { continue }
+            for episode in body.episodes ?? [] {
+                guard let number = episode.episode_number else { continue }
+                out.append(MetaVideo(
+                    id: "\(seriesID):\(season):\(number)",
+                    title: episode.name,
+                    season: season,
+                    episode: number,
+                    thumbnail: imageURL(episode.still_path, size: "w300"),
+                    overview: episode.overview,
+                    released: episode.air_date
+                ))
+            }
+        }
+        return out
     }
 
     static func episodeCast(imdbID: String, type: String, episode: MetaVideo) async -> [CastMember] {

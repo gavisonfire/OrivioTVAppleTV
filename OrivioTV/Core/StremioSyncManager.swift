@@ -7,7 +7,11 @@ final class StremioSyncManager: ObservableObject {
 
     var onMergedFromStremio: (() async -> Void)?
 
-    private static let autoSyncInterval: TimeInterval = 30
+    /// Tier-scaled like the Orivio account's: every tick rebuilds and hashes
+    /// the full push payload (even though only changed rows go up), so the
+    /// 2–3 GB boxes take the longer stride.
+    private static let autoSyncInterval: TimeInterval =
+        (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower) ? 90 : 30
 
     private let stremio: StremioAccountStore
     private let addonManager: AddonManager

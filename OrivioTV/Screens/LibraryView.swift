@@ -1,9 +1,18 @@
 import SwiftUI
 
 /// One chip row drives the whole screen: All / Movies / Shows filter the one
-/// unified grid, Cloud swaps to the debrid cloud pane.
+/// unified grid, Plex / Jellyfin (only while that server is connected) swap
+/// to the server's own library, Cloud swaps to the debrid cloud pane.
 private enum LibraryFilter: String, CaseIterable {
-    case all = "All", movies = "Movies", shows = "Shows", cloud = "Cloud"
+    case all = "All", movies = "Movies", shows = "Shows", plex = "Plex", jellyfin = "Jellyfin", cloud = "Cloud"
+
+    var mediaServer: MediaServerKind? {
+        switch self {
+        case .plex: return .plex
+        case .jellyfin: return .jellyfin
+        default: return nil
+        }
+    }
 }
 
 struct LibraryView: View {
@@ -11,10 +20,15 @@ struct LibraryView: View {
     @EnvironmentObject private var posterLayout: HomeCatalogSettingsStore
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var progressStore: ProgressStore
+    @EnvironmentObject private var mediaServers: MediaServerStore
 
     let onSelect: (MetaItem) -> Void
     /// Opens the full Cloud Library screen (debrid cloud files).
     var onOpenCloud: () -> Void = {}
+    /// Plays a Plex / Jellyfin item straight from the server.
+    var onPlayMediaServer: (PlaybackRequest) -> Void = { _ in }
+    /// Opens a Plex / Jellyfin show's episode list.
+    var onOpenMediaServerShow: (MediaServerItem) -> Void = { _ in }
     /// Back pressed while already at the top of the grid: leave the screen.
     var onBackAtRoot: () -> Void = {}
 
@@ -47,39 +61,43 @@ struct LibraryView: View {
         return items
     }
 
-    private var savedMovies: [SavedLibraryItem] { sorted.filter { !$0.metaItem.isSeries } }
-    private var savedShows: [SavedLibraryItem] { sorted.filter { $0.metaItem.isSeries } }
-
-    /// The one grid's contents under the active filter.
-    private var visibleItems: [SavedLibraryItem] {
-        switch filter {
-        case .movies: return savedMovies
-        case .shows: return savedShows
-        default: return sorted
-        }
-    }
-
-    private var firstItemID: String? { visibleItems.first?.id }
-
     /// "12 movies · 8 shows" beside the title.
-    private var countLine: String? {
-        guard !sorted.isEmpty else { return nil }
+    private func countLine(movies: Int, shows: Int) -> String? {
+        guard movies + shows > 0 else { return nil }
         var parts: [String] = []
-        if !savedMovies.isEmpty { parts.append("\(savedMovies.count) movie\(savedMovies.count == 1 ? "" : "s")") }
-        if !savedShows.isEmpty { parts.append("\(savedShows.count) show\(savedShows.count == 1 ? "" : "s")") }
+        if movies > 0 { parts.append("\(movies) movie\(movies == 1 ? "" : "s")") }
+        if shows > 0 { parts.append("\(shows) show\(shows == 1 ? "" : "s")") }
         return parts.joined(separator: "  ·  ")
     }
 
     var body: some View {
+        // Derived ONCE per body pass. These used to be chained computed
+        // properties (`sorted` → `savedMovies`/`savedShows` → `visibleItems`
+        // → `countLine`), and one pass touched the chain 6–8 times — each
+        // touch re-sorting the whole library. `focusedID` is `@FocusState`
+        // on this view, so every D-pad move in the grid pays a body pass;
+        // on an A8 with a few hundred saved items that was per-press jank.
+        let sortedItems = sorted
+        let movies = sortedItems.filter { !$0.metaItem.isSeries }
+        let shows = sortedItems.filter { $0.metaItem.isSeries }
+        let visibleItems: [SavedLibraryItem] = {
+            switch filter {
+            case .movies: return movies
+            case .shows: return shows
+            default: return sortedItems
+            }
+        }()
         ZStack {
             ATVBackground()
             ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: OrivioSpacing.lg) {
-                    header
+                    header(countLine: countLine(movies: movies.count, shows: shows.count))
                     chipRow
                     if filter == .cloud {
                         cloudPane
+                    } else if let kind = filter.mediaServer {
+                        MediaServerPane(kind: kind, onPlay: onPlayMediaServer, onOpenShow: onOpenMediaServerShow)
                     } else if visibleItems.isEmpty {
                         OrivioEmptyState(icon: "bookmark",
                                         title: emptyTitle,
@@ -111,8 +129,20 @@ struct LibraryView: View {
                 .padding(.top, OrivioSpacing.xl)
             }
             .scrollClipDisabled()
-            .onExitCommand { backToTop(proxy) }
+            .onExitCommand { backToTop(proxy, firstID: visibleItems.first?.id) }
             }
+        }
+        // A server tab whose server was disconnected falls back to All.
+        .onChange(of: mediaServers.connected) { _, connected in
+            if let kind = filter.mediaServer, !connected.contains(kind) { filter = .all }
+        }
+    }
+
+    /// The chips on offer: a server tab only while that server is connected.
+    private var filters: [LibraryFilter] {
+        LibraryFilter.allCases.filter { f in
+            guard let kind = f.mediaServer else { return true }
+            return mediaServers.connected.contains(kind)
         }
     }
 
@@ -126,17 +156,17 @@ struct LibraryView: View {
 
     /// Back deep in the grid scrolls to (and focuses) the first poster; a second
     /// Back — already at the top — leaves the screen via `onBackAtRoot`.
-    private func backToTop(_ proxy: ScrollViewProxy) {
+    private func backToTop(_ proxy: ScrollViewProxy, firstID: String?) {
         // `focusedID` is nil while the chips / Sort pill hold focus — Back from
         // there leaves the screen; it used to yank focus down into the grid.
-        guard let first = firstItemID, let focused = focusedID, focused != first else {
+        guard let first = firstID, let focused = focusedID, focused != first else {
             onBackAtRoot(); return
         }
         withAnimation(FusionMotion.focusMove) { proxy.scrollTo(first, anchor: .top) }
         DispatchQueue.main.async { focusedID = first }
     }
 
-    private var header: some View {
+    private func header(countLine: String?) -> some View {
         HStack(alignment: .firstTextBaseline) {
             Text("Library")
                 .font(FusionType.pageTitle(theme.font))
@@ -161,14 +191,14 @@ struct LibraryView: View {
     /// left, the Sort pill on the right.
     private var chipRow: some View {
         HStack(spacing: OrivioSpacing.md) {
-            ForEach(LibraryFilter.allCases, id: \.self) { f in
+            ForEach(filters, id: \.self) { f in
                 Button { filter = f } label: {
                     LibraryChip(title: f.rawValue, selected: filter == f)
                 }
                 .buttonStyle(PlainCardButtonStyle())
             }
             Spacer()
-            if filter != .cloud {
+            if filter != .cloud, filter.mediaServer == nil {
                 OrivioDropdown(
                     title: "Sort",
                     selection: sort,

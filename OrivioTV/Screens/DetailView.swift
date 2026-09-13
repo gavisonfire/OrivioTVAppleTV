@@ -3,7 +3,35 @@ import AVKit
 
 @MainActor
 final class DetailViewModel: ObservableObject {
-    @Published var meta: MetaItem
+    @Published var meta: MetaItem {
+        didSet {
+            episodeCache.removeAll()
+            allEpisodesCache = nil
+        }
+    }
+
+    /// Memoized per-season episode lists. `episodes(season:)` filters, sorts
+    /// and dedups the FULL `videos` array per call, and the page's body used
+    /// to call it per season, twice per body pass (`seriesPlayTarget` + the
+    /// episode row) — on an A8, per D-pad move, for a 400-episode series.
+    /// The lists only change when `meta` itself is reassigned (didSet above).
+    private var episodeCache: [Int: [MetaVideo]] = [:]
+    private var allEpisodesCache: [MetaVideo]?
+
+    func episodes(season: Int) -> [MetaVideo] {
+        if let cached = episodeCache[season] { return cached }
+        let list = meta.episodesIncludingLinkedSpecials(season: season)
+        episodeCache[season] = list
+        return list
+    }
+
+    /// Every episode in playback order (season by season), memoized.
+    var allEpisodesInPlayOrder: [MetaVideo] {
+        if let allEpisodesCache { return allEpisodesCache }
+        let all = meta.playbackSeasons.flatMap { episodes(season: $0) }
+        allEpisodesCache = all
+        return all
+    }
     @Published var selectedSeason: Int?
     @Published var isLoading = true
     @Published var cast: [TMDBService.CastMember] = []
@@ -35,8 +63,34 @@ final class DetailViewModel: ObservableObject {
     /// republishing every row each time was pure churn with a visible flash.
     private var hasLoaded = false
 
+    /// The TMDB enrichment (cast, more-like-this, collection, trailers,
+    /// director…) came back empty on the last try. One flaked request used to
+    /// leave the page permanently half-loaded — everything below the Play
+    /// button missing, latched behind `hasLoaded` with nothing that would
+    /// ever ask again. Now the `.task` re-run on every reappearance retries
+    /// just the enrichment while this is set.
+    private var enrichmentPending = false
+
+    /// The core load (identity + episodes) reached its natural end. Distinct
+    /// from `hasLoaded`, which latches at ENTRY: a reappearance while a
+    /// cancelled load is still unwinding used to read the latch, skip loading,
+    /// and only then have the old task's defer reset it — a page stuck on the
+    /// stub for that whole visit.
+    private var coreLoaded = false
+
     func load(addonManager: AddonManager, mdbSettings: MDBListSettings = .default, tmdb: TMDBSettings = .default, parentalGuideEnabled: Bool = false) async {
-        guard !hasLoaded else { return }
+        // A previous load is mid-flight or mid-unwind: wait it out briefly.
+        // Either it completes (we then just handle the enrichment retry) or
+        // its cancellation defer drops the latch and this run loads for real.
+        var waited = 0
+        while hasLoaded, !coreLoaded, !Task.isCancelled, waited < 30 {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            waited += 1
+        }
+        guard !hasLoaded else {
+            if enrichmentPending { await enrich(tmdb: tmdb) }
+            return
+        }
         hasLoaded = true
         // The `.task` is cancelled by `onDisappear` (Play is focusable from
         // the first frame), and a cancelled load leaves the stub meta — with
@@ -67,9 +121,42 @@ final class DetailViewModel: ObservableObject {
         let commentsTask = Task { await TraktService.comments(imdbID: meta.id, type: meta.type) }
         let ratingsTask = Task { await loadMDBRatings(settings: mdbSettings) }
 
-        if let addon = addonManager.metaAddon(for: meta.type, id: meta.id),
-           let full = try? await StremioAPI.meta(addon: addon, type: meta.type, id: meta.id) {
-            meta = full
+        // Ask every meta add-on that could serve this id, not just the first.
+        //
+        // The first answer used to be the only answer, so a series from a
+        // catalog-only add-on (Kaptain's mega collection and friends) whose id
+        // no installed meta provider really serves came back with a name and
+        // NO `videos` — a detail page with no season or episode list at all,
+        // and nothing that tried anybody else. Keep the first usable meta as a
+        // floor and keep going until one carries episodes.
+        var best: MetaItem?
+        // Capped: a viewer with a dozen meta add-ons installed should not pay a
+        // dozen serial round trips on a title none of them can serve. Four is
+        // past the id-prefix matches and a couple of long shots.
+        for addon in addonManager.metaAddons(for: meta.type, id: meta.id).prefix(4) {
+            guard let full = try? await StremioAPI.meta(addon: addon, type: meta.type, id: meta.id)
+            else { continue }
+            if best == nil { best = full }
+            // A movie has nothing more to find; a series is only done when it
+            // has an episode list.
+            guard meta.isSeries else { break }
+            if !(full.videos ?? []).isEmpty { best = full; break }
+        }
+        if let best { meta = best }
+        // Still no episodes: TMDB knows the structure of essentially every
+        // series, and an episode list from there is far better than a detail
+        // page that can't be played.
+        if meta.isSeries, (meta.videos ?? []).isEmpty, TMDBService.hasAPIKey {
+            let episodes = await TMDBService.episodes(for: meta.id, type: meta.type)
+            if !episodes.isEmpty {
+                meta = MetaItem(
+                    id: meta.id, type: meta.type, name: meta.name,
+                    poster: meta.poster, background: meta.background, logo: meta.logo,
+                    description: meta.description, releaseInfo: meta.releaseInfo,
+                    imdbRating: meta.imdbRating, runtime: meta.runtime,
+                    genres: meta.genres, cast: meta.cast, videos: episodes
+                )
+            }
         }
         if selectedSeason == nil {
             selectedSeason = meta.regularSeasons.first ?? meta.seasons.first
@@ -84,36 +171,72 @@ final class DetailViewModel: ObservableObject {
         // just made "episodes" wait even longer for no reason.
         isLoading = false
 
-        if let detail = await enrichTask?.value ?? nil {
-            // Granular TMDB toggles gate which enriched sections appear.
-            if tmdb.useCredits {
-                cast = detail.cast
-                crew = detail.crew
-                director = detail.director
-            }
-            if tmdb.useDetails {
-                country = detail.country
-                language = detail.language
-            }
-            contentRating = detail.contentRating
-            if tmdb.useReleaseDates { releaseDate = detail.releaseDate }
-            if tmdb.useMoreLikeThis { moreLikeThis = detail.moreLikeThis.deduplicatedByID() }
-            if tmdb.useProductions { companies = detail.companies }
-            if tmdb.useTrailers { trailers = detail.trailers }
-            if tmdb.useCollections {
-                collection = detail.collection
-                if let collection {
-                    collectionParts = await TMDBService.collectionItems(id: collection.id)
-                        .filter { $0.id != meta.id }
-                        .deduplicatedByID()
-                }
+        // Unwinding on cancellation: the garnish tasks below were already
+        // launched — kill them rather than let three network round trips run
+        // to completion for a page the viewer left. (Each aborted visit used
+        // to orphan all three.)
+        if Task.isCancelled {
+            enrichTask?.cancel()
+            commentsTask.cancel()
+            ratingsTask.cancel()
+            return
+        }
+        coreLoaded = true
+        // The rest is garnish riding slow endpoints. Awaiting it HERE kept the
+        // load task alive for the whole TMDB round trip, so a cancelled task
+        // could not unwind (the latch stayed up, and a quick exit-and-return
+        // found a page that refused to load). Applied from its own task; each
+        // publish is main-actor via the view model.
+        Task { [weak self] in
+            guard let self else { return }
+            await self.apply(detail: await enrichTask?.value ?? nil, tmdb: tmdb)
+            self.comments = await commentsTask.value
+            self.mdbRatings = await ratingsTask.value
+            // Content advisories (IMDb parents guide) once the id is canonical tt.
+            if parentalGuideEnabled, self.meta.id.hasPrefix("tt") {
+                self.parentalGuide = await ParentalGuideService.guide(imdbID: self.meta.id)
             }
         }
-        comments = await commentsTask.value
-        mdbRatings = await ratingsTask.value
-        // Content advisories (IMDb parents guide) once the id is canonical tt.
-        if parentalGuideEnabled, meta.id.hasPrefix("tt") {
-            parentalGuide = await ParentalGuideService.guide(imdbID: meta.id)
+    }
+
+    /// Fetch (or re-fetch) the TMDB enrichment and fold it in. Sets
+    /// `enrichmentPending` while it has not succeeded, so a reappearance of
+    /// the page tries again instead of leaving the sections empty for good.
+    private func enrich(tmdb: TMDBSettings) async {
+        guard TMDBService.hasAPIKey else { enrichmentPending = false; return }
+        await apply(detail: await TMDBService.detail(imdbID: meta.id, type: meta.type), tmdb: tmdb)
+    }
+
+    private func apply(detail: TMDBService.Detail?, tmdb: TMDBSettings) async {
+        guard let detail else {
+            // Nothing came back (network flake, TMDB hiccup). Remember to
+            // retry — but only when a key exists and enrichment was expected.
+            enrichmentPending = TMDBService.hasAPIKey
+            return
+        }
+        enrichmentPending = false
+        // Granular TMDB toggles gate which enriched sections appear.
+        if tmdb.useCredits {
+            cast = detail.cast
+            crew = detail.crew
+            director = detail.director
+        }
+        if tmdb.useDetails {
+            country = detail.country
+            language = detail.language
+        }
+        contentRating = detail.contentRating
+        if tmdb.useReleaseDates { releaseDate = detail.releaseDate }
+        if tmdb.useMoreLikeThis { moreLikeThis = detail.moreLikeThis.deduplicatedByID() }
+        if tmdb.useProductions { companies = detail.companies }
+        if tmdb.useTrailers { trailers = detail.trailers }
+        if tmdb.useCollections {
+            collection = detail.collection
+            if let collection {
+                collectionParts = await TMDBService.collectionItems(id: collection.id)
+                    .filter { $0.id != meta.id }
+                    .deduplicatedByID()
+            }
         }
     }
 
@@ -148,13 +271,15 @@ final class DetailViewModel: ObservableObject {
         loadingEpisodeCast.insert(episode.id)
         defer { loadingEpisodeCast.remove(episode.id) }
         let cast = await TMDBService.episodeCast(imdbID: meta.id, type: meta.type, episode: episode)
-        if !cast.isEmpty { episodeCasts[episode.id] = cast }
+        // A cancelled cell task (scrolled away / page dismissed) must not
+        // publish — each insert re-renders the whole page.
+        if !Task.isCancelled, !cast.isEmpty { episodeCasts[episode.id] = cast }
     }
 }
 
 private extension View {
-    /// Adds the hold-Select menu to the Play button ONLY when Auto Link
-    /// Selector is on (Play Manually / Play in Infuse); with it off, Play
+    /// Adds the hold-Select menu to the Play button ONLY while an auto-select
+    /// feature is armed (Play Manually / Play in Infuse); with both off, Play
     /// already opens the source list, so there is no menu at all.
     @ViewBuilder
     func playManuallyMenu(enabled: Bool,
@@ -162,6 +287,12 @@ private extension View {
                           infuse: (() -> Void)? = nil) -> some View {
         if enabled {
             contextMenu {
+                // Marks that tvOS actually asked for this menu's content, so a
+                // "hold does nothing" report can be split into "the press
+                // never became a long-press" vs "the menu built and failed to
+                // present" without guessing. Costs nothing when the hold probe
+                // is off.
+                let _ = HoldProbe.log("MENU BUILT — detail Play")
                 Button(action: action) {
                     Label("Play Manually", systemImage: "list.and.film")
                 }
@@ -231,6 +362,13 @@ struct DetailView: View {
     /// trailer takes the full screen (with sound). Any press/move restores.
     @State private var trailerFullscreen = false
     @State private var teaserFocused = false
+    /// The synopsis teaser becomes focusable only once Play has held focus
+    /// (or a moment has passed). It is the topmost focusable on the page, so
+    /// whenever the engine re-resolved — the page's data landing a beat after
+    /// the first frame — it went there, and the correction back to Play was
+    /// the visible "starts on the plot, then jumps" hop. Unfocusable, it can't
+    /// be the engine's pick; Up from Play reaches it as soon as it is armed.
+    @State private var teaserArmed = false
     /// Bumped on any tracked focus change; re-arms (or cancels) the idle timer.
     @State private var interactionCount = 0
     /// Set when the user backs OUT of full-screen: the idle timer stays
@@ -268,9 +406,14 @@ struct DetailView: View {
         self.onSelectCompany = onSelectCompany
     }
 
-    /// Whether the active profile's Auto Link Selector is on (Play auto-picks;
-    /// hold-Play offers "Play Manually").
-    private var autoLinkOn: Bool { profiles.activeAutoLink.enabled }
+    /// Whether SOME auto-selection will act on Play — the per-profile Auto
+    /// Link Selector or the global "Auto-play best source". Either one means
+    /// Play skips the source list, so either one earns the hold-for-manual
+    /// menu; gating on the selector alone left global-auto-play users with no
+    /// way to reach the list at all.
+    private var autoLinkOn: Bool {
+        profiles.activeAutoLink.enabled || playerSettings.settings.autoPlaySourceEnabled
+    }
 
     var body: some View {
         ZStack {
@@ -319,18 +462,31 @@ struct DetailView: View {
                     .onTapGesture { exitTrailerFullscreen() }
             }
         }
-        // Arm the idle → full-screen countdown whenever the trailer is up and
-        // the user is resting in the header; any tracked interaction re-arms.
+        // Arm the idle → full-screen countdown only while the viewer is resting
+        // on the SYNOPSIS — never while focus is on the action row.
+        //
+        // Resting on Play is not idling: Play is this page's DEFAULT focus, so
+        // the countdown fired on every visit and dissolved the page a few
+        // seconds after it opened (device trailer delay 3s + 6s idle). The
+        // chrome goes to `.opacity(0)` and `.disabled`, which DELETES the Play
+        // button mid-visit: a hold-Select that overlaps the takeover is
+        // cancelled, and one attempted after it only restores the chrome. That
+        // is the second, independent half of "the hold menu on Play doesn't
+        // work" — measured on the sim: without this gate the page reached
+        // `fs=1` 17s after opening and focus was stranded off the row; with it,
+        // Play held focus for 14m45s across 205 samples and it never fired.
+        // Full screen is still reachable on demand from the trailer button.
         .task(id: "\(backdropTrailerPlaying)#\(interactionCount)#\(trailerFullscreen)") {
             guard backdropTrailerPlaying, !trailerFullscreen, !fullscreenCooldown,
                   activeTrailer == nil, !showRatingPicker,
-                  actionFocus != nil || teaserFocused else { return }
+                  teaserFocused, actionFocus == nil else { return }
             // A real rest, not a reading pause: the first press after the
             // chrome fades only brings it back, so this must never fire while
             // someone is still deciding.
             try? await Task.sleep(for: .seconds(6))
             guard !Task.isCancelled, backdropTrailerPlaying, !trailerFullscreen,
                   !fullscreenCooldown, activeTrailer == nil, !showRatingPicker,
+                  teaserFocused, actionFocus == nil,
                   !PiPHandoff.shared.isActive else { return }
             // Un-muting needs a live audio session — the muted backdrop
             // deliberately runs without one (a raw AVPlayer can stall on tvOS
@@ -375,6 +531,34 @@ struct DetailView: View {
             case .manual: onPlayManually(viewModel.meta, target)
             case .infuse: onPlayInInfuse(viewModel.meta, target)
             }
+        }
+        // `.defaultFocus($actionFocus, .play)` opens the page on Play, but it
+        // LOSES A RACE on a cold start: the page's data lands a beat after the
+        // first frame, the focus engine re-resolves, and the topmost focusable
+        // — the synopsis teaser — takes focus instead. A show hides this (its
+        // Play title changes to "Play S1:E1" when episodes arrive, which
+        // re-settles the row); a movie's title never changes, so the page just
+        // sits there with the synopsis lit. Reproduced against a freshly
+        // installed app in `FocusTour.testDetailPlayHold`.
+        //
+        // So: for a short window after the page opens, move focus back to Play
+        // whenever it is resting on the teaser. ONE writer, deferred, and it
+        // stops the moment the action row holds focus — the rules the rest of
+        // this page's focus code follows. It never touches a move to anywhere
+        // else, so pressing Down into the cast row still works immediately.
+        .task {
+            for _ in 0..<12 {
+                try? await Task.sleep(for: .milliseconds(150))
+                if actionFocus != nil || trailerFullscreen { return }
+                guard teaserFocused else { continue }
+                actionFocus = .play
+            }
+        }
+        // Arm the teaser even if Play somehow never took focus, so the
+        // synopsis is always reachable.
+        .task {
+            try? await Task.sleep(for: .seconds(2))
+            teaserArmed = true
         }
         .task { await viewModel.load(addonManager: addonManager, mdbSettings: mdblist.settings, tmdb: tmdbSettings.settings, parentalGuideEnabled: playerSettings.settings.parentalGuideEnabled) }
         // Auto-play the trailer in the backdrop after the configured idle
@@ -422,12 +606,20 @@ struct DetailView: View {
                             maxPixels: PerformanceProfile.backdropPixelCap)
                     .allowsHitTesting(false)
                     .frame(width: geo.size.width, height: geo.size.height)
-                if showBackdropTrailer, let player = backdropPlayer {
-                    BackdropVideoView(player: player)
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                }
+                // MOUNTED ALWAYS, revealed by opacity — never inserted into
+                // the tree while the page is on screen. Inserting a
+                // UIViewRepresentable makes the focus engine re-resolve (the
+                // reason this view is `isUserInteractionEnabled = false` in
+                // the first place), and the insertion lands ~3s after the page
+                // opens: exactly when a viewer is reaching for hold-Select on
+                // Play, whose long-press the re-resolve then cancels — the
+                // "hold panel doesn't work any more" report. It used to be
+                // hidden by how OFTEN extraction failed or ran long; caching
+                // resolved URLs made it punctual and the collision routine.
+                BackdropVideoView(player: backdropPlayer)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .allowsHitTesting(false)
+                    .opacity(showBackdropTrailer ? 1 : 0)
                 HeroGradient(background: theme.stageBlend, fullBleed: true)
                     .opacity(trailerFullscreen ? 0 : 1)
             }
@@ -600,6 +792,7 @@ struct DetailView: View {
                         interactionCount += 1
                     }
                 )
+                .disabled(!teaserArmed)
             }
 
             actionRow
@@ -763,6 +956,14 @@ struct DetailView: View {
             // WITHIN the row (old != nil) are left alone.
             .onChange(of: actionFocus) { old, new in
                 interactionCount += 1
+                // Deferred one turn: arming flips the teaser from unfocusable
+                // to focusable, and doing that INSIDE the focus change that
+                // put Play in focus is the "focusable set depends on focus"
+                // trap this row's own comment bans — the engine can invalidate
+                // the in-flight move and bounce it.
+                if new == .play, !teaserArmed {
+                    Task { @MainActor in teaserArmed = true }
+                }
                 // Only a USER move re-arms full-screen. Leaving full-screen
                 // restores focus to Play programmatically; treating that as
                 // interaction cleared the cooldown, so the page went back to
@@ -841,7 +1042,7 @@ struct DetailView: View {
     /// For a series, the episode the Play button should start: an in-progress
     /// episode, else the next-up episode, else the very first — like the APK.
     private var seriesPlayTarget: MetaVideo? {
-        let all = viewModel.meta.playbackSeasons.flatMap { viewModel.meta.episodesIncludingLinkedSpecials(season: $0) }
+        let all = viewModel.allEpisodesInPlayOrder
         guard !all.isEmpty else { return nil }
         if let inProgress = all.first(where: { ep in
             if let p = progressStore.progress(for: ep.id) { return p.fraction > 0.02 && p.fraction < 0.95 }
@@ -907,10 +1108,19 @@ struct DetailView: View {
                     Spacer()
                     // Mark/unmark the whole season in one press.
                     Button {
-                        let episodes = viewModel.meta.episodesIncludingLinkedSpecials(season: season)
-                        for episode in episodes where !watched.isWatched(
+                        let episodes = viewModel.episodes(season: season)
+                        for episode in episodes where episode.hasAired && !watched.isWatched(
                             contentID: viewModel.meta.id, season: episode.season ?? season, episode: episode.episode
                         ) {
+                            // `hasAired` matters: this marked every episode the
+                            // season LISTS, including ones that have not been
+                            // broadcast yet. Those phantom rows are pushed to
+                            // Trakt and SIMKL as real plays, and they make the
+                            // show look permanently caught-up — the new-episode
+                            // badge measures against the furthest episode you
+                            // have reached, so a season marked through to a
+                            // finale that airs next month can never report a
+                            // new episode again.
                             watched.mark(meta: viewModel.meta, video: episode)
                         }
                     } label: {
@@ -921,7 +1131,7 @@ struct DetailView: View {
                 }
                 ScrollView(.horizontal) {
                     LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
-                        ForEach(viewModel.meta.episodesIncludingLinkedSpecials(season: season)) { episode in
+                        ForEach(viewModel.episodes(season: season)) { episode in
                             let extra = episode.episode.flatMap { viewModel.episodeExtras[season]?[$0] }
                             EpisodeCell(
                                 imageURL: episode.thumbnail ?? extra?.still ?? viewModel.meta.background,
@@ -937,9 +1147,24 @@ struct DetailView: View {
                                 detailLine: episodeCastLine(viewModel.episodeCasts[episode.id]),
                                 blurImage: shouldBlurEpisode(episode, season: season),
                                 onPlay: { onPlay(viewModel.meta, episode) },
-                                onToggleWatched: { toggleWatched(episode, season: season) }
+                                onToggleWatched: { toggleWatched(episode, season: season) },
+                                // Auto-select armed: holding an episode offers
+                                // the manual source list, same as hold-Play.
+                                onPlayManually: autoLinkOn
+                                    ? { onPlayManually(viewModel.meta, episode) }
+                                    : nil
                             )
-                            .task { await viewModel.loadCast(for: episode) }
+                            .task {
+                                // Debounce: a fast scroll across a 24-episode
+                                // season materializes every cell, and each used
+                                // to fire a TMDB cast request immediately —
+                                // each response republishing the whole page.
+                                // Waiting a beat lets the `.task` cancellation
+                                // of scrolled-past cells win before any fetch.
+                                try? await Task.sleep(nanoseconds: 300_000_000)
+                                guard !Task.isCancelled else { return }
+                                await viewModel.loadCast(for: episode)
+                            }
                         }
                     }
                     .padding(.horizontal, OrivioSpacing.huge)
@@ -1158,6 +1383,9 @@ private struct EpisodeCell: View {
     var blurImage: Bool
     let onPlay: () -> Void
     let onToggleWatched: () -> Void
+    /// Present only while an auto-select feature is armed: the hold menu's
+    /// "Play Manually" escape hatch to the full source list for THIS episode.
+    var onPlayManually: (() -> Void)?
 
     /// Focus mirrored out of the button: a sibling caption cannot read
     /// `\.isFocused`, which only resolves inside the focusable view.
@@ -1193,8 +1421,14 @@ private struct EpisodeCell: View {
             // not tell which episode you were on.
             .mediaCardButtonStyle()
             // Hold Select on an episode to flip its watched state without
-            // opening it.
+            // opening it — and, when auto-select is armed, to reach the manual
+            // source list (a plain press auto-picks a link).
             .contextMenu {
+                if let onPlayManually {
+                    Button(action: onPlayManually) {
+                        Label("Play Manually", systemImage: "list.and.film")
+                    }
+                }
                 Button(action: onToggleWatched) {
                     Label(isWatched ? "Mark as Unwatched" : "Mark as Watched",
                           systemImage: isWatched ? "eye.slash" : "checkmark.circle")
@@ -1404,6 +1638,16 @@ private struct CircleIconLabel: View {
 /// Primary Play/Resume pill — the SAME chrome as the home hero's button
 /// (white pill at rest, accent fill + white ring + accent glow on focus), so
 /// the app's main action reads identically everywhere.
+///
+/// The label carries a MINIMUM WIDTH, and that is load-bearing, not cosmetic:
+/// **tvOS silently declines to present a `.contextMenu` on a focused view
+/// that is too narrow.** A show's pill reads "Play S1:E1" (214pt) and its
+/// hold menu opened; a movie's reads "Play" or "Resume" (152pt) and holding
+/// it did nothing at all — no error, no log, the interaction simply never
+/// fired. That is the whole of the "hold menu works on shows but not movies"
+/// report. Verified both ways in the simulator with
+/// `FocusTour.testDetailPlayHold*`: widening the label alone turns the movie
+/// case from no-menu to menu, with no other change.
 struct PlayActionButton: View {
     @EnvironmentObject private var theme: ThemeManager
 
@@ -1416,6 +1660,9 @@ struct PlayActionButton: View {
                 Image(systemName: "play.fill").font(.system(size: 24, weight: .bold))
                 Text(title).font(FusionType.button(theme.font))
             }
+            // Keeps the capsule at ~222pt even for "Play" — comfortably past
+            // the threshold the menu needs. See the note above.
+            .frame(minWidth: 150)
         }
         .buttonStyle(DetailPillButtonStyle())
     }

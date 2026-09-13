@@ -38,6 +38,7 @@ struct OrivioTVApp: App {
     @StateObject private var plugins = PluginStore()
     @StateObject private var torrent = TorrentSettingsStore()
     @StateObject private var ratings = RatingsStore()
+    @StateObject private var mediaServers = MediaServerStore()
 
     var body: some Scene {
         WindowGroup {
@@ -63,6 +64,7 @@ struct OrivioTVApp: App {
                 .environmentObject(plugins)
                 .environmentObject(torrent)
                 .environmentObject(ratings)
+                .environmentObject(mediaServers)
                 // Classic is hard-dark (the original look). The Apple TV theme
                 // honors its Appearance setting — light, dark, or nil to
                 // follow the TV's own system appearance.
@@ -92,6 +94,8 @@ enum Route: Hashable {
     case catalogSeeAll(addon: InstalledAddon, catalog: ManifestCatalog, title: String)
     case discover
     case cloudLibrary
+    /// A Plex / Jellyfin show's episode list.
+    case mediaServerShow(MediaServerItem)
 }
 
 struct RootView: View {
@@ -113,6 +117,7 @@ struct RootView: View {
     @EnvironmentObject private var streamBadges: StreamBadgeStore
     @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
     @EnvironmentObject private var debrid: DebridStore
+    @EnvironmentObject private var mediaServers: MediaServerStore
     @EnvironmentObject private var plugins: PluginStore
     @EnvironmentObject private var torrent: TorrentSettingsStore
     @EnvironmentObject private var ratings: RatingsStore
@@ -148,6 +153,11 @@ struct RootView: View {
     /// manifest is fetched first (read-only), the add-on is NAMED in a
     /// confirmation, and nothing is written until the viewer presses Install.
     @State private var pendingAddonInstall: PendingAddonInstall?
+    /// Why a Live TV channel couldn't be opened — DRM the box can't decrypt, or
+    /// a YouTube relay that no longer resolves. Shown instead of letting the
+    /// player fail with a generic decode error and burn four source retries on
+    /// something that can never work.
+    @State private var liveChannelError: String?
     /// True while the manifest behind a deep link is being fetched for the
     /// prompt — keeps a second link from queueing a second dialog.
     @State private var addonInstallInFlight = false
@@ -180,7 +190,15 @@ struct RootView: View {
     /// the receiver gates it to Home + active + not-in-player. A no-change pull
     /// mutates nothing (mergeRemote only publishes on a real diff), so an idle
     /// Home doesn't re-render.
-    private let continueWatchingPoll = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+    /// `.default`, NOT `.common`: common-mode timers fire inside the run-loop
+    /// tracking mode focus/scroll animations run in, waking SwiftUI mid-scroll
+    /// for a poll that is never urgent. Tier-scaled: on the A8/A10X the full
+    /// account sync already runs every 90s, and a second independent 30s pull
+    /// over the same data doubled the recurring decode/merge load for nothing.
+    private let continueWatchingPoll = Timer.publish(
+        every: (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower) ? 60 : 30,
+        on: .main, in: .default
+    ).autoconnect()
     /// When Home last popped back from a pushed screen — used to swallow the
     /// stray Menu that otherwise opens the sidebar right after backing out.
     @State private var lastHomePopAt: Date?
@@ -227,7 +245,7 @@ struct RootView: View {
                 if sync == nil {
                     // Finishing a title records it in watched history.
                     progressStore.onFinished = { [weak watched, finishedThisSession] meta, video in
-                        watched?.mark(meta: meta, video: video)
+                        watched?.mark(meta: meta, video: video, fromPlayback: true)
                         // Remember it for the stop scrobble: the row this fires
                         // for has just been DELETED from the progress store.
                         finishedThisSession.keys.insert(
@@ -288,6 +306,7 @@ struct RootView: View {
                         tmdbSettings?.setProfile(id)
                         theme?.setProfile(id)
                         streamBadges?.setProfile(id)
+                        LiveChannelFavorites.shared.setProfile(id)
                         // Every store just re-pointed at another profile's
                         // data; reconcile the new picture everywhere rather
                         // than waiting for a tick.
@@ -296,9 +315,20 @@ struct RootView: View {
                     profiles.onProfileLockChanged = { [weak progressStore] in
                         progressStore?.refreshTopShelf()
                     }
+                    // Write the shelf once at launch. Every other trigger is a
+                    // CHANGE — a progress save, a PIN flip — so a device whose
+                    // Continue Watching arrived from the account (a reinstall,
+                    // a second box) had nothing on the tvOS home screen until
+                    // it played something. Also logs where the snapshot went,
+                    // which is the only way to tell "no rows" apart from "the
+                    // signer stripped the app group" from a device log.
+                    progressStore.refreshTopShelf()
+                    NSLog("[TopShelf] app group %@ → %@", AppGroupResolver.identifier,
+                          AppGroupResolver.sharedFile("topshelf.json")?.path ?? "UNAVAILABLE")
                     profiles.onProfileDeleted = { [weak trakt, weak simkl, weak addonManager,
                                                    weak plugins, weak debrid, weak playerSettings,
-                                                   weak tmdbSettings, weak theme, weak streamBadges] id in
+                                                   weak tmdbSettings, weak theme, weak streamBadges,
+                                                   weak orivioSync] id in
                         trakt?.forgetProfile(id)
                         simkl?.forgetProfile(id)
                         addonManager?.forgetProfile(id)
@@ -308,6 +338,8 @@ struct RootView: View {
                         tmdbSettings?.forgetProfile(id)
                         theme?.forgetProfile(id)
                         streamBadges?.forgetProfile(id)
+                        LiveChannelFavorites.shared.forgetProfile(id)
+                        orivioSync?.syncProfilesNow()
                         SyncCoordinator.shared.requestFullSync("profile deleted")
                     }
                     traktSync = TraktSyncManager(
@@ -316,11 +348,14 @@ struct RootView: View {
                     )
                     // Constructed AFTER the Trakt manager, and safely so: the
                     // store hooks both subscribe to are lists, so this appends
-                    // rather than replacing Trakt's subscriptions. No progress
-                    // store — SIMKL has no playback-position API.
+                    // rather than replacing Trakt's subscriptions. It takes the
+                    // progress store to SEED Continue Watching from SIMKL's
+                    // "watching" list; SIMKL has no playback-position API, so
+                    // nothing flows the other way (see syncContinueWatching).
                     simklSync = SimklSyncManager(
                         simkl: simkl, watched: watched, library: library,
-                        ratings: ratings, addonManager: addonManager
+                        ratings: ratings, addonManager: addonManager,
+                        progress: progressStore
                     )
                     let stremioManager = StremioSyncManager(
                         stremio: stremioAccount,
@@ -341,7 +376,14 @@ struct RootView: View {
                     // reach twice.
                     // Coming back from Picture in Picture: re-present the
                     // cover for the session PiPHandoff kept alive.
-                    PiPHandoff.shared.present = { request in playback = request }
+                    PiPHandoff.shared.present = { [pipRestored] request in
+                        // Flag it as a RESTORE before the cover flips back on,
+                        // so the scrobble lifecycle doesn't read a session that
+                        // never stopped playing as a fresh start (see
+                        // PiPRestoredRequest).
+                        pipRestored.id = request.id
+                        playback = request
+                    }
                     let coordinator = SyncCoordinator.shared
                     coordinator.observe(watched: watched, library: library,
                                         ratings: ratings, progress: progressStore)
@@ -358,11 +400,20 @@ struct RootView: View {
                             }
                         }
                     }
+                    // NOT forced: the per-item hooks (pushMark etc.) already
+                    // delivered the change itself — this pass is pure
+                    // reconciliation, and `force: true` bypassed the managers'
+                    // own throttles, so a single "mark watched" pulled the
+                    // FULL Trakt watched history (thousands of per-episode
+                    // rows, transformed on the main actor) while the user was
+                    // still navigating the page. With the throttle honored a
+                    // burst reconciles once; the 5-min periodic tick remains
+                    // the backstop.
                     coordinator.addDestination("Trakt") { [weak traktSyncRef = traktSync] in
-                        traktSyncRef?.syncNow(force: true)
+                        traktSyncRef?.syncNow(force: false)
                     }
                     coordinator.addDestination("SIMKL") { [weak simklSyncRef = simklSync] in
-                        simklSyncRef?.syncNow(force: true)
+                        simklSyncRef?.syncNow(force: false)
                     }
                     coordinator.addDestination("Stremio") { [weak stremioManager] in
                         stremioManager?.syncNow(reason: "Local change")
@@ -721,6 +772,30 @@ struct RootView: View {
                     .background(theme.palette.background.ignoresSafeArea())
             )
         }
+        // Dev-only: open a detail page directly, so the page's opening focus
+        // and the hold-Select menu on Play can be driven from a UI test
+        // without navigating through Home. `-detailSeries` renders a show
+        // instead of a movie — the two branches of the action row are the
+        // working/broken pair for the hold menu.
+        if ProcessInfo.processInfo.arguments.contains("-detailDemo") {
+            let series = ProcessInfo.processInfo.arguments.contains("-detailSeries")
+            return AnyView(
+                ZStack {
+                    theme.palette.background.ignoresSafeArea()
+                    DetailView(
+                        item: series
+                            ? MetaItem(id: "tt0903747", type: "series", name: "Breaking Bad",
+                                       description: "A chemistry teacher turns to making meth.")
+                            : MetaItem(id: "tt0111161", type: "movie", name: "The Shawshank Redemption",
+                                       description: "Two imprisoned men bond over a number of years."),
+                        onPlay: { _, _ in },
+                        onPlayManually: { _, _ in },
+                        onPlayInInfuse: { _, _ in },
+                        onPlayFromBeginning: { _, _ in }
+                    )
+                }
+            )
+        }
         if ProcessInfo.processInfo.arguments.contains("-accountDemo") {
             return AnyView(
                 ZStack { theme.palette.background.ignoresSafeArea(); AccountView() }
@@ -814,6 +889,13 @@ struct RootView: View {
         } message: { pending in
             Text("\(pending.name)\n\(pending.manifestURL)\n\nThis add-on will be able to supply catalogs, metadata and stream links to Orivio.")
         }
+        .alert("Can't play this channel",
+               isPresented: Binding(get: { liveChannelError != nil },
+                                    set: { if !$0 { liveChannelError = nil } })) {
+            Button("OK", role: .cancel) { liveChannelError = nil }
+        } message: {
+            Text(liveChannelError ?? "")
+        }
         // Feed the resolved system scheme to the theme so `.system` appearance
         // under the Apple TV theme can pick the matching palette.
         .onAppear { theme.systemIsDark = colorScheme == .dark }
@@ -823,7 +905,7 @@ struct RootView: View {
     /// Whether the current tab is at its root (no pushed screen). When a
     /// Detail/Streams/etc. is pushed the rail hides so that screen runs
     /// full-bleed.
-    private var showSidebar: Bool {
+    private var atTabRoot: Bool {
         switch selectedTab {
         case 0: return homePath.isEmpty
         case 1: return searchPath.isEmpty
@@ -833,59 +915,109 @@ struct RootView: View {
         }
     }
 
+    /// Layout → "Hide the sidebar until it's needed": the collapsed rail is
+    /// off screen entirely and content runs full width, until a sideways press
+    /// at the left edge of the content (or Menu) calls it back. Settings keeps
+    /// its rail regardless — that pane is navigated THROUGH the rail, and
+    /// hiding it there leaves no way back out of a settings detail.
+    private var sidebarAutoHides: Bool {
+        homeCatalogSettings.autoHideSidebar && selectedTab != 3
+    }
+
+    /// Set when the auto-hiding rail has been summoned; cleared when it
+    /// collapses again.
+    @State private var sidebarRevealed = false
+
+    private var showSidebar: Bool {
+        guard atTabRoot else { return false }
+        return !sidebarAutoHides || sidebarRevealed
+    }
+
+    /// Bring a hidden rail back and put focus on it. The reveal has to happen
+    /// BEFORE the focus write — the rail isn't in the view tree until
+    /// `showSidebar` turns true, and `@FocusState` on a view that doesn't
+    /// exist yet is dropped on the floor.
+    private func revealSidebar() {
+        guard sidebarAutoHides, !sidebarRevealed else { return }
+        // The failed-move notification is app-wide: a left press with no
+        // target inside the player, a pushed Detail page, or either fullscreen
+        // gate reaches here too, and revealing there would flip state for a
+        // rail that isn't even on screen — it then greets the viewer already
+        // open when they come back to the root.
+        guard atTabRoot, playback == nil, !showProfileGate, !showWelcome else { return }
+        sidebarRevealed = true
+        setSidebarEnabled(true)
+        DispatchQueue.main.async { sidebarFocus = selectedTab }
+    }
+
     /// The app's single root: an always-visible Liquid Glass rail floating at
     /// the left edge over full-bleed content. OVERLAY layout (not an HStack)
     /// so the expanding panel just draws over the content — the content
     /// column never re-lays-out during the spring.
-    /// The rail is open and holding focus, so the content is slid aside
-    /// beneath it. Nothing dims: a scrim under the rail turned the glass
-    /// black, and one over the content laid a sheet across the search field
-    /// and the headings while leaving the strip beside the rail lighter than
-    /// the page. Sliding the content clear is separation enough.
-    private var sidebarExpanded: Bool { sidebarFocus != nil && showSidebar }
-
     private var tabLayout: some View {
         ZStack(alignment: .leading) {
             selectedContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                // Fade the incoming tab up instead of cutting to it. Removal
-                // is `.identity` on purpose: the outgoing screen leaves the
-                // tree at once, so two full tab hierarchies are never live
-                // together (and never both focusable) — only the arriving one
-                // animates. `.id` is what makes a tab change read as an
-                // insertion rather than an in-place update.
+                // Tab changes CUT. No fade, in either direction.
+                //
+                // There were two attempts at fading before this, and each one
+                // exposed something it shouldn't:
+                //
+                // 1. `insertion: .opacity, removal: .identity`. `.identity`
+                //    does not mean "leaves the tree at once" — it means no
+                //    visual transform is applied, so the outgoing page stayed
+                //    FULLY OPAQUE for the whole 0.22s while the new one faded
+                //    in on top of it. Home's hero art showed straight through
+                //    the half-faded page arriving over it.
+                // 2. Removing the outgoing page over ~0 seconds fixed that,
+                //    and then the fade-in had nothing in front of the app
+                //    background — so `ATVBackground`'s accent bloom flashed
+                //    through the half-transparent page instead.
+                //
+                // Both are the same root cause: a page that is partially
+                // transparent shows whatever is behind it, and on this screen
+                // there is always something behind it worth not seeing. A cut
+                // has no transparent frame at all, which is also what the
+                // system tvOS apps do when moving between tabs.
+                //
+                // `.id` still forces a fresh view per tab, so the outgoing
+                // hierarchy is torn down rather than updated in place.
                 .id(selectedTab)
-                .transition(.asymmetric(insertion: .opacity, removal: .identity))
-                .animation(perf.sidebarAnimationEffective ? .easeOut(duration: 0.22) : nil,
-                           value: selectedTab)
+                .transition(.identity)
+                .animation(nil, value: selectedTab)
                 // Home runs full-bleed (hero art sweeps under the floating
                 // pill); other tabs clear the rail.
                 .padding(.leading, showSidebar && selectedTab != 0 ? GlassSidebar.collapsedWidth : 0)
-                // Slide out from under the expanded panel. Still an OFFSET,
-                // not layout: the content column keeps its geometry through
-                // the spring, it just rides sideways. Without it the panel
-                // opened straight over the page and cut the screen title in
-                // half — on Settings you were reading "ayout" with the rest of
-                // the heading behind glass. The shift clears the panel's right
-                // edge (28 leading + 240 wide) less the inset the content
-                // already keeps, and the gap it opens on the left is exactly
-                // the strip the panel is covering, so nothing shows through.
-                .offset(x: sidebarExpanded ? GlassSidebar.expandedWidth + 28 - GlassSidebar.collapsedWidth : 0)
-                // The slide gets its OWN timing rather than inheriting the
-                // ZStack's, and it is ASYMMETRIC, because the panel's own
-                // width is driven by @FocusState and lands a few frames after
-                // this does. Opening, the content has to leave FIRST or the
-                // widening glass sweeps across the search field and the
-                // "Trending" heading; closing, it has to come back LAST or it
-                // slides in under a panel that is still full width. Hence the
-                // quick spring out and the delayed one back.
-                .animation(perf.sidebarAnimationEffective
-                           ? (sidebarExpanded
-                              ? .spring(response: 0.3, dampingFraction: 0.92)
-                              : .spring(response: 0.3, dampingFraction: 0.95).delay(0.12))
-                           : nil,
-                           value: sidebarExpanded)
+                // The expanded panel draws OVER the page and the page does
+                // not move. There was an `.offset` here (plus an animation
+                // keyed to the rail opening) that slid the content sideways to
+                // clear the panel's right edge. It kept every heading legible,
+                // but it meant opening the rail shoved the whole screen
+                // across, which is the part that reads as wrong in motion — a
+                // side panel is supposed to overlay. The cost is that while it
+                // is open the panel covers the leading edge of what is under
+                // it. Nothing dims behind it either: the rail's glass samples
+                // what is behind it, so a scrim under it only turns the glass
+                // muddy.
                 .focusSection()
+                // Summon a hidden rail — but ONLY from the left edge. This was
+                // `.onMoveCommand(.left)` on the section, on the belief that a
+                // section's move handler fires only when the engine finds no
+                // candidate. It does not: it fires on EVERY left press anywhere
+                // in the content, so stepping between two cards mid-row popped
+                // the rail open. `movementDidFailNotification` is the engine's
+                // own "I looked left and found nothing" — exactly the press
+                // from the first card of a row, and nothing else.
+                .onReceive(NotificationCenter.default.publisher(
+                    for: UIFocusSystem.movementDidFailNotification)) { note in
+                    guard let ctx = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey]
+                            as? UIFocusUpdateContext,
+                          ctx.focusHeading.contains(.left) else { return }
+                    revealSidebar()
+                }
+                // Lets the content tell whether a LEFT press should be its own
+                // (step the hero spotlight) or the rail's (come back).
+                .environment(\.railIsHidden, sidebarAutoHides && !sidebarRevealed)
 
             if showSidebar {
                 GlassSidebar(selected: $selectedTab, focusBinding: $sidebarFocus,
@@ -901,14 +1033,34 @@ struct RootView: View {
                     // so the engine sees no candidate to the right — catch it
                     // and run the same collapse Back uses.
                     .onMoveCommand { direction in
-                        if direction == .right { collapseSidebarFromExit() }
+                        guard direction == .right else { return }
+                        // The engine acts on this press too: on tabs whose
+                        // content clears only the COLLAPSED rail, cards past
+                        // the panel's edge are real right candidates, so focus
+                        // may already have moved by the next tick. Then the
+                        // engine's pick stands — only the housekeeping runs —
+                        // instead of a second, visible teleport on top of it.
+                        DispatchQueue.main.async {
+                            if sidebarFocus != nil {
+                                collapseSidebarFromExit()
+                            } else {
+                                if sidebarAutoHides { sidebarRevealed = false }
+                                setSidebarEnabled(false, reenableAfter: 0.4)
+                            }
+                        }
                     }
                     .transition(.move(edge: .leading).combined(with: .opacity))
                     // Stays non-focusable until Home has content to hold
                     // initial focus (onContentReady); timer is the fallback.
                     .task {
                         try? await Task.sleep(nanoseconds: 3_000_000_000)
-                        sidebarEnabled = true
+                        // Cold-launch fallback ONLY. When a tab switch is
+                        // deliberately waiting on onContentReady, this timer
+                        // used to flip the rail focusable over slow addons
+                        // and the panel reclaimed initial focus.
+                        if sidebarReenableTask == nil, !sidebarAwaitingContent {
+                            sidebarEnabled = true
+                        }
                     }
             }
         }
@@ -966,11 +1118,7 @@ struct RootView: View {
                         // Popping all the way back to Home: keep the rail
                         // non-focusable for a beat so focus lands on a card
                         // instead of the rail springing open.
-                        sidebarEnabled = false
-                        Task {
-                            try? await Task.sleep(nanoseconds: 900_000_000)
-                            sidebarEnabled = true
-                        }
+                        setSidebarEnabled(false, reenableAfter: 0.9)
                     }
                     .navigationDestination(for: Route.self) { destination(for: $0, path: $homePath) }
             }
@@ -982,13 +1130,18 @@ struct RootView: View {
     private func selectTab(_ newTab: Int) {
         let enteringHomeFresh = selectedTab != 0 && newTab == 0
         selectedTab = newTab
+        if homeCatalogSettings.autoHideSidebar { sidebarRevealed = false }
         sidebarFocus = nil
-        sidebarEnabled = false
+        // Through the owner, so a pending re-enable (a rail exit moments ago)
+        // is CANCELLED — it used to flip the rail focusable before the fresh
+        // tab's content could hold focus, and the panel sprang open over it.
+        setSidebarEnabled(false)
         // Entering Home fresh rebuilds HomeView; its onContentReady is the
         // sole re-enabler there (a blind timer could beat the rows to
         // focusability and the rail would reclaim focus).
+        sidebarAwaitingContent = enteringHomeFresh
         guard enteringHomeFresh else {
-            scheduleSidebarReenable()
+            setSidebarEnabled(false, reenableAfter: 0.4)
             return
         }
     }
@@ -999,22 +1152,67 @@ struct RootView: View {
     /// dropped — a Menu press in one of those windows did nothing. A deliberate
     /// Back always wins: enable now, focus on the next tick.
     private func focusSidebar(_ tab: Int) {
-        sidebarEnabled = true
+        // Menu at a tab root is the other way back to a hidden rail.
+        if sidebarAutoHides { sidebarRevealed = true }
+        setSidebarEnabled(true)
         DispatchQueue.main.async { sidebarFocus = tab }
     }
 
     /// Back pressed while the rail itself is focused: close the panel. Always
     /// the fast fixed-delay re-enable — nothing is being freshly mounted.
     private func collapseSidebarFromExit() {
+        // An auto-hiding rail goes all the way away again, not just narrow.
+        if sidebarAutoHides { sidebarRevealed = false }
+        // Hand focus to the FIRST tile of the row the viewer left, when that
+        // row is mounted to take it. Dropping the rail's focus with no
+        // destination let the engine pick whatever card sat nearest the
+        // rail's centre — the fourth along, with the first two under the
+        // panel. The rail stays enabled for the turn the hand-off needs; a
+        // request into a `.disabled` view is silently dropped.
+        if ContentFocusRouter.shared.focusLastRowStart() {
+            DispatchQueue.main.async {
+                sidebarFocus = nil   // a no-op once the tile holds focus
+                setSidebarEnabled(false, reenableAfter: 0.4)
+            }
+            return
+        }
         sidebarFocus = nil
-        sidebarEnabled = false
-        scheduleSidebarReenable()
+        setSidebarEnabled(false, reenableAfter: 0.4)
     }
 
-    private func scheduleSidebarReenable() {
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 400_000_000)
+    /// The ONE owner of every timed rail re-enable. Five independent timers
+    /// used to race each other: exit the rail (400ms re-enable pending), then
+    /// switch tabs — the tab switch disabled the rail to keep initial focus in
+    /// the content, and the stale 400ms timer flipped it back early, so the
+    /// panel sprang open over the fresh screen. Scheduling through one task
+    /// cancels whatever was pending first.
+    @State private var sidebarReenableTask: Task<Void, Never>?
+
+    private func setSidebarEnabled(_ enabled: Bool, reenableAfter delay: Double? = nil) {
+        if enabled { sidebarAwaitingContent = false }
+        sidebarReenableTask?.cancel()
+        sidebarReenableTask = nil
+        sidebarEnabled = enabled
+        guard !enabled, let delay else { return }
+        scheduleSidebarReenable(after: delay)
+    }
+
+    /// Waiting on HomeView's onContentReady before the rail may take focus
+    /// (the entering-Home-fresh tab switch). Distinct from a pending timer,
+    /// so the cold-launch 3s fallback can tell the two disables apart.
+    @State private var sidebarAwaitingContent = false
+
+    /// Re-enable the rail after `delay` WITHOUT touching its current state —
+    /// for callers that merely want "focusable again soon" (onContentReady),
+    /// where disabling first would break a rail the viewer has open.
+    private func scheduleSidebarReenable(after delay: Double) {
+        sidebarAwaitingContent = false
+        sidebarReenableTask?.cancel()
+        sidebarReenableTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
             sidebarEnabled = true
+            sidebarReenableTask = nil
         }
     }
 
@@ -1023,11 +1221,7 @@ struct RootView: View {
     /// would land on the rail and pop it open. Briefly disable it again so
     /// focus goes to Home's content first.
     private func deferSidebarAfterProfileGate() {
-        sidebarEnabled = false
-        Task {
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            sidebarEnabled = true
-        }
+        setSidebarEnabled(false, reenableAfter: 0.8)
     }
 
     // MARK: - Tab roots
@@ -1039,17 +1233,24 @@ struct RootView: View {
             onResume: { resume($0) },
             onResumeFromStart: { resume($0, fromBeginning: true) },
             onPlayManually: { meta, video in playManually(meta, video) },
+            onPlayManuallyProgress: { playManuallyFromProgress($0) },
             onOpenCollection: { homePath.append(Route.collection($0)) },
+            // A pinned channel plays exactly as it would from the Live TV tab:
+            // an M3U channel straight away, an add-on channel via the picker.
+            onPlayChannel: { channel in
+                if channel.directURL != nil { playLiveChannel(channel) }
+                else if let meta = channel.meta { homePath.append(Route.streams(meta, nil)) }
+            },
             onSeeAll: { addon, catalog, title in
                 homePath.append(Route.catalogSeeAll(addon: addon, catalog: catalog, title: title))
             },
             onContentReady: {
                 // Give the freshly-loaded rows a beat to render and take
-                // initial focus before the rail becomes focusable.
-                Task {
-                    try? await Task.sleep(nanoseconds: 800_000_000)
-                    sidebarEnabled = true
-                }
+                // initial focus before the rail becomes focusable. This must
+                // ONLY schedule the re-enable — it fires on every catalog
+                // refresh, and disabling first would kick focus off an OPEN
+                // rail whenever a background sync reloaded Home.
+                scheduleSidebarReenable(after: 0.8)
             },
             // Back at the start of a row opens the rail.
             onHomeBack: {
@@ -1071,6 +1272,8 @@ struct RootView: View {
         LibraryView(
             onSelect: { libraryPath.append(Route.detail($0)) },
             onOpenCloud: { libraryPath.append(Route.cloudLibrary) },
+            onPlayMediaServer: { startPlayback($0) },
+            onOpenMediaServerShow: { libraryPath.append(Route.mediaServerShow($0)) },
             onBackAtRoot: { focusSidebar(2) }
         )
     }
@@ -1115,6 +1318,8 @@ struct RootView: View {
                     allEntries: [entry], resumePosition: nil
                 ))
             }
+        case .mediaServerShow(let show):
+            MediaServerShowView(show: show) { startPlayback($0) }
         case .streams(let meta, let video):
             StreamsView(
                 meta: meta, video: video,
@@ -1160,7 +1365,13 @@ struct RootView: View {
             }
         case .streamsFromStart(let meta, let video):
             // Same picker, but playback ignores any saved progress (Start Over).
-            StreamsView(meta: meta, video: video) { entry, all in
+            // Carries `onAutoDismiss` like every other automatic route: without
+            // it an auto-picked Start Over had nothing to pop, so the source
+            // list uncovered itself behind the player and Back landed on it.
+            StreamsView(
+                meta: meta, video: video,
+                onAutoDismiss: { pendingAutoPlayPop = true }
+            ) { entry, all in
                 startPlayback(PlaybackRequest(
                     meta: meta,
                     video: video,
@@ -1211,16 +1422,53 @@ struct RootView: View {
     final class FinishedKeys { var keys: Set<String> = [] }
     @State private var finishedThisSession = FinishedKeys()
 
+    /// The `PlaybackRequest` id Picture in Picture has just put back on screen.
+    ///
+    /// A handoff dismisses this cover and a restore re-presents the SAME
+    /// request, so `onChange(of: playback?.id)` sees the id go nil and come
+    /// back — indistinguishable from the viewer starting the title afresh.
+    /// That is how a restore came to report a `start` at the position the
+    /// session ORIGINALLY resumed from (0% for a film played from the top)
+    /// while the engine had been playing continuously for an hour.
+    /// `PiPHandoff.isActive` cannot answer this side: the re-presented screen
+    /// releases the park from `PlayerScreen.init`, before this handler runs.
+    ///
+    /// A reference box for the same reason as `FinishedKeys` above: it is
+    /// written by the `present` closure PiPHandoff holds and read from the
+    /// change handler, with no view update guaranteed to sit between the two.
+    final class PiPRestoredRequest { var id: UUID? }
+    @State private var pipRestored = PiPRestoredRequest()
+
     private func scrobbleForPlaybackChange() {
         guard trakt.isSignedIn, trakt.scrobbleEnabled, let token = trakt.accessToken else {
             scrobblingItem = nil
             return
         }
         if let request = playback {
+            // Coming back from Picture in Picture: this cover is being
+            // re-presented for a session that never stopped, so there is
+            // nothing to start — and `resumePosition` is where that session
+            // BEGAN, so starting from it threw the account's progress back to
+            // the top of the film while the engine was an hour in. The item is
+            // still in `scrobblingItem` (the handoff left it there) and, if the
+            // session auto-advanced inside the PiP window, it is the episode
+            // actually playing rather than the one this request names.
+            if pipRestored.id == request.id {
+                pipRestored.id = nil
+                return
+            }
             // Playback started.
             startScrobble(meta: request.meta, video: request.video,
                           resumePosition: request.resumePosition, token: token)
         } else if let item = scrobblingItem {
+            // The handoff INTO Picture in Picture dismisses this cover while
+            // the engine plays on in the system's small window (PlayerScreen's
+            // onWillStart: begin() then dismiss()), so this nil is the UI
+            // leaving, not playback ending. A stop here reported the title as
+            // paused mid-film every time the viewer popped it out — Trakt reads
+            // a stop under 80% as a pause. The session's real stop follows when
+            // the restored cover is dismissed for good.
+            if PiPHandoff.shared.isActive { return }
             // Playback ended — report final progress.
             scrobblingItem = nil
             stopScrobble(item, token: token)
@@ -1310,15 +1558,54 @@ struct RootView: View {
     /// Play a direct Live TV channel (M3U): wrap its URL in a one-off stream and
     /// go straight to the player — no source picker, no debrid.
     private func playLiveChannel(_ channel: LiveChannel) {
-        guard let url = channel.directURL else { return }
-        let stream = Stream(name: "Live", title: channel.name, description: nil,
-                            url: url, infoHash: nil, behaviorHints: nil)
-        let entry = StreamEntry(addonName: "Live TV", stream: stream)
-        let meta = MetaItem(id: channel.id, type: "tv", name: channel.name,
-                            poster: channel.logo, background: channel.logo, logo: channel.logo)
-        startPlayback(PlaybackRequest(
-            meta: meta, video: nil, entry: entry, allEntries: [entry], resumePosition: nil
-        ))
+        guard let rawURL = channel.directURL else { return }
+        // A `|Header=Value` suffix can reach here on a channel that came from
+        // somewhere other than the playlist parser (a favourite stored by an
+        // older build, an add-on). Splitting again is idempotent.
+        let split = LiveStreamClassifier.splitPipedOptions(rawURL)
+        var options = channel.options
+        options.merge(split.options)
+
+        // Say WHY an encrypted channel can't play. Handing a DRM-protected
+        // manifest to the player produces a generic decode failure and four
+        // pointless source retries; tvOS gives third-party apps no Widevine or
+        // PlayReady CDM at all, so this can only ever fail.
+        if let reason = options.unsupportedDRMReason {
+            liveChannelError = reason
+            return
+        }
+
+        Task { @MainActor in
+            var playURL = split.url
+            // YouTube links are pages, not media. Community playlists are full
+            // of 24/7 relays published as ordinary watch/live URLs, and handing
+            // one straight to a player fetches HTML.
+            if LiveStreamClassifier.isYouTube(playURL) {
+                guard let resolved = await LiveStreamResolver.resolveYouTube(playURL) else {
+                    liveChannelError = "Couldn't open this YouTube channel. YouTube may have "
+                        + "ended the broadcast or changed how it serves this video."
+                    return
+                }
+                playURL = resolved.url
+                options.merge(resolved.options)
+            }
+
+            let hints = options.requestHeaders.map {
+                StreamBehaviorHints(proxyHeaders: StreamProxyHeaders(request: $0))
+            }
+            let stream = Stream(name: "Live", title: channel.name, description: nil,
+                                url: playURL, infoHash: nil, behaviorHints: hints)
+            let entry = StreamEntry(addonName: "Live TV", stream: stream)
+            let meta = MetaItem(id: channel.id, type: "tv", name: channel.name,
+                                poster: channel.logo, background: channel.logo, logo: channel.logo)
+            startPlayback(PlaybackRequest(
+                meta: meta, video: nil, entry: entry, allEntries: [entry], resumePosition: nil,
+                // RTMP/RTSP/UDP and DASH cannot be opened by AVPlayer at all,
+                // so the engine preference must not be honoured for them —
+                // with Native selected the channel would simply fail.
+                forceDemuxer: LiveStreamClassifier.kind(for: playURL, options: options) == .demuxer
+            ))
+        }
     }
 
     /// Pop the source page off the active tab's stack after an Auto Link
@@ -1367,6 +1654,25 @@ struct RootView: View {
                 }
                 return
             }
+        }
+        // A session parked in the Picture in Picture window is still decoding
+        // and still owns the audio route, and nothing in the app ever ended
+        // one — `stop()` had no callers at all. Opening a different title over
+        // it left two engines live: two soundtracks at once and two pipelines
+        // on a 3 GB A10X, and with the hybrid cache on, `beginSession` for the
+        // new origin tore down the parked session's connections and deleted
+        // the cache file its reader was still reading.
+        if PiPHandoff.shared.isActive {
+            // Window first: `finish()` on its own runs the teardown but leaves
+            // AVKit's window up over a view model that no longer exists.
+            PiPHandoff.shared.viewModel?.pictureInPicture.stop()
+            // Then the teardown `onDidStop` would have run — synchronously,
+            // BEFORE the new cover. Teardown resets state the two sessions
+            // share (the cache server's session, the audio session, the sync
+            // pause), so letting it land after the new load has started strips
+            // that out from under the new engine. AVKit's own `didStop` still
+            // arrives later and finds nothing parked, which is a no-op.
+            PiPHandoff.shared.finish()
         }
         playback = request
     }
@@ -1515,7 +1821,7 @@ struct RootView: View {
     ) async -> StreamEntry? {
         var showID = meta.id
         if showID.hasPrefix("tmdb:"), let n = Int(showID.dropFirst("tmdb:".count)),
-           let tt = await TMDBService.imdbID(tmdbID: n, isMovie: meta.type != "series") {
+           let tt = await TMDBService.imdbID(tmdbID: n, isMovie: !meta.isSeries) {
             showID = tt
         }
         let streamID: String
@@ -1691,11 +1997,87 @@ struct RootView: View {
     /// entry so the card doesn't fork into a duplicate under the new key.
     @MainActor
     private func resumeResolved(_ progress: WatchProgress, fromBeginning: Bool) async {
+        // A Plex / Jellyfin item plays again from its server; its id means
+        // nothing to the add-ons the source picker would scrape.
+        if MediaServerKind.kind(ofMetaID: progress.metaID) != nil {
+            if let request = await MediaServerPlayback.resume(progress, store: mediaServers,
+                                                              fromBeginning: fromBeginning) {
+                startPlayback(request)
+            } else {
+                ToastCenter.shared.show("Couldn't reach the media server", icon: "exclamationmark.triangle")
+            }
+            return
+        }
+        let (meta, video) = await canonicalResumeIdentity(progress)
+        // Resume ALWAYS re-scrapes a fresh link now: a remembered URL from a
+        // debrid/Comet-style addon expires, so replaying it "fails to load" and
+        // (with no failover alternates) drops you back to 0:00. Instead route to
+        // the source picker, which auto-plays the link best matching what was
+        // last watched, with the full list as failover. Start Over takes the
+        // same matched-link path but plays from 0:00.
+        homePath.append(Route.streamsResume(meta, video, fromStart: fromBeginning))
+    }
+
+    /// Continue Watching hold → "Play Manually". The manual source list, but
+    /// through the SAME identity repair as a resume: this route used to push
+    /// the raw stored row (Home built a MetaItem straight off it), so every id
+    /// shape `resumeResolved` had learned to fix — `tmdb:` metaIDs, rows typed
+    /// "tv", synced rows whose season/episode columns were dropped — reached
+    /// the picker unrepaired and produced the same empty Sources page the
+    /// automatic path was cured of.
+    private func playManuallyFromProgress(_ progress: WatchProgress) {
+        // A media-server row has no addon sources to pick between — play it
+        // from its server exactly like a plain resume.
+        if MediaServerKind.kind(ofMetaID: progress.metaID) != nil {
+            resume(progress)
+            return
+        }
+        Task { @MainActor in
+            let (meta, video) = await canonicalResumeIdentity(progress)
+            homePath.append(Route.streamsManual(meta, video))
+        }
+    }
+
+    /// Whether a progress row is a series. Synced rows arrive typed "tv",
+    /// "show" or "anime" as well as "series" — a bare `type != "series"` test
+    /// sent every one of those down TMDB's MOVIE endpoint (disjoint id space →
+    /// no tt id, or the wrong film's) and put the raw type into the addon
+    /// stream path (`/stream/tv/…` → 404), which is why SOME shows resumed
+    /// from Continue Watching found no sources while their Detail page — which
+    /// tests `isSeries` properly — worked.
+    private static func isSeriesProgressType(_ type: String) -> Bool {
+        ["series", "tv", "show", "tvshow", "anime"].contains(type.lowercased())
+    }
+
+    /// The canonical (meta, video) identity for a stored Continue Watching
+    /// row — shared by resume and the hold-menu's Play Manually. Repairs the
+    /// id/type shapes sync sources leave behind, and migrates the stored row
+    /// so the corrected key doesn't fork a duplicate card.
+    @MainActor
+    private func canonicalResumeIdentity(_ progress: WatchProgress) async -> (MetaItem, MetaVideo?) {
+        let isSeries = Self.isSeriesProgressType(progress.type)
+
+        // Recover a dropped season/episode from the progress KEY. Synced rows
+        // can carry `season`/`episode` as nil while the key still spells them
+        // ("tt123:2:5" — the backend sent video_id but not the columns). With
+        // them nil the episode identity below collapsed to the bare show id,
+        // and a show-level stream query returns nothing for a series.
+        var season = progress.season
+        var episode = progress.episode
+        if isSeries, season == nil || episode == nil {
+            let parts = progress.id.split(separator: ":")
+            if parts.count >= 3,
+               let s = Int(parts[parts.count - 2]), let e = Int(parts[parts.count - 1]) {
+                season = s
+                episode = e
+            }
+        }
+
         var metaID = progress.metaID
         // TMDB-sourced ids can't be served by Cinemeta/Torrentio — resolve to
         // the IMDb tt id (DetailView does the same).
         if metaID.hasPrefix("tmdb:"), let n = Int(metaID.dropFirst("tmdb:".count)),
-           let tt = await TMDBService.imdbID(tmdbID: n, isMovie: progress.type != "series") {
+           let tt = await TMDBService.imdbID(tmdbID: n, isMovie: !isSeries) {
             metaID = tt
         }
 
@@ -1708,10 +2090,12 @@ struct RootView: View {
         // correctly) worked. Only for tt-based shows; leave exotic id schemes
         // (kitsu: etc.) and movies alone.
         var episodeID = progress.id
-        if metaID.hasPrefix("tt"), let season = progress.season, let episode = progress.episode {
+        if metaID.hasPrefix("tt"), let season, let episode {
             episodeID = "\(metaID):\(season):\(episode)"
-        } else if metaID != progress.metaID {
-            // tmdb → tt movie (no episode): the id is just the show/movie id.
+        } else if metaID != progress.metaID, !isSeries {
+            // tmdb → tt movie (no episode): the id is just the movie id. A
+            // series row must NOT take this collapse — with no recoverable
+            // episode it would rewrite the stored key to the show id.
             episodeID = metaID
         }
 
@@ -1723,7 +2107,10 @@ struct RootView: View {
 
         let meta = MetaItem(
             id: metaID,
-            type: progress.type,
+            // Normalised: the raw stored type goes verbatim into the addon
+            // stream URL (`/stream/<type>/<id>.json`), and only "series" /
+            // "movie" exist there.
+            type: isSeries ? "series" : "movie",
             name: progress.name,
             poster: progress.poster,
             background: progress.background,
@@ -1731,21 +2118,15 @@ struct RootView: View {
         )
         // Rebuild the episode identity so progress keeps saving under the
         // episode key instead of forking a second entry under the show.
-        let video: MetaVideo? = progress.season != nil || progress.episode != nil
+        let video: MetaVideo? = season != nil || episode != nil
             ? MetaVideo(
                 id: episodeID,
                 title: progress.episodeTitle,
-                season: progress.season,
-                episode: progress.episode
+                season: season,
+                episode: episode
             )
             : nil
-        // Resume ALWAYS re-scrapes a fresh link now: a remembered URL from a
-        // debrid/Comet-style addon expires, so replaying it "fails to load" and
-        // (with no failover alternates) drops you back to 0:00. Instead route to
-        // the source picker, which auto-plays the link best matching what was
-        // last watched, with the full list as failover. Start Over takes the
-        // same matched-link path but plays from 0:00.
-        homePath.append(Route.streamsResume(meta, video, fromStart: fromBeginning))
+        return (meta, video)
     }
 }
 

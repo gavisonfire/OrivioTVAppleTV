@@ -23,6 +23,19 @@ struct CollectionRowSection: View {
 
     @FocusState private var focusedID: String?
 
+    private func registerRowHandler(_ proxy: ScrollViewProxy) {
+        let firstID = collection.folders.first?.id
+        ContentFocusRouter.shared.register("collection.\(collection.id)") {
+            guard let first = firstID else { return false }
+            ContentFocusRouter.land(assign: {
+                proxy.scrollTo(first, anchor: .leading)
+                focusedID = first
+            }, landed: { focusedID == first },
+               focusToken: { focusedID })
+            return true
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: OrivioSpacing.md) {
             RowHeader(title: title)
@@ -69,6 +82,16 @@ struct CollectionRowSection: View {
                     onBackAtStart()
                 }
             }
+            // Coming back out of the rail lands on the first tile when this
+            // was the row the viewer left (ContentFocusRouter). Re-registered
+            // when the first folder changes — a sync pull can reorder the
+            // collection under a mounted row.
+            .onAppear { registerRowHandler(proxy) }
+            .onChange(of: collection.folders.first?.id) { _, _ in registerRowHandler(proxy) }
+            .onDisappear { ContentFocusRouter.shared.unregister("collection.\(collection.id)") }
+            .onChange(of: focusedID) { _, new in
+                if new != nil { ContentFocusRouter.shared.noteFocused(row: "collection.\(collection.id)") }
+            }
             }   // ScrollViewReader
         }
     }
@@ -98,6 +121,19 @@ struct CollectionsRowSection: View {
         guard !pinned.isEmpty else { return collections }
         let rest = collections.filter { !$0.pinToTop }
         return pinned + rest
+    }
+
+    private func registerRowHandler(_ proxy: ScrollViewProxy) {
+        let firstID = ordered.first?.id
+        ContentFocusRouter.shared.register("collections.shared") {
+            guard let first = firstID else { return false }
+            ContentFocusRouter.land(assign: {
+                proxy.scrollTo(first, anchor: .leading)
+                focusedID = first
+            }, landed: { focusedID == first },
+               focusToken: { focusedID })
+            return true
+        }
     }
 
     /// Tallest tile in this row, plus room for the title line beneath it. Must
@@ -152,6 +188,15 @@ struct CollectionsRowSection: View {
             } else {
                 onBackAtStart()
             }
+        }
+        // Coming back out of the rail lands on the first tile when this was
+        // the row the viewer left (ContentFocusRouter). Re-registered when
+        // the first tile changes under a mounted row.
+        .onAppear { registerRowHandler(proxy) }
+        .onChange(of: ordered.first?.id) { _, _ in registerRowHandler(proxy) }
+        .onDisappear { ContentFocusRouter.shared.unregister("collections.shared") }
+        .onChange(of: focusedID) { _, new in
+            if new != nil { ContentFocusRouter.shared.noteFocused(row: "collections.shared") }
         }
         }   // ScrollViewReader
     }
@@ -221,13 +266,6 @@ struct CollectionTileCard: View, Equatable {
         return CommunityCollections.decodeCoverStyles(coverStylesJSON)[id] ?? false
     }
 
-    /// SQUARE is the only shape that means "a logo mark on a branded card";
-    /// POSTER and LANDSCAPE are full-bleed artwork that should fill the tile.
-    private var isLogoMark: Bool {
-        let shape = firstFolder?.tileShape ?? "SQUARE"
-        return shape != "POSTER" && shape != "LANDSCAPE"
-    }
-
     /// Tile size follows the (editable) shape of the collection's first folder.
     private var cardSize: CGSize {
         switch firstFolder?.tileShape {
@@ -235,6 +273,13 @@ struct CollectionTileCard: View, Equatable {
         case "LANDSCAPE": return CGSize(width: 380, height: 214)
         default: return CGSize(width: 260, height: 260)   // SQUARE
         }
+    }
+
+    /// SQUARE is the only shape that means "a logo mark on a branded card";
+    /// POSTER and LANDSCAPE are full-bleed artwork that should fill the tile.
+    private var isLogoMark: Bool {
+        let shape = firstFolder?.tileShape ?? "SQUARE"
+        return shape != "POSTER" && shape != "LANDSCAPE"
     }
 
     var body: some View {
@@ -246,11 +291,11 @@ struct CollectionTileCard: View, Equatable {
                     // POSTER / LANDSCAPE covers are full-bleed CARD ART (a
                     // Netflix card, a director portrait), not logo marks — so
                     // fill the tile edge to edge. Drawing them .fit with padding
-                    // left the grey `surface` fill showing as bars around every
-                    // tile. Only SQUARE is a logo mark that wants a margin.
+                    // left the fill showing as bars around every tile. Only
+                    // SQUARE is a logo mark that wants a margin.
                     RemoteImage(url: cover, contentMode: isLogoMark ? .fit : .fill,
                                 maxDimension: max(cardSize.width, cardSize.height))
-                        .padding(OrivioSpacing.sm)
+                        .padding(isLogoMark ? OrivioSpacing.sm : 0)
                         .clipShape(RoundedRectangle(cornerRadius: OrivioRadius.md))
                 } else if let emoji, !emoji.isEmpty {
                     Text(emoji).font(.system(size: 84))
@@ -359,13 +404,6 @@ struct CollectionFolderCard: View, Equatable {
         return url
     }
 
-    /// Same rule as CollectionCard: only SQUARE is a logo mark wanting a margin.
-    private var isLogoMark: Bool {
-        if forceLandscape { return false }
-        let shape = folder?.tileShape ?? "SQUARE"
-        return shape != "POSTER" && shape != "LANDSCAPE"
-    }
-
     private var isPoster: Bool { folder?.tileShape == "POSTER" }
     private var isLandscape: Bool { folder?.tileShape == "LANDSCAPE" }
 
@@ -373,6 +411,13 @@ struct CollectionFolderCard: View, Equatable {
         if isPoster { return CGSize(width: 220, height: 330) }
         if isLandscape || forceLandscape { return CGSize(width: 360, height: 200) }
         return CGSize(width: 260, height: 260)   // SQUARE default
+    }
+
+    /// Same rule as CollectionCard: only SQUARE is a logo mark wanting a margin.
+    private var isLogoMark: Bool {
+        if forceLandscape { return false }
+        let shape = folder?.tileShape ?? "SQUARE"
+        return shape != "POSTER" && shape != "LANDSCAPE"
     }
 
     var body: some View {
@@ -384,7 +429,7 @@ struct CollectionFolderCard: View, Equatable {
                     // Full-bleed for POSTER/LANDSCAPE card art; .fit + margin
                     // only for SQUARE logo marks. See CollectionCard above —
                     // padding full-bleed art inside the tile is what produced
-                    // the grey bars around every tile.
+                    // the bars around every tile.
                     // Decode capped to the tile, NOT the original. This asked
                     // TMDB for `originalSize` and then handed it to RemoteImage
                     // uncapped, so a 260-330pt tile decoded full-resolution
@@ -409,12 +454,20 @@ struct CollectionFolderCard: View, Equatable {
 
                 // Focus GIF. The model has carried `focusGifUrl` /
                 // `focusGifEnabled` since the Android port, but nothing ever
-                // drew them — that's why "the gifs don't work". Only mounted
-                // while focused, so a 100-folder collection isn't animating a
-                // hundred GIFs at once, and it fades in over the still art.
-                if let gif = focusGifURL, isFocused {
+                // drew them — that's why "the gifs don't work". MOUNTED
+                // whenever the folder has one, DORMANT until focused
+                // (`active:`): `if isFocused` used to insert/remove this
+                // UIViewRepresentable on every focus step, and that tree
+                // mutation forces a UIKit focus re-resolve which strands the
+                // native platter raise — the "frozen poster while captions
+                // move on" bug, the exact mechanism HeroTrailerLayer's
+                // MOUNTED-ALWAYS fix documents. Dormant views fetch and
+                // decode nothing, so a 100-folder strip still animates only
+                // the focused tile.
+                if let gif = focusGifURL {
                     AnimatedGIFView(url: gif, contentMode: .scaleAspectFill,
-                                    stillOnly: effectiveGifQuality == .partial) { ok in
+                                    stillOnly: effectiveGifQuality == .partial,
+                                    active: isFocused) { ok in
                         withAnimation(.easeOut(duration: 0.22)) { gifPlaying = ok }
                     }
                     // Pin to the tile explicitly. Without a hard frame the
@@ -537,7 +590,14 @@ struct CollectionView: View {
         return loadedFolders.contains(selectedFolderID)
     }
 
-    private var typeFilteredItems: [MetaItem] {
+    // The derived chain below (folder merge → type filter → genres/sort) is
+    // computed ONCE per body pass in `collectionBody` and threaded down as
+    // parameters. As chained computed properties, one pass walked the whole
+    // merged set 4–5 times — and during the phase-2 background fill every
+    // published window re-ran the walks over a growing 10k+ item set, so the
+    // screen got progressively slower to render exactly on the A8/A10X.
+
+    private func typeFiltered(_ folderItems: [MetaItem]) -> [MetaItem] {
         switch typeFilter {
         case .all: return folderItems
         case .movies: return folderItems.filter { !$0.isSeries }
@@ -547,7 +607,7 @@ struct CollectionView: View {
 
     /// True only when the current folder/"All" selection genuinely mixes both
     /// movies and shows — a Movies/Shows filter is pointless clutter otherwise.
-    private var hasMixedTypes: Bool {
+    private func hasMixedTypes(_ folderItems: [MetaItem]) -> Bool {
         var sawMovie = false, sawShow = false
         for item in folderItems {
             if item.isSeries { sawShow = true } else { sawMovie = true }
@@ -559,16 +619,16 @@ struct CollectionView: View {
     /// Genres actually present in the current type-filtered set (TMDB discover
     /// sources carry genres; addon/Trakt-sourced items generally don't, so this
     /// is empty — and the picker hides itself — for those).
-    private var availableGenres: [String] {
+    private func availableGenres(in typeFiltered: [MetaItem]) -> [String] {
         var seen = Set<String>()
-        for item in typeFilteredItems {
+        for item in typeFiltered {
             for g in item.genres ?? [] where seen.insert(g).inserted {}
         }
         return seen.sorted()
     }
 
-    private var visibleItems: [MetaItem] {
-        var items = typeFilteredItems
+    private func visibleItems(from typeFiltered: [MetaItem]) -> [MetaItem] {
+        var items = typeFiltered
         if let genreFilter {
             items = items.filter { $0.genres?.contains(genreFilter) == true }
         }
@@ -593,20 +653,6 @@ struct CollectionView: View {
                   spacing: OrivioSpacing.lg)]
     }
 
-    /// The collection's background picture — explicit backdrop, else the first
-    /// folder's cover (so it matches the tile).
-    private var backdropURL: String? {
-        if let b = collection.backdropImageUrl, !b.isEmpty { return b }
-        if let c = collection.folders.first?.coverImageUrl, !c.isEmpty { return c }
-        return nil
-    }
-    /// True when `backdropURL` is a genuine wide backdrop PHOTO (meant to fill
-    /// the screen edge-to-edge) rather than the logo fallback (a small brand
-    /// mark — every community category has one — meant to be seen WHOLE, not
-    /// stretched/cropped to cover the frame, which just showed a zoomed-in
-    /// sliver of the mark).
-    private var backdropIsRealPhoto: Bool { collection.backdropImageUrl?.isEmpty == false }
-
     private var hasTabs: Bool {
         viewMode == .grid && (collection.folders.count > 1 || !collection.showAllTab)
     }
@@ -619,22 +665,28 @@ struct CollectionView: View {
     var body: some View { collectionBody }
 
     private var collectionBody: some View {
-        ZStack(alignment: .top) {
+        // One walk of the merged set per body pass (see the note above the
+        // derived-chain helpers).
+        let folderItems = self.folderItems
+        let typeFilteredItems = typeFiltered(folderItems)
+        return ZStack(alignment: .top) {
+            // No artwork backdrop behind the grid any more — the page sits on
+            // the dark background of whatever theme is chosen in Settings
+            // (ATVBackground), with a subtle card-tone wash so it still reads
+            // as its own screen rather than bare Home.
             ATVBackground()
-            // A real backdrop photo fills edge-to-edge like before; the logo
-            // fallback (every community category has one, no real backdrop)
-            // is shown WHOLE via .fit instead of cropped/zoomed via .fill, at
-            // a bit more opacity so the mark actually reads.
-            if let backdrop = backdropURL {
-                RemoteImage(url: backdrop, contentMode: backdropIsRealPhoto ? .fill : .fit,
-                            maxPixels: PerformanceProfile.backdropPixelCap)
-                    .ignoresSafeArea()
-                    .opacity(backdropIsRealPhoto ? 0.3 : 0.55)
-                    .overlay(theme.palette.background.opacity(0.35).ignoresSafeArea())
-            }
+            LinearGradient(
+                stops: [
+                    .init(color: theme.palette.backgroundCard.opacity(0.55), location: 0),
+                    .init(color: theme.palette.backgroundCard.opacity(0.25), location: 0.5),
+                    .init(color: theme.palette.backgroundCard.opacity(0), location: 1)
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+            .ignoresSafeArea()
 
             // Scrolling posters (full-bleed; content padded to clear the header).
-            grid
+            grid(folderItems: folderItems, visibleItems: visibleItems(from: typeFilteredItems))
 
             // The "grain bar": a background-toned scrim over the top that hides
             // posters as they scroll up under the header, matching the pinned
@@ -662,7 +714,8 @@ struct CollectionView: View {
                 // filter bar over a spinner.
                 if !isLoading {
                     folderTabs
-                    filterBar
+                    filterBar(genres: availableGenres(in: typeFilteredItems),
+                              mixedTypes: hasMixedTypes(folderItems))
                 }
             }
             .padding(.top, OrivioSpacing.xl)
@@ -823,7 +876,7 @@ struct CollectionView: View {
     }
 
     @ViewBuilder
-    private var grid: some View {
+    private func grid(folderItems: [MetaItem], visibleItems: [MetaItem]) -> some View {
         if isLoading || (viewMode == .grid && !selectedFolderResolved) {
             // holdsFocus ONLY on the first load, when the tab/filter row isn't
             // rendered yet and this really is the only thing on screen (with
@@ -877,8 +930,7 @@ struct CollectionView: View {
     /// items actually carry genre data (TMDB discover sources do; addon/Trakt
     /// sources generally don't).
     @ViewBuilder
-    private var filterBar: some View {
-        let genres = availableGenres
+    private func filterBar(genres: [String], mixedTypes: Bool) -> some View {
         HStack(spacing: OrivioSpacing.md) {
             // Categories (a row per folder, desktop-style) vs the merged grid.
             // Only for collections that actually have categories to lay out.
@@ -903,7 +955,7 @@ struct CollectionView: View {
             }
 
             if viewMode == .grid {
-                gridFilterControls(genres: genres)
+                gridFilterControls(genres: genres, mixedTypes: mixedTypes)
             }
         }
         .padding(.horizontal, OrivioSpacing.huge)
@@ -918,7 +970,7 @@ struct CollectionView: View {
     /// Sort/Type/Genre — grid mode only. Category rows keep each folder's own
     /// source order, exactly like the desktop layout they mirror.
     @ViewBuilder
-    private func gridFilterControls(genres: [String]) -> some View {
+    private func gridFilterControls(genres: [String], mixedTypes: Bool) -> some View {
         Group {
             OrivioDropdown(
                 title: "Sort",
@@ -932,7 +984,7 @@ struct CollectionView: View {
                 triggerWidth: 280
             ) { sortMode = SortMode(rawValue: $0) ?? .popular }
 
-            if hasMixedTypes {
+            if mixedTypes {
                 OrivioDropdown(
                     title: "Type",
                     selection: typeFilter.rawValue,
@@ -946,7 +998,11 @@ struct CollectionView: View {
                     typeFilter = TypeFilter(rawValue: newValue) ?? .all
                     // A genre that only existed on the now-excluded type
                     // shouldn't linger as an invisible active filter.
-                    if let genreFilter, !availableGenres.contains(genreFilter) { self.genreFilter = nil }
+                    // (Event handler — the one-off recompute here is fine.)
+                    if let genreFilter,
+                       !availableGenres(in: typeFiltered(folderItems)).contains(genreFilter) {
+                        self.genreFilter = nil
+                    }
                 }
             }
 
@@ -1035,7 +1091,10 @@ struct CollectionView: View {
         // Unbounded meant a 200-folder collection opened 200 folders × 4 pages =
         // 800 simultaneous TMDB requests, which throttles and finishes SLOWER
         // than a bounded queue as well as spiking memory on the small boxes.
-        let maxParallelFolders = 6
+        // Tiered: each in-flight folder also decodes its JSON pages, and six
+        // of those beside poster decodes saturates the A8's two cores.
+        let maxParallelFolders = PerformanceProfile.isLowPower ? 3
+            : PerformanceProfile.isMidPower ? 4 : 6
         let firstPassPages = 3          // 3 TMDB pages ≈ 60 titles
 
         /// Fetch `folders` a chunk at a time, publishing each chunk as it lands

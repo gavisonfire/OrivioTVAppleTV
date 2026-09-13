@@ -293,7 +293,7 @@ final class PluginStore: ObservableObject {
     /// check so a fresh account can't wipe this device.
     func applyRemote(_ s: PluginSyncSnapshot, reconcile: Bool = false) async {
         applyingRemote = true
-        defer { applyingRemote = false }
+        defer { endApplyingRemote() }
         let existing = Set(repositories.map(\.url))
         for url in s.repositoryURLs where !existing.contains(url) {
             await addRepository(url)
@@ -318,7 +318,20 @@ final class PluginStore: ObservableObject {
         } else {
             s = "https://" + s
         }
-        return s.hasSuffix(".json") ? s : (s.hasSuffix("/") ? s + "manifest.json" : s + "/manifest.json")
+        // Split any query/fragment off BEFORE deciding — the same fix
+        // `AddonManager.normalizeManifestURL` carries. A repo URL of the form
+        // "…/manifest.json?token=abc" does not end in ".json", so this used to
+        // produce "…/manifest.json?token=abc/manifest.json": a 404 and an
+        // unexplained "Couldn't add repository".
+        var suffix = ""
+        if let mark = s.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            suffix = String(s[mark...])
+            s = String(s[s.startIndex..<mark])
+        }
+        if !s.hasSuffix(".json") {
+            s = s.hasSuffix("/") ? s + "manifest.json" : s + "/manifest.json"
+        }
+        return s + suffix
     }
 
     /// Resolves a scraper's `filename` against its repository manifest URL.
@@ -344,7 +357,26 @@ final class PluginStore: ObservableObject {
         return "\(base)/\(filename.hasPrefix("/") ? String(filename.dropFirst()) : filename)"
     }
 
-    private func notifyLocalChange() { if !applyingRemote { onLocalChange?() } }
+    /// See `AddonManager.missedLocalChangeWhileSuppressed` — `applyRemote`
+    /// holds `applyingRemote` across a manifest fetch plus every scraper body
+    /// download, and a repo the user removes in that window would otherwise
+    /// never arm the account push.
+    private var missedLocalChangeWhileSuppressed = false
+
+    private func notifyLocalChange() {
+        guard !applyingRemote else {
+            missedLocalChangeWhileSuppressed = true
+            return
+        }
+        onLocalChange?()
+    }
+
+    private func endApplyingRemote() {
+        applyingRemote = false
+        guard missedLocalChangeWhileSuppressed else { return }
+        missedLocalChangeWhileSuppressed = false
+        onLocalChange?()
+    }
 
     private func load() {
         if let data = ProfileScopedDefaults.data(Self.reposKey, feature: Self.feature, profileID),

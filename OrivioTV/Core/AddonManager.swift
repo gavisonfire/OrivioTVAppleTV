@@ -89,9 +89,54 @@ final class AddonManager: ObservableObject {
     struct RemoteAddonState {
         let manifestURL: String
         let enabled: Bool
+        /// Whether the source actually KNOWS the enabled state.
+        ///
+        /// Stremio's add-on descriptor has no `enabled` field at all, so a pull
+        /// from there can only report "installed". Passing `true` for every row
+        /// re-enabled anything the user had switched off here, on every tick
+        /// (gap 5) — a local disable is an overlay the wire cannot express, so
+        /// it must survive a pull that has nothing to say about it.
+        let enabledIsAuthoritative: Bool
+
+        init(manifestURL: String, enabled: Bool, enabledIsAuthoritative: Bool = true) {
+            self.manifestURL = manifestURL
+            self.enabled = enabled
+            self.enabledIsAuthoritative = enabledIsAuthoritative
+        }
     }
 
+    /// A local edit arrived while a remote apply held the suppression.
+    ///
+    /// `applyRemote` keeps `suppressChange` set across its manifest fetches —
+    /// seconds, on a slow or unreachable add-on — and it runs on the main
+    /// actor, so a user removing an add-on in that window is delivered here
+    /// and silently dropped. `onLocalChange` is the ONLY thing that sets the
+    /// account sync's dirty flag, and the tail push is now gated on it, so the
+    /// removal never reached the server and the next reconciling pull put the
+    /// add-on straight back. Remember it and fire once the apply finishes.
+    private var missedLocalChangeWhileSuppressed = false
+
     private func notifyLocalChange() {
+        guard !suppressChange else {
+            missedLocalChangeWhileSuppressed = true
+            return
+        }
+        onLocalChange?()
+    }
+
+    /// Lift the suppression, delivering any change that arrived under it.
+    private func endSuppression() {
+        suppressChange = false
+        guard missedLocalChangeWhileSuppressed else { return }
+        missedLocalChangeWhileSuppressed = false
+        onLocalChange?()
+    }
+
+    /// Add-ons just merged from the Stremio account need to reach the Orivio
+    /// account too. `applyRemote` deliberately fires no change hook (the
+    /// account's own pull must not echo), so a tracker merge asks explicitly —
+    /// the full sync no longer re-uploads the list unconditionally.
+    func requestSyncPush() {
         guard !suppressChange else { return }
         onLocalChange?()
     }
@@ -148,7 +193,7 @@ final class AddonManager: ObservableObject {
     @discardableResult
     func applyRemote(addons remoteAddons: [RemoteAddonState], reconcile: Bool = false) async -> Int {
         suppressChange = true
-        defer { suppressChange = false }
+        defer { endSuppression() }
         let normalizedStates = remoteAddons.map { state in
             let manifestURL = Self.normalizeManifestURL(state.manifestURL)
             // Derived by the SAME rule as `InstalledAddon.baseURL`. This used to
@@ -159,7 +204,8 @@ final class AddonManager: ObservableObject {
             // order), a reconciling pull removed then re-added it, and an
             // enable/disable made on another device never reached it.
             let baseURL = InstalledAddon.baseURL(forManifestURL: manifestURL)
-            return (manifestURL: manifestURL, baseURL: baseURL, enabled: state.enabled)
+            return (manifestURL: manifestURL, baseURL: baseURL, enabled: state.enabled,
+                    authoritative: state.enabledIsAuthoritative)
         }
         let existing = Set(addons.map { $0.baseURL })
         // Keep only genuinely-new addons, in their incoming order.
@@ -175,7 +221,7 @@ final class AddonManager: ObservableObject {
         }
 
         var updatedEnabled = 0
-        for state in normalizedStates {
+        for state in normalizedStates where state.authoritative {
             guard let index = addons.firstIndex(where: { $0.baseURL == state.baseURL }),
                   addons[index].enabled != state.enabled else { continue }
             addons[index].enabled = state.enabled
@@ -291,11 +337,29 @@ final class AddonManager: ObservableObject {
     }
 
     func metaAddon(for type: String, id: String) -> InstalledAddon? {
+        metaAddons(for: type, id: id).first
+    }
+
+    /// Every meta add-on worth ASKING for this id, best first.
+    ///
+    /// `metaAddon` returns only the best guess, and a single guess is not
+    /// enough for a series: an add-on can advertise meta, claim the id, and
+    /// still answer without a `videos` array — at which point the detail page
+    /// has a title and no episodes, and nothing tries anyone else. (That is
+    /// what "no season or episode options" looks like on a catalog-only
+    /// add-on whose items carry ids no installed meta provider really serves.)
+    /// Callers that need episodes walk this list until one answers usefully.
+    ///
+    /// Ordered: add-ons that declare the id prefix first, then the rest as a
+    /// long shot — the same two-tier logic `metaAddon` had, spelled out.
+    func metaAddons(for type: String, id: String) -> [InstalledAddon] {
         // Honour `enabled`, as every other capability lookup does: a disabled
         // meta addon stopped serving catalogs and streams but still answered
         // episode lists, Continue Watching enrichment and next-episode lookups.
         let enabled = addons.filter { $0.enabled && $0.manifest.providesMeta }
-        return enabled.first { $0.handles(id: id) } ?? enabled.first
+        let claiming = enabled.filter { $0.handles(id: id) }
+        let rest = enabled.filter { addon in !claiming.contains { $0.id == addon.id } }
+        return claiming + rest
     }
 
     func install(manifestURL rawURL: String) async throws {

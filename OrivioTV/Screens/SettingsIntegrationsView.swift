@@ -9,9 +9,10 @@ struct IntegrationsDetail: View {
     @EnvironmentObject private var mdblist: MDBListSettingsStore
     @EnvironmentObject private var debrid: DebridStore
     @EnvironmentObject private var torrent: TorrentSettingsStore
+    @EnvironmentObject private var mediaServers: MediaServerStore
     @State private var sheet: IntegrationSheet?
 
-    enum IntegrationSheet: String, Identifiable { case tmdb, mdblist, debrid, p2p; var id: String { rawValue } }
+    enum IntegrationSheet: String, Identifiable { case tmdb, mdblist, debrid, p2p, plex, jellyfin; var id: String { rawValue } }
 
     var body: some View {
         // APK layout: a single list of drill-in rows, each opening a sub-screen.
@@ -22,6 +23,12 @@ struct IntegrationsDetail: View {
                 integrationRow(title: "MDBList", subtitle: "External ratings providers", icon: "star.circle.fill") { sheet = .mdblist }
                 integrationRow(title: "Debrid", subtitle: "Cached torrent sources as direct streams", icon: "bolt.horizontal.circle.fill") { sheet = .debrid }
                 integrationRow(title: "P2P (TorrServer)", subtitle: "Stream uncached torrents through your own TorrServer", icon: "point.3.connected.trianglepath.dotted") { sheet = .p2p }
+                integrationRow(title: "Plex", subtitle: mediaServers.account(for: .plex) == nil
+                               ? "Play your Plex Media Server's library" : "Connected · \(mediaServers.plex?.serverName ?? "Plex")",
+                               icon: MediaServerKind.plex.icon) { sheet = .plex }
+                integrationRow(title: "Jellyfin", subtitle: mediaServers.account(for: .jellyfin) == nil
+                               ? "Play your Jellyfin server's library" : "Connected · \(mediaServers.jellyfin?.serverName ?? "Jellyfin")",
+                               icon: MediaServerKind.jellyfin.icon) { sheet = .jellyfin }
             }
         }
         .fullScreenCover(item: $sheet) { s in
@@ -34,6 +41,7 @@ struct IntegrationsDetail: View {
             .environmentObject(mdblist)
             .environmentObject(debrid)
             .environmentObject(torrent)
+            .environmentObject(mediaServers)
             .onExitCommand { sheet = nil }
         }
     }
@@ -63,6 +71,14 @@ struct IntegrationsDetail: View {
         case .p2p:
             DetailScaffold(title: "P2P (TorrServer)", subtitle: "Stream torrents peer-to-peer via a TorrServer instance") {
                 SettingsGroupCard(title: "") { P2PSection() }
+            }
+        case .plex:
+            DetailScaffold(title: "Plex", subtitle: "Your Plex Media Server as a Library tab") {
+                SettingsGroupCard(title: "") { MediaServerSection(kind: .plex) }
+            }
+        case .jellyfin:
+            DetailScaffold(title: "Jellyfin", subtitle: "Your Jellyfin server as a Library tab") {
+                SettingsGroupCard(title: "") { MediaServerSection(kind: .jellyfin) }
             }
         }
     }

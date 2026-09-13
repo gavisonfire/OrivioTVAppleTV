@@ -385,11 +385,7 @@ struct MetaItem: Codable, Identifiable, Hashable {
         // Full date: compare properly, so something due later THIS year is
         // still correctly hidden.
         if releaseInfo.count >= 10 {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.timeZone = TimeZone(secondsFromGMT: 0)
-            formatter.dateFormat = "yyyy-MM-dd"
-            if let date = formatter.date(from: String(releaseInfo.prefix(10))) {
+            if let date = ReleaseDateParser.ymdGMT.date(from: String(releaseInfo.prefix(10))) {
                 return date > Date()
             }
         }
@@ -495,6 +491,51 @@ extension Array where Element == MetaVideo {
     }
 }
 
+/// Statically cached parsers for the release/air-date hot paths. `hasAired`,
+/// `airedDate` and `isUnreleased` used to construct 1–3 formatters PER CALL,
+/// and their callers run per episode across whole series (the Next Up refresh
+/// walks every episode of up to 40 shows; the Detail page re-derives its play
+/// target on focus moves) — on an A8 the ICU formatter construction dwarfs the
+/// parse itself. Both formatter classes are documented thread-safe.
+enum ReleaseDateParser {
+    static let isoFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    /// Bare "yyyy-MM-dd", pinned to POSIX/GMT (release-date comparisons).
+    static let ymdGMT: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+    /// Bare "yyyy-MM-dd" in the device's locale/zone (display parsing —
+    /// keeps `airedText` rendering the calendar day the addon wrote).
+    static let ymdLocal: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+    static let mediumDisplay: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        return f
+    }()
+    /// Full ISO 8601 (with or without fractional seconds), else bare date.
+    static func parse(_ released: String) -> Date? {
+        if let d = isoFractional.date(from: released) { return d }
+        if let d = iso.date(from: released) { return d }
+        return ymdGMT.date(from: String(released.prefix(10)))
+    }
+}
+
 struct MetaVideo: Codable, Identifiable, Hashable {
     let id: String
     let title: String?
@@ -557,11 +598,8 @@ struct MetaVideo: Codable, Identifiable, Hashable {
 
     var hasAired: Bool {
         guard let released else { return true }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: released) { return date <= Date() }
-        formatter.formatOptions = [.withInternetDateTime]
-        if let date = formatter.date(from: released) { return date <= Date() }
+        if let date = ReleaseDateParser.isoFractional.date(from: released) { return date <= Date() }
+        if let date = ReleaseDateParser.iso.date(from: released) { return date <= Date() }
         return true
     }
 
@@ -572,35 +610,21 @@ struct MetaVideo: Codable, Identifiable, Hashable {
 
     var airedDate: Date? {
         guard let released, !released.isEmpty else { return nil }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = iso.date(from: released) { return date }
-        iso.formatOptions = [.withInternetDateTime]
-        if let date = iso.date(from: released) { return date }
-        let ymd = DateFormatter()
-        ymd.locale = Locale(identifier: "en_US_POSIX")
-        ymd.timeZone = TimeZone(secondsFromGMT: 0)
-        ymd.dateFormat = "yyyy-MM-dd"
-        return ymd.date(from: String(released.prefix(10)))
+        return ReleaseDateParser.parse(released)
     }
 
     /// Air date formatted for display ("Jun 25, 2021"), or nil if unknown.
     var airedText: String? {
         guard let released, !released.isEmpty else { return nil }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        var date = iso.date(from: released)
-        if date == nil { iso.formatOptions = [.withInternetDateTime]; date = iso.date(from: released) }
+        var date = ReleaseDateParser.isoFractional.date(from: released)
+        if date == nil { date = ReleaseDateParser.iso.date(from: released) }
         if date == nil {
-            // Bare "yyyy-MM-dd".
-            let ymd = DateFormatter()
-            ymd.dateFormat = "yyyy-MM-dd"
-            date = ymd.date(from: String(released.prefix(10)))
+            // Bare "yyyy-MM-dd" — local zone, so the shown day matches what
+            // the addon wrote.
+            date = ReleaseDateParser.ymdLocal.date(from: String(released.prefix(10)))
         }
         guard let date else { return nil }
-        let out = DateFormatter()
-        out.dateStyle = .medium
-        return out.string(from: date)
+        return ReleaseDateParser.mediumDisplay.string(from: date)
     }
 }
 
@@ -685,6 +709,44 @@ struct Stream: Codable, Hashable {
     }
 
     var isTorrent: Bool { infoHash != nil && url == nil }
+
+    /// Addons whose origin has refused a byte-range request outright.
+    ///
+    /// Keyed by ADDON, not by link, for the same reason `noticeClipsByAddon`
+    /// is: an addon that hands out cast endpoints hands out cast endpoints for
+    /// everything, so its next link refuses ranges too. Seen on "DMM Cast for
+    /// TorBox", which answers 500 to every range request — the proxy fails open
+    /// so the film PLAYS, and caching, seeking and scrub previews are all
+    /// silently impossible for the rest of the session. Nothing about that is
+    /// visible to the viewer beyond "the cache isn't working".
+    ///
+    /// Persisted, because the verdict is about the addon and not about tonight.
+    /// Auto-selection only: a manual tap still plays whatever you choose.
+    enum RangeRefusingAddons {
+        // v2: the first version noted an addon after ONE failure on any status,
+        // including 416 — which meant a good source could be excluded for good
+        // on the strength of a bad request we made ourselves. Anything the
+        // eager version recorded is untrustworthy, so the key moves and the old
+        // list is simply abandoned.
+        private static let key = "cache.addonsRefusingRanges.v2"
+
+        static var all: Set<String> {
+            Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        }
+
+        static func note(_ addon: String?) {
+            guard let addon, !addon.isEmpty else { return }
+            var current = all
+            guard current.insert(addon).inserted else { return }
+            UserDefaults.standard.set(Array(current), forKey: key)
+            NSLog("[OrivioCache] %@ refuses byte ranges — excluded from auto-selection", addon)
+        }
+
+        static func contains(_ addon: String?) -> Bool {
+            guard let addon, !addon.isEmpty else { return false }
+            return all.contains(addon)
+        }
+    }
 
     /// A cast / open-externally stream (e.g. DMM Cast): no in-app-playable url
     /// and no torrent, but a link to hand off to the system / an external app.
@@ -1195,3 +1257,16 @@ struct AnyIgnorable: Codable {
     }
 }
 
+
+/// A point in a series, ordered season-then-episode.
+///
+/// Comparing `(season, episode)` tuples inline works but reads badly and was
+/// getting rewritten at each call site; this gives the ordering one name.
+struct SeasonEpisode: Comparable, Hashable {
+    let season: Int
+    let episode: Int
+
+    static func < (a: SeasonEpisode, b: SeasonEpisode) -> Bool {
+        (a.season, a.episode) < (b.season, b.episode)
+    }
+}

@@ -34,8 +34,12 @@ struct FusionHeroBar: View {
 
     /// Seconds each hero title stays up before auto-advancing.
     private let dwellSeconds: TimeInterval = 9
-    // Idle tick for auto-rotation — the dwell gate below does the real pacing.
-    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    // Idle tick for auto-rotation — the dwell gate below does the real pacing,
+    // so 2s granularity on a 9s dwell is plenty. `.default`, NOT `.common`:
+    // common-mode timers fire inside the run-loop tracking mode focus/scroll
+    // animations run in, waking SwiftUI mid-scroll on the A8 for a check that
+    // is never urgent.
+    private let tick = Timer.publish(every: 2, on: .main, in: .default).autoconnect()
 
     /// Near-black graphite used by the left readability scrim (§4.3).
     private static let scrim = Color(hex: 0x06080A)
@@ -211,13 +215,21 @@ struct FusionHeroBar: View {
     /// on the focused view, so Down could never leave the bar for the rows.
     @FocusState private var stepFocus: Int?
     @FocusState private var playButtonFocus: Bool
+    @Environment(\.railIsHidden) private var railIsHidden
 
     @ViewBuilder
     private var buttons: some View {
         HStack(spacing: 0) {
-            Color.clear.frame(width: 1, height: 40)
-                .focusable()
-                .focused($stepFocus, equals: -1)
+            // Dropped while the rail is auto-hidden, exactly like the top
+            // hero's sentinel: LEFT must find no candidate here so the failed
+            // move bubbles up and summons the rail. With the sentinel always
+            // present, Left from the Featured bar stepped the carousel forever
+            // and the hidden rail was unreachable from this row.
+            if !railIsHidden {
+                Color.clear.frame(width: 1, height: 40)
+                    .focusable()
+                    .focused($stepFocus, equals: -1)
+            }
             // One primary action, matching the reference — opens the title's
             // page. Labelled by TYPE: "Go to Show" on a series read wrong as
             // "Go to Movie". (The top hero keeps its own labelling.)
@@ -232,8 +244,21 @@ struct FusionHeroBar: View {
             // focus ring, and kept auto-rotating under a focused button.
             .onChange(of: playButtonFocus) { _, focused in
                 playFocused = focused
-                if focused { lastInteraction = Date() }
+                if focused {
+                    lastInteraction = Date()
+                    ContentFocusRouter.shared.noteFocused(row: "hero")
+                }
             }
+            // Coming back out of the rail lands on this button when the bar
+            // was where the viewer left (ContentFocusRouter).
+            .onAppear {
+                ContentFocusRouter.shared.register("hero") {
+                    playButtonFocus = true
+                    DispatchQueue.main.async { if !playButtonFocus { playButtonFocus = true } }
+                    return true
+                }
+            }
+            .onDisappear { ContentFocusRouter.shared.unregister("hero") }
             Color.clear.frame(width: 1, height: 40)
                 .focusable()
                 .focused($stepFocus, equals: 1)

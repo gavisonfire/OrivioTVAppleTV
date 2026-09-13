@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 
 struct HomeRow: Identifiable {
@@ -616,6 +617,121 @@ final class HomeViewModel: ObservableObject {
     }
 }
 
+/// Fades the top of the row list out, so content scrolling up under a PINNED
+/// hero dissolves into the stage instead of sliding out from behind it.
+///
+/// A mask rather than a colour scrim: the stage is `ATVBackground` — a wash
+/// plus an accent bloom that changes with y — so any opaque strip painted over
+/// it would show as a seam. Fading the content itself to transparent reveals
+/// the real background underneath and can't mismatch.
+///
+/// Applied ONLY in the pinned layout. `scrollClipDisabled` (which the rows need
+/// so a focused card's lift isn't cut off) is exactly what let them draw up
+/// over the billboard in the first place, and a full-screen mask is an
+/// offscreen compositing pass — not something to impose on the default layout
+/// for a problem it doesn't have. Flipping `active` remounts the scroll view,
+/// which only happens when the setting itself is toggled.
+private struct HeroFadeMask: ViewModifier {
+    let active: Bool
+
+    /// How much of the strip above the scroll view a row dissolves across on
+    /// its way under the billboard. In POINTS, not a fraction: the mask is
+    /// deliberately larger than the view it masks, so a proportional stop
+    /// would drift as that overhang changed.
+    private static let fadeHeight: CGFloat = 60
+    /// How far the mask spills PAST the scroll view's frame on the other three
+    /// sides. tvOS keeps a title-safe inset, and `scrollClipDisabled` is what
+    /// lets a row draw into it — which is where a poster's caption lands when
+    /// the focused card is near the bottom. A mask sized to the frame clipped
+    /// exactly that strip, so the titles and release dates under the last
+    /// visible row vanished. The overhang keeps the fade at the top and leaves
+    /// every other edge alone.
+    private static let overhang: CGFloat = 260
+
+    func body(content: Content) -> some View {
+        if active {
+            content.mask(
+                VStack(spacing: 0) {
+                    // The fade sits ENTIRELY ABOVE the scroll view's top edge,
+                    // in the strip that `scrollClipDisabled` lets a row draw
+                    // into as it rides up under the billboard. Everything from
+                    // the top edge down is fully opaque.
+                    //
+                    // It was the other way round at first — the gradient ran
+                    // downward FROM the top edge — which faded the first row's
+                    // header and See All while they were sitting in perfectly
+                    // ordinary, un-overlapped space. The only content that
+                    // should be dimmed is the content actually behind the hero.
+                    LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                        .frame(height: Self.fadeHeight)
+                    Color.black
+                }
+                .padding(.top, -Self.fadeHeight)
+                .padding(.bottom, -Self.overhang)
+                .padding(.horizontal, -Self.overhang)
+            )
+        } else {
+            content
+        }
+    }
+}
+
+/// True while the glass rail is auto-hidden and not currently summoned
+/// (Layout → "Hide the sidebar"). Injected by RootView, which owns that state.
+///
+/// The hero needs it because it flanks its Play button with two invisible
+/// focusable sentinels that turn LEFT/RIGHT into spotlight steps — and the
+/// hero's Play button is where focus lands at launch. With the rail hidden,
+/// the left sentinel swallowed the very press that is supposed to call the
+/// rail back, so the first thing a viewer tried did nothing.
+private struct RailIsHiddenKey: EnvironmentKey { static let defaultValue = false }
+
+extension EnvironmentValues {
+    var railIsHidden: Bool {
+        get { self[RailIsHiddenKey.self] }
+        set { self[RailIsHiddenKey.self] = newValue }
+    }
+}
+
+/// A pinned Live TV channel on the home screen: its logo on a plate, sized to
+/// match the poster rows around it rather than the wider Live TV tiles.
+private struct HomeLiveChannelCard: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.isFocused) private var isFocused
+    let favorite: FavoriteChannel
+
+    private let width: CGFloat = 260
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OrivioSpacing.sm) {
+            ZStack {
+                theme.palette.backgroundCard
+                if let logo = favorite.logo {
+                    RemoteImage(url: logo, contentMode: .fit, maxDimension: width)
+                        .padding(OrivioSpacing.md)
+                } else {
+                    Image(systemName: "tv")
+                        .font(.system(size: 40))
+                        .foregroundStyle(theme.palette.textTertiary)
+                }
+            }
+            .frame(width: width, height: width * 9 / 16)
+            .clipShape(RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
+                    .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
+            )
+
+            Text(favorite.name)
+                .font(.system(size: 20, weight: .medium))
+                .lineLimit(1)
+                .foregroundStyle(isFocused ? theme.palette.textPrimary : theme.palette.textSecondary)
+                .frame(width: width, alignment: .leading)
+        }
+        .focusLift(OrivioFocus.card, isFocused)
+    }
+}
+
 /// The live billboard title, updated as focus moves across cards. Kept separate
 /// from HomeViewModel and owned by HomeView WITHOUT observation, so its frequent
 /// animated changes re-render only the billboard subviews — not the poster rows.
@@ -653,6 +769,11 @@ final class HeroFocus: ObservableObject {
     /// True while the hero's own Play button holds focus — rotation stays
     /// frozen so the title can't change out from under a press.
     var heroButtonFocused = false
+    /// True while the billboard trailer preview is playing (HeroTrailerLayer).
+    /// Rotation holds — the trailer earned the spotlight by the viewer
+    /// resting on this title, and swapping it mid-play is the same yank the
+    /// idle window exists to prevent.
+    var trailerPlaying = false
 
     /// Seed the rotation set and show its first title. Safe to call repeatedly;
     /// only re-seeds when the set actually changed.
@@ -660,6 +781,11 @@ final class HeroFocus: ObservableObject {
         guard items.map(\.id) != spotlight.map(\.id) else { return }
         spotlight = items
         spotlightIndex = 0
+        // A fresh spotlight starts its dwell NOW. Left at .distantPast, the
+        // first auto-advance fired the moment the idle gate opened (~6s in),
+        // cutting the first title short — on the pinned billboard, right
+        // after its trailer had finally started.
+        lastRotation = Date()
         if item == nil, let first = items.first { item = first }
     }
 
@@ -681,6 +807,14 @@ final class HeroFocus: ObservableObject {
     /// Timer tick: advance to the next spotlight title, but only if the user
     /// hasn't touched anything for a few seconds (so it never yanks the hero
     /// out from under someone browsing).
+    ///
+    /// NOT reachable from the PINNED hero, which never auto-advances at all
+    /// (HomeView's tick skips it). The pinned billboard's whole contract is
+    /// "show the title under the highlight", and a timer that moves it on is
+    /// that contract broken: the trailer for the card you are sitting on
+    /// played for a moment and then the art, name and synopsis all jumped to
+    /// a title you had not selected. Browsing IS the only thing that changes
+    /// a pinned billboard.
     func rotateIfIdle() {
         let now = Date()
         // Reduce Motion disables automatic rotation, exactly as FusionHeroBar
@@ -689,7 +823,7 @@ final class HeroFocus: ObservableObject {
         // setting, it swapped as a HARD CUT, which is strictly worse for the
         // person the setting exists to protect. Manual stepping still works.
         guard !PerformanceSettingsStore.shared.reduceMotion,
-              spotlight.count > 1, !heroButtonFocused,
+              spotlight.count > 1, !heroButtonFocused, !trailerPlaying,
               now.timeIntervalSince(lastInteraction) > 6,
               now.timeIntervalSince(lastRotation) >= dwellSeconds else { return }
         lastRotation = now
@@ -779,13 +913,20 @@ struct HomeView: View {
     // focus falls back to the sidebar, which reopened the panel.
     @ObservedObject var viewModel: HomeViewModel
     @ObservedObject private var perf = PerformanceSettingsStore.shared
+    @ObservedObject private var liveFavorites = LiveChannelFavorites.shared
 
     let onSelect: (MetaItem) -> Void
     let onResume: (WatchProgress) -> Void
     var onResumeFromStart: (WatchProgress) -> Void = { _ in }
     /// Opens the source list (StreamsView) so the user picks a stream manually.
     var onPlayManually: (MetaItem, MetaVideo?) -> Void = { _, _ in }
+    /// Same, from a Continue Watching card's hold menu — takes the STORED row
+    /// so the root can run the identity repair a resume gets (tmdb: → tt,
+    /// "tv"-typed rows, dropped season/episode) before opening the picker.
+    var onPlayManuallyProgress: (WatchProgress) -> Void = { _ in }
     let onOpenCollection: (OrivioCollection) -> Void
+    /// A channel pinned to Home from the Live TV tab's hold menu.
+    var onPlayChannel: (LiveChannel) -> Void = { _ in }
     var onSeeAll: (InstalledAddon, ManifestCatalog, String) -> Void = { _, _, _ in }
     /// Fires when the first load attempt finishes (success or error), so the
     /// root can re-enable the sidebar only once content exists to hold focus.
@@ -797,9 +938,18 @@ struct HomeView: View {
 
     private var layout: HomeLayout { homeCatalogSettings.homeLayout }
 
-    /// The spotlight stays pinned on its rotating Top-10 title as you browse
-    /// down — it never chases card focus.
-    private var heroFollowsFocus: Bool { false }
+    /// Whether the hero chases card focus.
+    ///
+    /// OFF (the default): the spotlight stays on its rotating Top-10 title as
+    /// you browse down. ON (Layout → "Pin hero to the top"): the hero is
+    /// fixed above the rows and shows whatever card is highlighted — the
+    /// rotation is switched off with it, since the two would otherwise fight
+    /// over the same billboard.
+    private var heroFollowsFocus: Bool { homeCatalogSettings.pinnedHero }
+
+    /// The pinned hero sits OUTSIDE the scroll view, so the rows scroll under
+    /// a billboard that stays put.
+    private var heroIsPinned: Bool { perf.settings.heroBackdrop && homeCatalogSettings.pinnedHero }
 
     // Owned via @State (NOT @StateObject) so HomeView does NOT observe it —
     // hero changes must re-render only the billboard subviews, never the rows.
@@ -817,10 +967,18 @@ struct HomeView: View {
     /// Coalesces the launch burst of store publishes into one reload.
     @State private var reloadDebounce: Task<Void, Never>?
     @State private var nextUpContinueItems: [WatchProgress] = []
+    /// metaID → how many episodes have aired since the viewer started that
+    /// show and are still unwatched. Drives the green "+N" badge. Covers shows
+    /// with a real progress row too, not just the synthesised Next Up cards.
+    @State private var newEpisodeCounts: [String: Int] = [:]
 
     /// Drives the Apple TV hero's spotlight rotation. Ticks every 2s; the hero
     /// only advances when it's been idle for a few seconds (see rotateIfIdle).
-    private let spotlightTick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    /// `.default`, NOT `.common`: a common-mode timer fires inside the
+    /// run-loop tracking mode that focus/scroll animations run in, waking
+    /// SwiftUI mid-scroll every 2s on the A8 for a check whose real pacing is
+    /// the idle-dwell gate (see the HeroTrailerLayer watchdog note).
+    private let spotlightTick = Timer.publish(every: 2, on: .main, in: .default).autoconnect()
 
     /// False while Home is covered (player fullScreenCover, pushed screen,
     /// other tab). Home stays mounted in those states, so without this gate the
@@ -833,10 +991,13 @@ struct HomeView: View {
         .onAppear { isVisible = true }
         .onDisappear { isVisible = false }
         .onReceive(spotlightTick) { _ in
-            // §55: Reduce Motion disables automatic hero rotation.
-            if isVisible && !perf.reduceMotion {
-                hero.rotateIfIdle()
-            }
+            // §55: Reduce Motion disables automatic hero rotation (both
+            // modes). The pinned hero cycles only while the viewer is resting
+            // ON it — browsing cards drives it by focus instead, and a timer
+            // swapping the highlighted title out from under someone browsing
+            // is a bug, not a feature (see rotateIfIdle's pinnedBillboard).
+            guard isVisible && !perf.reduceMotion, !heroIsPinned else { return }
+            hero.rotateIfIdle()
         }
         .task {
             // Continue Watching rows only persist name/art — this fetches the
@@ -914,7 +1075,11 @@ struct HomeView: View {
         guard let item, hero.item == nil else { return }
         hero.item = item
         hero.setSpotlight(viewModel.spotlightItems(max: 10))
-        guard !didSeedHeroFocus, perf.settings.heroBackdrop else { return }
+        // The PINNED hero has no Play button to land on — it is a display, and
+        // its title is whatever the focused card is. Seeding focus at it would
+        // be a request into a view that isn't in the tree, leaving the page
+        // with nothing focused at all; let the first row take it instead.
+        guard !didSeedHeroFocus, perf.settings.heroBackdrop, !heroIsPinned else { return }
         didSeedHeroFocus = true
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 100_000_000)
@@ -927,34 +1092,80 @@ struct HomeView: View {
     private var fusionModernLayout: some View {
         ZStack {
             ATVBackground()
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: OrivioSpacing.xl) {
-                    if perf.settings.heroBackdrop {
-                        FusionHeroHeader(hero: hero, onPlay: { onSelect($0) }, playFocus: $heroPlayFocused)
-                            // Group the hero as its own focus section so a vertical
-                            // UP from ANY card in the row below reaches it.
-                            .focusSection()
-                    }
-                    // LAZY: with a signed-in account this list is dozens of
-                    // rows; an eager VStack materializes every row body and
-                    // rebuilds ALL of them on any parent re-render (measured
-                    // before at ~40 row bodies per D-pad step vs 1.3 lazy) —
-                    // that's the "super slow signed in" case.
-                    LazyVStack(alignment: .leading, spacing: OrivioSpacing.xl) {
-                        rowsContent
-                    }
-                    // Rows keep a title-safe inset that also clears the
-                    // floating glass rail; the hero (above) does not, so
-                    // its art can bleed to the very edges.
-                    .padding(.leading, 100)
-                    .padding(.trailing, OrivioSpacing.lg)
+            VStack(spacing: 0) {
+                // Pinned: the hero is a fixed header the rows scroll beneath,
+                // and it renders whichever card holds focus. A VStack rather
+                // than an overlay, so the ScrollView is laid out in the space
+                // that's LEFT and its content can't start underneath the
+                // billboard.
+                if heroIsPinned {
+                    // 500, against the scrolling hero's 880: pinned, every
+                    // point the billboard takes is a point the rows never get
+                    // back. `ATVHeroInfoView` bottom-anchors its content inside
+                    // its own box, so a shorter header lifts the whole billboard
+                    // rather than cropping it — and those points go to the row
+                    // below, where they are the difference between a focused
+                    // card's release date being on screen and being cut off by
+                    // the bottom edge.
+                    FusionHeroHeader(hero: hero, onPlay: { heroSelect($0) },
+                                     playFocus: $heroPlayFocused, height: 500,
+                                     artCropBias: 0.75, showsTopBadge: false,
+                                     playsTrailer: true, showsActions: false)
+                        // NO `.focusSection()` here, unlike the scrolling
+                        // banner. A section exists to give the engine a region
+                        // to aim at, and with `showsActions: false` there is
+                        // nothing focusable inside this one — an empty region
+                        // is only something for focus resolution to trip over.
+                        .ignoresSafeArea(edges: [.top, .horizontal])
+                        // ABOVE the rows. `scrollClipDisabled` below lets row
+                        // content draw outside the scroll view's bounds (that's
+                        // what keeps a focused card's lift and shadow from
+                        // being cut off), and a later sibling in a VStack draws
+                        // on top — so without this the rows painted over the
+                        // billboard as they scrolled up under it.
+                        .zIndex(1)
                 }
-                .padding(.bottom, OrivioSpacing.huge)
+
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: OrivioSpacing.xl) {
+                        if perf.settings.heroBackdrop && !heroIsPinned {
+                            FusionHeroHeader(hero: hero, onPlay: { heroSelect($0) }, playFocus: $heroPlayFocused)
+                                // Group the hero as its own focus section so a vertical
+                                // UP from ANY card in the row below reaches it.
+                                .focusSection()
+                        }
+                        // LAZY: with a signed-in account this list is dozens of
+                        // rows; an eager VStack materializes every row body and
+                        // rebuilds ALL of them on any parent re-render (measured
+                        // before at ~40 row bodies per D-pad step vs 1.3 lazy) —
+                        // that's the "super slow signed in" case.
+                        LazyVStack(alignment: .leading, spacing: OrivioSpacing.xl) {
+                            rowsContent
+                        }
+                        // Rows keep a title-safe inset that also clears the
+                        // floating glass rail; the hero (above) does not, so
+                        // its art can bleed to the very edges.
+                        .padding(.leading, 100)
+                        .padding(.trailing, OrivioSpacing.lg)
+                    }
+                    // Under a pinned hero the first row would otherwise sit
+                    // flush against the billboard's bottom edge.
+                    .padding(.top, heroIsPinned ? OrivioSpacing.lg : 0)
+                    // The pinned layout leaves ~520pt of viewport, and a poster
+                    // row plus its caption very nearly fills it. The extra
+                    // run-out gives the scroll somewhere to go, so the last
+                    // row's title and release date can clear the bottom edge
+                    // instead of being scrolled to the very limit and cut.
+                    .padding(.bottom, heroIsPinned ? 160 : OrivioSpacing.huge)
+                }
+                // The whole scroll ignores the safe area so the hero backdrop fills
+                // edge to edge (like the Detail page); rows re-inset themselves above.
+                // NOT at the top when the hero is pinned — there the billboard owns
+                // the top of the screen and the rows must start below it.
+                .ignoresSafeArea(edges: heroIsPinned ? [.horizontal] : [.top, .horizontal])
+                .scrollClipDisabled()
+                .modifier(HeroFadeMask(active: heroIsPinned))
             }
-            // The whole scroll ignores the safe area so the hero backdrop fills
-            // edge to edge (like the Detail page); rows re-inset themselves above.
-            .ignoresSafeArea(edges: [.top, .horizontal])
-            .scrollClipDisabled()
         }
     }
 
@@ -1045,6 +1256,11 @@ struct HomeView: View {
             }
         }
 
+        // Channels pinned from Live TV (hold a channel → Favorite → Add to
+        // Home Page). Below Continue Watching and below the Featured window,
+        // which is where they were asked for.
+        liveChannelsRow
+
         // Collections render by viewMode:
         // • ROWS      → each collection is its OWN row of folder buttons; a
         //               folder button opens that folder's discover page.
@@ -1066,6 +1282,12 @@ struct HomeView: View {
                         title: homeCatalogSettings.customTitle(for: key) ?? collection.title,
                         onOpenFolder: { openFolder($0, in: collection) },
                         onOpenCollection: { onOpenCollection(collection) },
+                        // The pinned hero follows categories too: the folder's
+                        // backdrop (or the collection's) with its brand logo
+                        // rendered whole — see `heroItem(for:in:)`. A folder
+                        // with no art of its own still shows its name on the
+                        // stage, which beats the billboard silently holding a
+                        // title from three rows up.
                         onFolderFocus: { folder in
                             if heroFollowsFocus { hero.focus(heroItem(for: folder, in: collection)) }
                         },
@@ -1079,6 +1301,38 @@ struct HomeView: View {
                         onBackAtStart: onHomeBack
                     )
                 }
+            }
+        }
+    }
+
+    /// Live TV channels the viewer pinned to Home. Drawn from the stored
+    /// favourites, so this needs neither the Live TV tab to have been visited
+    /// nor the IPTV playlist to be loaded.
+    @ViewBuilder
+    private var liveChannelsRow: some View {
+        let pinned = liveFavorites.homeChannels
+        if !pinned.isEmpty {
+            VStack(alignment: .leading, spacing: OrivioSpacing.md) {
+                RowHeader(title: "Live Channels")
+                    .padding(.leading, OrivioSpacing.sm)
+                ScrollView(.horizontal) {
+                    LazyHStack(alignment: .top, spacing: OrivioSpacing.lg) {
+                        ForEach(pinned) { favorite in
+                            Button { onPlayChannel(LiveChannel(favorite)) } label: {
+                                HomeLiveChannelCard(favorite: favorite)
+                                    // No hand-off handler — the note keeps the
+                                    // router honest so leaving the rail from
+                                    // here falls back to the engine instead of
+                                    // teleporting to the last ROUTED row.
+                                    .onFocusChange { if $0 { ContentFocusRouter.shared.noteFocused(row: "live") } }
+                            }
+                            .buttonStyle(PlainCardButtonStyle())
+                            .channelHoldMenu(favorite)
+                        }
+                    }
+                    .padding(.vertical, OrivioSpacing.lg)
+                }
+                .scrollClipDisabled()
             }
         }
     }
@@ -1130,6 +1384,30 @@ struct HomeView: View {
         )
     }
 
+    /// Select on the hero. A real title opens its detail page; a collection
+    /// stand-in (the pinned hero following a category) opens that collection
+    /// or folder instead — its synthetic `collection:` id names nothing any
+    /// meta add-on could serve, so routing it to the detail page would land on
+    /// an empty screen.
+    private func heroSelect(_ item: MetaItem) {
+        guard item.type == "collection", item.id.hasPrefix("collection:") else {
+            onSelect(item)
+            return
+        }
+        let parts = item.id.split(separator: ":", maxSplits: 2).map(String.init)
+        guard parts.count >= 2 else { return }
+        let all = viewModel.entries.compactMap { entry -> OrivioCollection? in
+            if case .collection(let c) = entry { return c }
+            return nil
+        } + viewModel.sharedCollections
+        guard let collection = all.first(where: { $0.id == parts[1] }) else { return }
+        if parts.count == 3, let folder = collection.folders.first(where: { $0.id == parts[2] }) {
+            openFolder(folder, in: collection)
+        } else {
+            onOpenCollection(collection)
+        }
+    }
+
     /// Only catalog rows go through here; collection rows are handled directly
     /// in `rowsList` (they render by viewMode).
     @ViewBuilder
@@ -1156,20 +1434,25 @@ struct HomeView: View {
             heroItemFor: heroItem(from:),
             onResume: onResume,
             onDetails: { onSelect(heroItem(from: $0)) },
-            onPlayManuallyMenu: { onPlayManually(heroItem(from: $0), metaVideo(from: $0)) },
+            onPlayManuallyMenu: { onPlayManuallyProgress($0) },
             onResumeFromStartMenu: { onResumeFromStart($0) },
             onBackAtStart: onHomeBack
         )
     }
 
     private var nextUpRefreshKey: String {
-        let watchedKey = watched.items.keys.sorted().joined(separator: "|")
-        let progressKey = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
-            .map(\.id)
-            .sorted()
-            .joined(separator: "|")
-        let dismissedKey = progressStore.dismissedNextUpShows.sorted().joined(separator: "|")
-        return "\(watchedKey)#\(progressKey)#\(homeCatalogSettings.showUnairedNextUp)#\(dismissedKey)"
+        // CHEAP. This is a `.task(id:)` key recomputed on every Home body
+        // pass; it used to sort-and-join the full watch history (a ~100KB
+        // string after a Trakt import) plus a full Continue Watching sort,
+        // twice over per invalidation. An order-insensitive hash of the same
+        // inputs changes exactly when they do, for a few microseconds.
+        var watchedHash = 0, progressHash = 0, dismissedHash = 0
+        for key in watched.items.keys { watchedHash ^= key.hashValue }
+        for item in progressStore.continueWatching(sortMode: .recentlyWatched) {
+            progressHash ^= item.id.hashValue &+ Int(item.positionSeconds)
+        }
+        for show in progressStore.dismissedNextUpShows { dismissedHash ^= show.hashValue }
+        return "\(watchedHash)#\(progressHash)#\(homeCatalogSettings.showUnairedNextUp)#\(dismissedHash)"
     }
 
     private func mergedContinueItems() -> [WatchProgress] {
@@ -1183,11 +1466,44 @@ struct HomeView: View {
             !activeMetaIDs.contains($0.metaID)
                 && !progressStore.dismissedNextUpShows.contains($0.metaID)
         }
-        return active + additions
+        // Synthesised Next Up rows already carry their count; stamp the ones
+        // with a real progress row here. Doing it on the row (rather than
+        // passing the map down) keeps `ContinueWatchingCell`'s Equatable
+        // comparison honest — the card re-renders when the number changes.
+        let stamped = active.map { row -> WatchProgress in
+            guard let count = newEpisodeCounts[row.metaID] else { return row }
+            var copy = row
+            copy.newEpisodeCount = count
+            return copy
+        }
+        return stamped + additions
+    }
+
+    /// One show this pass needs metadata for.
+    ///
+    /// Two kinds, fetched together in a single bounded pass: shows that are
+    /// ALREADY in Continue Watching (metadata is needed only to count their
+    /// new episodes) and shows the viewer has watched but has no progress row
+    /// for (which additionally get a synthesised Next Up card).
+    private struct NextUpTarget {
+        let contentID: String
+        let contentType: String
+        let lastWatchedAt: Date
+        let wantsCard: Bool
     }
 
     private func refreshNextUpContinueItems() async {
-        let activeMetaIDs = Set(progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode).map(\.metaID))
+        let activeRows = progressStore.continueWatching(sortMode: homeCatalogSettings.continueWatchingSortMode)
+        let activeMetaIDs = Set(activeRows.map(\.metaID))
+        // Series already on the row. No card is synthesised for these — they
+        // have a real progress row — but they still need their episode list so
+        // the "+N new episodes" badge can be computed for them.
+        let activeSeries = activeRows
+            .filter { $0.season != nil && ($0.type == "series" || $0.type == "tv") }
+            .prefix(20)
+            .map { NextUpTarget(contentID: $0.metaID, contentType: $0.type,
+                                lastWatchedAt: $0.updatedAt, wantsCard: false) }
+
         let watchedSeries = watched.items.values
             .filter { ($0.contentType == "series" || $0.contentType == "tv") && $0.season != nil && $0.episode != nil }
             .sorted { $0.watchedAt > $1.watchedAt }
@@ -1197,6 +1513,15 @@ struct HomeView: View {
             // synthesised suggestion that would otherwise replace the card.
             .filter { !progressStore.dismissedNextUpShows.contains($0.contentID) }
             .prefix(20)
+            .map { NextUpTarget(contentID: $0.contentID, contentType: $0.contentType,
+                                lastWatchedAt: $0.watchedAt, wantsCard: true) }
+
+        let targets = activeSeries + watchedSeries
+        // When the viewer first STARTED each show, and how far they have got.
+        // Built once, off the per-show loop, from data that already syncs
+        // everywhere (see `startedWatchingByShow`).
+        let startedAt = startedWatchingByShow()
+        let reached = reachedEpisodesByShow()
 
         // Bounded-concurrent, not serial. These are full-series metadata
         // responses — among the largest payloads in the app — and fetching up to
@@ -1204,42 +1529,168 @@ struct HomeView: View {
         // cache before a single Next Up card appeared. `boundedConcurrentMap`
         // preserves order, and the result is re-sorted below anyway.
         let fetched = await boundedConcurrentMap(
-            Array(watchedSeries), limit: AddonSweepLimits.catalogs
-        ) { item -> (meta: MetaItem, watchedAt: Date)? in
-            guard let addon = addonManager.metaAddon(for: item.contentType, id: item.contentID),
+            targets, limit: AddonSweepLimits.catalogs
+        ) { target -> (meta: MetaItem, target: NextUpTarget)? in
+            guard let addon = addonManager.metaAddon(for: target.contentType, id: target.contentID),
                   let meta = try? await StremioAPI.meta(
-                      addon: addon, type: item.contentType, id: item.contentID
+                      addon: addon, type: target.contentType, id: target.contentID
                   )
             else { return nil }
-            return (meta, item.watchedAt)
+            return (meta, target)
         }
-        // `nextUpEpisode` reads the watched store, so it stays on the main actor.
-        var rows: [WatchProgress] = []
-        for case let entry? in fetched {
-            guard let next = nextUpEpisode(in: entry.meta) else { continue }
-            rows.append(nextUpProgress(meta: entry.meta, episode: next, lastWatchedAt: entry.watchedAt))
-        }
+        // The episode walking below is pure computation over the fetched
+        // metas — up to 40 FULL series' episode lists, each walked several
+        // times with per-episode date parses. Snapshot what it needs from the
+        // main-actor stores (cheap: a key set and two bools), then run it
+        // detached; only the publish hops back. On an A8 this loop used to be
+        // hundreds of milliseconds ON the main actor at every launch and
+        // after every watched/progress mutation.
+        let watchedKeys = Set(watched.items.keys)
+        let showUnaired = homeCatalogSettings.showUnairedNextUp
+        let fromFurthest = homeCatalogSettings.nextUpFromFurthestEpisode
+        let entries = fetched.compactMap { $0 }
+        let (rows, counts) = await Task.detached(priority: .userInitiated) {
+            var rows: [WatchProgress] = []
+            var counts: [String: Int] = [:]
+            for entry in entries {
+                // Keyed by the CANONICAL id the watch/progress stores use, not
+                // the id the meta addon echoed back — a fallback meta addon can
+                // answer with its own scheme (tvdb:, anidb:…), and rows/badges
+                // keyed by that never matched the stores (badge missing) and
+                // resumed into a sources page no stream addon claims.
+                let contentID = entry.target.contentID
+                let count = Self.newEpisodeCount(in: entry.meta,
+                                                 startedAt: startedAt[contentID],
+                                                 reached: reached[contentID] ?? [])
+                if count > 0 { counts[contentID] = count }
+                guard entry.target.wantsCard,
+                      let next = Self.nextUpEpisode(in: entry.meta, contentID: contentID,
+                                                    watchedKeys: watchedKeys,
+                                                    showUnaired: showUnaired,
+                                                    fromFurthest: fromFurthest) else { continue }
+                rows.append(Self.nextUpProgress(meta: entry.meta, contentID: contentID, episode: next,
+                                                lastWatchedAt: entry.target.lastWatchedAt,
+                                                newEpisodeCount: count))
+            }
+            return (rows, counts)
+        }.value
         if !Task.isCancelled {
             nextUpContinueItems = rows
+            newEpisodeCounts = counts
         }
     }
 
-    private func nextUpEpisode(in meta: MetaItem) -> MetaVideo? {
+    /// metaID → when this viewer first watched anything of that title.
+    ///
+    /// Derived rather than stored, from the two things that already sync
+    /// everywhere: watch history (account, Trakt, SIMKL, Stremio) and stored
+    /// playback positions. That is what makes the badge agree across devices
+    /// without a new synced field — and it means an imported Trakt history,
+    /// which carries each episode's ORIGINAL watch time, gives the true start
+    /// date rather than the import date.
+    private func startedWatchingByShow() -> [String: Date] {
+        var out: [String: Date] = [:]
+        for item in watched.items.values {
+            if let existing = out[item.contentID], existing <= item.watchedAt { continue }
+            out[item.contentID] = item.watchedAt
+        }
+        for row in progressStore.items.values {
+            if let existing = out[row.metaID], existing <= row.updatedAt { continue }
+            out[row.metaID] = row.updatedAt
+        }
+        return out
+    }
+
+    /// metaID → every episode the viewer has reached, watched or merely
+    /// started. "Reached" deliberately includes a part-watched episode: the
+    /// one you are in the middle of is not something you are behind on.
+    ///
+    /// A SET rather than a single furthest point, because the furthest point
+    /// has to be resolved against AIR DATES, which only the metadata knows —
+    /// see `newEpisodeCount`.
+    private func reachedEpisodesByShow() -> [String: Set<SeasonEpisode>] {
+        var out: [String: Set<SeasonEpisode>] = [:]
+        func offer(_ id: String, _ season: Int?, _ episode: Int?) {
+            guard let season, let episode else { return }
+            out[id, default: []].insert(SeasonEpisode(season: season, episode: episode))
+        }
+        for item in watched.items.values { offer(item.contentID, item.season, item.episode) }
+        for row in progressStore.items.values { offer(row.metaID, row.season, row.episode) }
+        return out
+    }
+
+    /// How many episodes are waiting AHEAD of the viewer that aired after they
+    /// started the show.
+    ///
+    /// Two conditions, and both are load-bearing:
+    ///
+    /// * **After the furthest episode they have reached.** Counting every
+    ///   unwatched episode would include the one they are 60% of the way
+    ///   through, so a show you are actively keeping up with would claim you
+    ///   were behind on it.
+    /// * **Aired after they started the show.** Working through a back
+    ///   catalogue is not being behind, and without this a series that
+    ///   finished years ago would sit at a permanent "+49" from the moment
+    ///   someone started episode one.
+    ///
+    /// An episode with no known air date is skipped rather than assumed new.
+    private nonisolated static func newEpisodeCount(in meta: MetaItem, startedAt: Date?,
+                                                    reached: Set<SeasonEpisode>) -> Int {
+        guard let startedAt, !reached.isEmpty else { return 0 }
+        let all = meta.playbackSeasons.flatMap { meta.episodesIncludingLinkedSpecials(season: $0) }
+        guard !all.isEmpty else { return 0 }
+        let now = Date()
+
+        // The furthest episode reached that has ACTUALLY AIRED. Unaired
+        // episodes are excluded from this even when they carry a watched row:
+        // an episode that has not been broadcast cannot have been watched, and
+        // "Mark Season Watched" used to stamp every episode a season lists,
+        // including next month's finale. Taking those at face value pinned the
+        // furthest point at the end of the season, so the show could never
+        // report a new episode again.
+        var furthest: SeasonEpisode?
+        for episode in all {
+            guard let season = episode.season, let number = episode.episode else { continue }
+            guard let aired = episode.airedDate, aired <= now else { continue }
+            let point = SeasonEpisode(season: season, episode: number)
+            guard reached.contains(point) else { continue }
+            if furthest == nil || point > furthest! { furthest = point }
+        }
+        guard let furthest else { return 0 }
+
+        return all.reduce(into: 0) { total, episode in
+            guard let season = episode.season, let number = episode.episode else { return }
+            guard SeasonEpisode(season: season, episode: number) > furthest else { return }
+            guard let aired = episode.airedDate, aired > startedAt, aired <= now else { return }
+            total += 1
+        }
+    }
+
+    private nonisolated static func nextUpEpisode(in meta: MetaItem, contentID: String,
+                                                  watchedKeys: Set<String>,
+                                                  showUnaired: Bool,
+                                                  fromFurthest: Bool) -> MetaVideo? {
         let all = meta.playbackSeasons.flatMap { meta.episodesIncludingLinkedSpecials(season: $0) }
         guard !all.isEmpty else { return nil }
 
         func isWatched(_ episode: MetaVideo) -> Bool {
-            watched.isWatched(contentID: meta.id, season: episode.season ?? 0, episode: episode.episode)
+            // The canonical store id, not `meta.id` — a fallback meta addon
+            // can echo its own id scheme, and history is not keyed by that.
+            // (`watchedKeys` is a snapshot of the watched store's keys, taken
+            // on the main actor by the caller.)
+            watchedKeys.contains(WatchedItem.key(contentID: contentID,
+                                                 season: episode.season ?? 0,
+                                                 episode: episode.episode))
         }
         // "Show unaired Next Up" was in this row's refresh key but never in the
         // selection, so Home offered an episode airing next week — with no
         // streams behind it — while Detail's Play button, which does honour the
         // setting, offered something watchable for the very same show.
         func isEligible(_ episode: MetaVideo) -> Bool {
-            homeCatalogSettings.showUnairedNextUp || episode.hasAired
+            showUnaired || episode.hasAired
         }
 
-        if homeCatalogSettings.nextUpFromFurthestEpisode,
+        if fromFurthest,
            let furthestIndex = all.lastIndex(where: isWatched),
            furthestIndex + 1 < all.endIndex {
             return all[(furthestIndex + 1)...].first(where: isEligible)
@@ -1248,11 +1699,21 @@ struct HomeView: View {
         return all.first { !isWatched($0) && isEligible($0) }
     }
 
-    private func nextUpProgress(meta: MetaItem, episode: MetaVideo, lastWatchedAt: Date) -> WatchProgress {
-        WatchProgress(
-            id: episode.id,
-            metaID: meta.id,
-            type: meta.type,
+    private nonisolated static func nextUpProgress(meta: MetaItem, contentID: String, episode: MetaVideo,
+                                                   lastWatchedAt: Date, newEpisodeCount: Int) -> WatchProgress {
+        // The canonical show id + a canonical episode key under it. Using the
+        // addon-echoed `meta.id`/`episode.id` made the synthesised row an
+        // identity no other store row (or stream addon) matched. Only tt ids
+        // take the `show:season:episode` form — exotic schemes (kitsu: …)
+        // shape their episode ids differently, so keep theirs.
+        var episodeID = episode.id
+        if contentID.hasPrefix("tt"), let s = episode.season, let e = episode.episode {
+            episodeID = "\(contentID):\(s):\(e)"
+        }
+        return WatchProgress(
+            id: episodeID,
+            metaID: contentID,
+            type: "series",
             name: meta.name,
             poster: meta.poster,
             background: meta.background,
@@ -1265,7 +1726,7 @@ struct HomeView: View {
             durationSeconds: 1,
             streamURL: nil,
             updatedAt: lastWatchedAt,
-            hasNewEpisode: episode.hasAired
+            newEpisodeCount: newEpisodeCount
         )
     }
 
@@ -1341,20 +1802,6 @@ struct HomeView: View {
             // vertical moves, and the section wrapper made cross-grid moves
             // re-home to a center poster ("focus goes to the middle").
         }
-    }
-
-    /// Rebuilds the episode identity from a progress entry (same shape the
-    /// root's resume() builds) so manual playback keeps saving under the
-    /// episode key instead of forking a new entry under the show.
-    private func metaVideo(from progress: WatchProgress) -> MetaVideo? {
-        guard progress.season != nil || progress.episode != nil else { return nil }
-        return MetaVideo(
-            id: progress.id,
-            title: progress.episodeTitle,
-            season: progress.season,
-            episode: progress.episode,
-            thumbnail: progress.episodeThumbnail
-        )
     }
 
     private func continueSubtitle(_ progress: WatchProgress) -> String? {
@@ -1464,7 +1911,36 @@ private struct HomePosterRow: View {
                 // Back: jump to the first card if scrolled in; on the first
                 // card, bubble up (sidebar / tab bar).
                 .onExitCommand { backToStart(proxy) }
+                // Coming back out of the rail lands on THIS row's first card
+                // when this was the row the viewer left (ContentFocusRouter).
+                // Re-registered whenever the first card CHANGES, not just on
+                // appear: the handler captures the id, and Home rows are
+                // replaced in place by refreshes and sync pulls — a stale
+                // handler scrolled to a card that no longer exists and its
+                // focus write was silently dropped.
+                .onAppear { registerRowHandler(proxy) }
+                .onChange(of: row.items.first?.id) { _, _ in registerRowHandler(proxy) }
+                .onDisappear { ContentFocusRouter.shared.unregister(row.id) }
+                .onChange(of: focusedID) { _, new in
+                    if new != nil { ContentFocusRouter.shared.noteFocused(row: row.id) }
+                }
             }
+        }
+    }
+
+    private func registerRowHandler(_ proxy: ScrollViewProxy) {
+        let firstID = row.items.first?.id
+        ContentFocusRouter.shared.register(row.id) {
+            guard let first = firstID else { return false }
+            // Retry until the card actually holds focus: deep in the row the
+            // first card is unloaded, and it takes the scroll a few ticks to
+            // materialize it on the slower boxes.
+            ContentFocusRouter.land(assign: {
+                proxy.scrollTo(first, anchor: .leading)
+                focusedID = first
+            }, landed: { focusedID == first },
+               focusToken: { focusedID })
+            return true
         }
     }
 
@@ -1593,6 +2069,20 @@ private struct ContinueWatchingRow: View {
     // the hold-menu long-press on Modern. Entry into the row is handled by the
     // .focusSection() below, exactly like the poster rows.
     @FocusState private var focusedCWCard: String?
+    private static let routerID = "row.continueWatching"
+
+    private func registerRowHandler(_ proxy: ScrollViewProxy) {
+        let firstID = items.first?.id
+        ContentFocusRouter.shared.register(Self.routerID) {
+            guard let first = firstID else { return false }
+            ContentFocusRouter.land(assign: {
+                proxy.scrollTo(first, anchor: .leading)
+                focusedCWCard = first
+            }, landed: { focusedCWCard == first },
+               focusToken: { focusedCWCard })
+            return true
+        }
+    }
 
     var body: some View {
         // Focus model mirrors HomePosterRow (plain @FocusState, no .focusScope /
@@ -1656,6 +2146,17 @@ private struct ContinueWatchingRow: View {
                 let oldIndex = oldIDs.firstIndex(of: focused) ?? 0
                 focusedCWCard = newIDs[min(oldIndex, newIDs.count - 1)]
             }
+            // Coming back out of the rail lands on the first card when this
+            // was the row the viewer left (ContentFocusRouter). Re-registered
+            // when the first card changes — Continue Watching reorders on
+            // every sync pull, and a handler holding the old first id dropped
+            // its focus write on the floor.
+            .onAppear { registerRowHandler(proxy) }
+            .onChange(of: items.first?.id) { _, _ in registerRowHandler(proxy) }
+            .onDisappear { ContentFocusRouter.shared.unregister(Self.routerID) }
+            .onChange(of: focusedCWCard) { _, new in
+                if new != nil { ContentFocusRouter.shared.noteFocused(row: Self.routerID) }
+            }
             }   // ScrollViewReader
         }
         // No .focusSection() — matches HomePosterRow. The focus section governs
@@ -1706,7 +2207,7 @@ private struct ContinueWatchingCell: View, Equatable {
                     subtitle: subtitle,
                     progress: progress.fraction,
                     remainingText: progress.remainingTimeText,
-                    hasNewEpisode: progress.hasNewEpisode == true,
+                    newEpisodeCount: progress.newEpisodeCount ?? 0,
                     blurImage: blur,
                     // Caption goes BELOW the platter (see below) so it isn't
                     // bridged to the still by the slab.
@@ -1887,6 +2388,15 @@ private struct FocusChangeModifier: ViewModifier {
             .onAppear {
                 if isFocused { action(true) }
             }
+            // …and the mirror: a cell that leaves the tree (a lazy row
+            // unloading it, a reload remounting the row) never gets the
+            // false, so its caption stayed "lowered" — a card that read as
+            // focused while the card actually under focus only moved its
+            // name and date. Reset on the way out; `onAppear` re-seeds a
+            // card that comes back already focused.
+            .onDisappear {
+                action(false)
+            }
     }
 }
 
@@ -1896,6 +2406,203 @@ private struct FocusChangeModifier: ViewModifier {
 /// artwork confined to the upper-right of a 300pt band, faded hard into the
 /// background, with only a compact title label (no synopsis, no buttons).
 /// Classic is meant to feel lighter/faster than Modern's full spotlight.
+/// Netflix-style billboard preview: once the hero has RESTED on one title for
+/// a few seconds, its trailer fades in behind the info block — muted, looping,
+/// and strictly decorative — and the still art returns the moment the hero
+/// moves on.
+///
+/// Reuses the Detail page's whole trailer stack (TMDB key lookup, YouTubeKit
+/// extraction, `BackdropVideoView`) and its switches: the Detail page's
+/// auto-play delay doubles as the rest time here (0 = off), the TMDB
+/// "trailers" enrichment switch is where the keys come from, and Reduce
+/// Motion keeps the still art. The player layer is decoration — no hit
+/// testing, no user interaction — per the hard-won focus rule (a focusable
+/// or hit-testable layer inserted mid-browse makes the engine re-resolve
+/// and throws the highlight).
+private struct HeroTrailerLayer: View {
+    @ObservedObject var hero: HeroFocus
+    @ObservedObject private var perf = PerformanceSettingsStore.shared
+    @EnvironmentObject private var tmdbSettings: TMDBSettingsStore
+    @EnvironmentObject private var homeCatalogSettings: HomeCatalogSettingsStore
+
+    @State private var player: AVPlayer?
+    @State private var visible = false
+    @State private var loopToken: NSObjectProtocol?
+    /// Fires when the player actually starts rendering — see `run()`.
+    @State private var statusObserver: NSKeyValueObservation?
+    /// Whether THIS layer activated the audio session (sound on) — teardown
+    /// only deactivates what it activated, and never out from under the real
+    /// player or a Picture in Picture session.
+    @State private var activatedAudio = false
+
+    var body: some View {
+        // MOUNTED ALWAYS, revealed by opacity. `if visible { ... }` inserted
+        // and removed a UIViewRepresentable in the middle of a browse, and the
+        // focus engine re-resolves on a view-tree change like that: the lift
+        // could be left stranded on the card the viewer had already stepped
+        // off, while the caption (plain @State) tracked the new one. Opacity
+        // is a pure render change and touches neither the tree nor focus.
+        ZStack {
+            BackdropVideoView(player: player)
+                .allowsHitTesting(false)
+                .opacity(visible ? 1 : 0)
+        }
+        .task(id: hero.item?.id) { await run() }
+        .onDisappear { teardown() }
+        // Layout toggles apply to a preview already on screen too, not just
+        // the next one.
+        .onChange(of: homeCatalogSettings.heroTrailersEnabled) { _, enabled in
+            if !enabled { teardown() }
+        }
+        .onChange(of: homeCatalogSettings.heroTrailerSound) { _, sound in
+            guard let player else { return }
+            setSound(sound, on: player)
+        }
+        // Backgrounding pauses the muted player for good; resume on return.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification)) { _ in player?.play() }
+        // A pinned Live TV channel starts the real player straight FROM Home,
+        // with no push to fire `onDisappear` — don't keep a second decoder
+        // looping behind the movie.
+        // A `.task` gated on `player`, not a timer publisher: the old
+        // `.onReceive(Timer.publish…)` built a fresh publisher on every body
+        // evaluation (this layer re-renders on every settled hero change), so
+        // the watchdog ticked for the life of Home even with no trailer
+        // playing — and each rebuild could reset its 3s deadline. This one
+        // exists only while a trailer player does.
+        .task(id: player != nil) {
+            guard player != nil else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if OrivioSyncManager.playbackActive { teardown(); break }
+            }
+        }
+    }
+
+    /// How long the hero has to hold one title before the trailer pipeline
+    /// commits. A DEBOUNCE, not a Netflix-style idle wait: the resolve runs
+    /// ALONGSIDE it, so time-to-motion is `max(debounce, resolve)` and every
+    /// tenth of a second here is a tenth added to a preview that already
+    /// waits on the network. Kept only long enough that stepping across a row
+    /// doesn't fire a TMDB lookup and a YouTube extraction per card.
+    private static let restDebounce: TimeInterval = 0.5
+
+    /// Give up on a resolve that has taken this long. Past it the viewer has
+    /// been looking at a still for so long that a preview snapping in reads
+    /// as a glitch rather than a flourish — and the extraction is very likely
+    /// wedged behind a slow remote fallback.
+    private static let resolveTimeout: TimeInterval = 12
+
+    private func run() async {
+        teardown()
+        guard let item = hero.item, item.type != "collection" else { return }
+        guard homeCatalogSettings.heroTrailersEnabled else { return }
+        guard !perf.reduceMotion,
+              tmdbSettings.settings.isUsable, tmdbSettings.settings.useTrailers else { return }
+        // The WHOLE pipeline — TMDB key lookup AND the YouTube extraction —
+        // overlaps the rest delay. It was only the key lookup at first, with
+        // extraction serialized after the sleep, and extraction is the slow
+        // half: the preview routinely started seconds after the delay ended,
+        // which reads as "the trailer takes too long". Now the wait is
+        // max(delay, resolve) instead of delay + resolve, and a repeat visit
+        // (TrailerResolver's URL cache) resolves in milliseconds.
+        let t0 = Date()
+        async let prepared: AVPlayerItem? = {
+            guard let key = await TMDBService.firstTrailerKey(id: item.id, type: item.type)
+            else { return nil }
+            NSLog("[OrivioHeroTrailer] key %@ resolved in %.2fs", key, Date().timeIntervalSince(t0))
+            let r = await TrailerResolver.backdropItem(youtubeKey: key)
+            NSLog("[OrivioHeroTrailer] item ready in %.2fs (nil=%@)", Date().timeIntervalSince(t0), r == nil ? "y" : "n")
+            return r
+        }()
+        try? await Task.sleep(for: .seconds(Self.restDebounce))
+        guard !Task.isCancelled, !PiPHandoff.shared.isActive,
+              !OrivioSyncManager.playbackActive else { return }
+        guard let avItem = await prepared, !Task.isCancelled else { return }
+        guard Date().timeIntervalSince(t0) < Self.resolveTimeout else {
+            NSLog("[OrivioHeroTrailer] gave up after %.2fs", Date().timeIntervalSince(t0))
+            return
+        }
+        // Small buffer target + play-when-ready: first frames on screen as
+        // soon as the stream can sustain them, rather than after AVPlayer's
+        // default (much larger) buffer fills.
+        avItem.preferredForwardBufferDuration = 2
+        let p = AVPlayer(playerItem: avItem)
+        // Muted by default: no audio session is needed then — activating one
+        // would duck whatever music another app is playing, for a silent
+        // preview. Layout → "Hero trailer sound" opts into the session.
+        setSound(homeCatalogSettings.heroTrailerSound, on: p)
+        p.actionAtItemEnd = .none
+        loopToken = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: avItem, queue: .main
+        ) { [weak p] _ in
+            p?.seek(to: .zero)
+            p?.playImmediately(atRate: 1)
+        }
+        player = p
+        // Reveal on the FIRST FRAME, not on the call to play(). Fading the
+        // layer in at `play()` put an empty (black) video layer over the
+        // artwork for however long the stream took to buffer — a black hole
+        // where the backdrop had been, which is a good part of what "takes
+        // too long to start" looked like. `.playing` is AVPlayer saying
+        // frames are actually flowing.
+        statusObserver = p.observe(\.timeControlStatus, options: [.initial, .new]) { observed, _ in
+            guard observed.timeControlStatus == .playing else { return }
+            Task { @MainActor in
+                guard player === observed else { return }   // a later title won the layer
+                hero.trailerPlaying = true
+                NSLog("[OrivioHeroTrailer] first frame at %.2fs", Date().timeIntervalSince(t0))
+                withAnimation(.easeInOut(duration: 0.45)) { visible = true }
+            }
+        }
+        p.playImmediately(atRate: 1)
+    }
+
+    /// Un-muting needs an ACTIVE audio session or a raw AVPlayer on tvOS can
+    /// stall outright; muting hands the session back (so another app's music
+    /// resumes) — but never touches a session the real player or a Picture in
+    /// Picture window owns.
+    private func setSound(_ sound: Bool, on player: AVPlayer) {
+        if sound {
+            if !PiPHandoff.shared.isActive, !OrivioSyncManager.playbackActive {
+                try? AVAudioSession.sharedInstance().setActive(true)
+                activatedAudio = true
+            }
+            player.isMuted = false
+        } else {
+            player.isMuted = true
+            releaseAudioIfHeld()
+        }
+    }
+
+    private func releaseAudioIfHeld() {
+        guard activatedAudio else { return }
+        activatedAudio = false
+        // Never while real playback owns the session — deactivating it there
+        // stops the movie's (or PiP window's) audio dead.
+        guard !PiPHandoff.shared.isActive, !OrivioSyncManager.playbackActive else { return }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    private func teardown() {
+        hero.trailerPlaying = false
+        visible = false
+        statusObserver?.invalidate()
+        statusObserver = nil
+        player?.pause()
+        // Clear the item, not just pause — a paused muted player otherwise
+        // stays the system "Now Playing" target and the transport overlay
+        // pops up over Home on a Play/Pause press (same as the Detail page).
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        releaseAudioIfHeld()
+        if let loopToken {
+            NotificationCenter.default.removeObserver(loopToken)
+            self.loopToken = nil
+        }
+    }
+}
+
 private struct FusionHeroHeader: View {
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject var hero: HeroFocus
@@ -1904,6 +2611,30 @@ private struct FusionHeroHeader: View {
     /// Tall like the Detail page's backdrop — the art dominates the first
     /// screen, with the first content row peeking at the very bottom.
     var height: CGFloat = 880
+    /// Where the visible slice of the backdrop sits. 0 = the middle of the
+    /// image (what a plain aspect-fill gives you); 1 = its very top.
+    ///
+    /// Only matters when the band is SHORT. A 16:9 backdrop in a 1920x880
+    /// header shows 81% of the image and a centre crop is fine, but the same
+    /// art in the pinned hero's 1920x500 band shows 46% — a horizontal slice
+    /// through the middle of the frame, which on a standing figure is a torso
+    /// with the head cut off. Biasing the slice upward gets the composed part
+    /// of the shot back without shrinking the art (nothing can show MORE of a
+    /// 16:9 image across a 3.84:1 window while still filling the width).
+    var artCropBias: CGFloat = 0
+    /// The "TOP 10" eyebrow belongs to the rotating spotlight. The pinned hero
+    /// shows whatever is highlighted — often not a top-ten title at all — so it
+    /// passes false.
+    var showsTopBadge = true
+    /// Only the PINNED hero plays a billboard trailer. The default rotating
+    /// banner stays still art — a preview restarting on every 9s rotation would
+    /// never get going, and the viewer never asked the banner to move.
+    var playsTrailer = false
+    /// The Play button and the spotlight dots. The pinned hero has neither: it
+    /// mirrors the card the viewer is already sitting on, so a "Go to Movie"
+    /// button is a second way to open the thing under their thumb, and the
+    /// dots count a rotation the viewer is not driving.
+    var showsActions = true
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -1913,15 +2644,52 @@ private struct FusionHeroHeader: View {
             // ATVBackground stage shows through — an opaque blend color can
             // never match the stage's bloom and always left a seam line.
             GeometryReader { geo in
-                if let art = hero.item?.background ?? hero.item?.poster {
-                    // Decorative — see the FusionHeroBar note. A full-bleed
-                    // RemoteImage overflows the frame it is clipped to and stays
-                    // hit-testable, which swallows a neighbouring card's
-                    // context-menu hit test.
-                    RemoteImage(url: art, maxPixels: PerformanceProfile.backdropPixelCap)
-                        .allowsHitTesting(false)
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .clipped()
+                // The subtree KEEPS ITS SHAPE whether or not the committed
+                // item has art. `if let art { …everything… }` used to wrap the
+                // trailer layer too, so committing an art-less item (a
+                // collection-folder hero stand-in) tore the BackdropVideoView
+                // representable out of the tree and re-inserted it on the
+                // next commit — a UIKit focus re-resolve landing 60–220ms
+                // after a focus move, mid-raise: the stranded-platter bug
+                // HeroTrailerLayer's own MOUNTED-ALWAYS note describes. Only
+                // the plain RemoteImage is conditional now.
+                let art = hero.item?.background ?? hero.item?.poster
+                // Two frames, not an offset. `RemoteImage` fills the frame
+                // it is GIVEN, so the only way to move the crop is to fill
+                // a taller frame (which recentres the slice further down the
+                // image) and then take the TOP of that. Offsetting the
+                // finished view instead would drag its clip rect along with
+                // it and just leave a gap.
+                //
+                // The taller frame's extra height is twice the shift, and
+                // the shift is measured against how far a 16:9 source
+                // actually overflows this band — so `artCropBias` reads as
+                // a true fraction of the distance from centre to top, and at
+                // 1.0 it can never exceed the image (H + 2s ≤ the rendered
+                // height for any bias ≤ 1).
+                let overflow = max(0, (geo.size.width * 9 / 16 - geo.size.height) / 2)
+                let shift = artCropBias * overflow
+                ZStack {
+                    if let art {
+                        // Decorative — see the FusionHeroBar note. A full-bleed
+                        // RemoteImage overflows the frame it is clipped to and
+                        // stays hit-testable, which swallows a neighbouring
+                        // card's context-menu hit test.
+                        RemoteImage(url: art, maxPixels: PerformanceProfile.backdropPixelCap)
+                            .allowsHitTesting(false)
+                            .frame(width: geo.size.width, height: geo.size.height + shift * 2)
+                            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+                            .clipped()
+                    }
+                    // The billboard trailer draws OVER the still art and
+                    // UNDER the wash/mask, so it inherits exactly the
+                    // treatment the art has and the info block stays
+                    // readable on top of it.
+                    if playsTrailer {
+                        HeroTrailerLayer(hero: hero)
+                            .frame(width: geo.size.width, height: geo.size.height)
+                    }
+                }
                         // Left readability wash rides INSIDE the mask so it
                         // fades away with the art instead of tinting the stage.
                         .overlay(
@@ -1946,18 +2714,18 @@ private struct FusionHeroHeader: View {
                                 startPoint: .top, endPoint: .bottom
                             )
                         )
-                }
             }
             // Spotlight info — extra leading inset so text/logo stay title-safe
             // even though the art bleeds to the edge.
-            ATVHeroInfoView(hero: hero, onPlay: onPlay, playFocus: playFocus)
+            ATVHeroInfoView(hero: hero, onPlay: onPlay, playFocus: playFocus,
+                            showsActions: showsActions)
                 .padding(.leading, 100)
         }
         .frame(height: height)
         .frame(maxWidth: .infinity)
         // "TOP 10" eyebrow at the very top-left of the hero.
         .overlay(alignment: .topLeading) {
-            if hero.spotlight.count > 1 {
+            if showsTopBadge, hero.spotlight.count > 1 {
                 Text("TOP 10")
                     .font(FusionType.badge(theme.font))
                     .tracking(2)
@@ -1980,10 +2748,13 @@ private struct ATVHeroInfoView: View {
     @ObservedObject var hero: HeroFocus
     let onPlay: (MetaItem) -> Void
     var playFocus: FocusState<Bool>.Binding
+    /// Play button + spotlight dots (see `FusionHeroHeader.showsActions`).
+    var showsActions = true
     /// -1 / 1 while an invisible stepping sentinel beside the Play button
     /// holds focus for a beat (see the hero button HStack).
     @FocusState private var spotlightStep: Int?
     @State private var contentRating: String?
+    @Environment(\.railIsHidden) private var railIsHidden
 
     var body: some View {
         VStack(alignment: .leading, spacing: OrivioSpacing.md) {
@@ -2003,10 +2774,17 @@ private struct ATVHeroInfoView: View {
     @ViewBuilder
     private func content(_ item: MetaItem) -> some View {
         if item.type == "collection" {
+            // The category's NAME — deliberately not its cover tile, which
+            // reads as a stray poster floating on the billboard. Raised by the
+            // height of the meta line / synopsis / button block a real title
+            // renders below its logo, so "Netflix" sits where a movie's title
+            // treatment sits rather than on the very bottom edge of the band.
             Text(item.name)
                 .font(.system(size: 60, weight: .heavy))
                 .foregroundStyle(theme.palette.textPrimary)
                 .lineLimit(2)
+                .shadow(color: .black.opacity(scheme == .light ? 0 : 0.4), radius: 10, y: 4)
+                .padding(.bottom, 180)
         } else {
             // (The "TOP 10" eyebrow now lives at the hero's top-left corner —
             // see FusionHeroHeader.)
@@ -2040,10 +2818,17 @@ private struct ATVHeroInfoView: View {
             // focus straight back after stepping. NOT `.onMoveCommand`: that
             // swallows EVERY direction on the focused view, so Down could
             // never leave the hero and the catalog rows were unreachable.
+            if showsActions {
             HStack(spacing: 0) {
-                Color.clear.frame(width: 1, height: 44)
-                    .focusable()
-                    .focused($spotlightStep, equals: -1)
+                // Dropped while the rail is hidden, so LEFT finds no candidate
+                // here, bubbles up to RootView's `onMoveCommand`, and brings
+                // the sidebar back (see `railIsHidden`). Stepping the spotlight
+                // backwards costs nothing there — RIGHT still cycles it.
+                if !railIsHidden {
+                    Color.clear.frame(width: 1, height: 44)
+                        .focusable()
+                        .focused($spotlightStep, equals: -1)
+                }
                 ATVHeroPlayButton(title: item.type == "series" ? "Go to Show" : "Go to Movie") {
                     onPlay(item)
                 }
@@ -2072,6 +2857,7 @@ private struct ATVHeroInfoView: View {
             if hero.spotlight.count > 1 {
                 paginationDots
                     .padding(.top, OrivioSpacing.sm)
+            }
             }
         }
     }

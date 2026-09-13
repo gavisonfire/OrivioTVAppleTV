@@ -40,6 +40,18 @@ final class SimklStore: ObservableObject {
     @Published var syncRatings: Bool {
         didSet { UserDefaults.standard.set(syncRatings, forKey: Self.ratingsKey) }
     }
+    /// Seed Continue Watching from SIMKL's "watching" list.
+    ///
+    /// SIMKL has no playback-position API — there is nothing equivalent to
+    /// Trakt's `/sync/playback`, so an exact resume point can't come from
+    /// here. What it does have is a "watching" bucket with the episodes you
+    /// have finished, which is enough to say WHICH episode is next; the row
+    /// lands at the start of that episode. Off would mean a viewer whose only
+    /// tracker is SIMKL sees an empty Continue Watching after a reinstall,
+    /// which is the complaint this exists to answer.
+    @Published var syncContinueWatching: Bool {
+        didSet { UserDefaults.standard.set(syncContinueWatching, forKey: Self.continueKey) }
+    }
 
     /// Last full-sync outcome, shown in Settings → Trakt & SIMKL.
     @Published private(set) var lastSyncStatus: String?
@@ -59,6 +71,7 @@ final class SimklStore: ObservableObject {
     private static let histKey = "orivio.simkl.synchistory.v1"
     private static let watchlistKey = "orivio.simkl.syncwatchlist.v1"
     private static let ratingsKey = "orivio.simkl.syncratings.v1"
+    private static let continueKey = "orivio.simkl.synccontinue.v1"
     /// Trakt's key, on purpose — one switch splits BOTH services per profile.
     private static let perProfileKey = "orivio.trakt.perProfileAccounts.v1"
     /// Same key ProfileStore uses, read directly so the scope is right from
@@ -69,6 +82,7 @@ final class SimklStore: ObservableObject {
         syncWatchHistory = UserDefaults.standard.object(forKey: Self.histKey) as? Bool ?? true
         syncWatchlist = UserDefaults.standard.object(forKey: Self.watchlistKey) as? Bool ?? true
         syncRatings = UserDefaults.standard.object(forKey: Self.ratingsKey) as? Bool ?? true
+        syncContinueWatching = UserDefaults.standard.object(forKey: Self.continueKey) as? Bool ?? true
         perProfileAccounts = UserDefaults.standard.bool(forKey: Self.perProfileKey)
         profileID = UserDefaults.standard.object(forKey: Self.activeProfileKey) as? Int ?? 1
         let suffix = perProfileAccounts ? ".p\(profileID)" : ""
@@ -496,6 +510,14 @@ extension SimklService {
                 // The title object sits under a key named for its kind.
                 let node = (row["movie"] ?? row["show"] ?? row["anime"]) as? [String: Any]
                 guard let node, let ids = node["ids"] as? [String: Any] else { continue }
+                // SIMKL files anime FILMS in the same bucket as anime series,
+                // and mapping the whole bucket to "series" typed a film as a
+                // show with no season — which the history filter rejects on
+                // both arms, so the film could never be recognised as
+                // already-synced and was re-uploaded on every single sync.
+                // `anime_type` is the row's own kind ("tv", "movie", "ova"…).
+                let animeKind = (node["anime_type"] as? String)?.lowercased()
+                let appType = (bucket == "anime" && animeKind == "movie") ? "movie" : appType
                 let imdb = ids["imdb"] as? String
                 let tmdb = (ids["tmdb"] as? Int) ?? (ids["tmdb"] as? String).flatMap(Int.init)
                 guard imdb != nil || tmdb != nil else { continue }

@@ -43,6 +43,36 @@ struct LayoutSettingsDetail: View {
                     subtitle: "The rotating Featured banner between Continue Watching and your catalog rows. Off removes it from the home screen.",
                     isOn: $settings.showFeaturedBar
                 )
+
+                SettingsToggleCard(
+                    title: "Pin hero to the top",
+                    subtitle: "Keep the hero fixed above the rows and show whatever title is highlighted, instead of a banner that scrolls away and cycles the top ten on its own.",
+                    isOn: $settings.pinnedHero
+                )
+
+                SettingsToggleCard(
+                    title: "Hide the sidebar",
+                    subtitle: "Give the rows the full width of the screen. Press LEFT from the edge of the page (or Menu) to bring the sidebar back; picking a tab hides it again. Settings always keeps its sidebar.",
+                    isOn: $settings.autoHideSidebar
+                )
+
+                SettingsToggleCard(
+                    title: "Hero trailers",
+                    subtitle: "With the hero pinned, play the highlighted title's trailer in the hero behind the name and details. Sitting on the hero itself cycles through the Top 10, trailer and all.",
+                    isOn: $settings.heroTrailersEnabled
+                )
+
+                SettingsToggleCard(
+                    title: "Hero trailer sound",
+                    subtitle: "Play the hero trailer with sound instead of muted.",
+                    isOn: $settings.heroTrailerSound
+                )
+
+                SettingsToggleCard(
+                    title: "Full stream names",
+                    subtitle: "On the source list, show every link's complete release name — wrapped across lines instead of cut off.",
+                    isOn: $settings.fullStreamTitles
+                )
             }
 
             SettingsGroupCard(title: "Posters", subtitle: "Card size and labels across the app") {
@@ -478,6 +508,30 @@ private struct LayoutRowView: View {
     }
 }
 
+/// On/off checkmark beside a collection or folder row.
+///
+/// `PlainCardButtonStyle` supplies only a press dip — the focus VISUAL is the
+/// label's own job, which is why `RowControlIcon` below draws one. These
+/// checkmarks were a bare `Image`, so moving focus left off the row and onto
+/// the checkmark made the highlight vanish: the row un-highlighted and nothing
+/// took its place, so there was no way to tell what was selected.
+private struct CheckToggleIcon: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.isFocused) private var isFocused
+    let isOn: Bool
+
+    var body: some View {
+        Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
+            .font(.system(size: 26, weight: .semibold))
+            .foregroundStyle(isFocused ? theme.palette.onSecondary
+                             : (isOn ? theme.palette.focusRing : theme.palette.textTertiary))
+            .frame(width: 56, height: 56)
+            .background(Circle().fill(isFocused ? theme.palette.secondary : Color.white.opacity(0.1)))
+            .overlay(Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
+            .focusLift(OrivioFocus.control, isFocused)
+    }
+}
+
 /// Small circular icon control (move/rename/hide) with the app's focus look.
 private struct RowControlIcon: View {
     @EnvironmentObject private var theme: ThemeManager
@@ -601,9 +655,7 @@ struct CollectionsSettingsDetail: View {
                     Button {
                         collections.setGloballyVisible(!on, id: collection.id)
                     } label: {
-                        Image(systemName: on ? "checkmark.circle.fill" : "circle")
-                            .font(.system(size: 30))
-                            .foregroundStyle(on ? theme.palette.focusRing : theme.palette.textTertiary)
+                        CheckToggleIcon(isOn: on)
                     }
                     .buttonStyle(PlainCardButtonStyle())
 
@@ -774,11 +826,7 @@ struct CollectionEditorView: View {
                                 collections.setFolderGloballyVisible(
                                     !collections.isFolderGloballyVisible(folder.id), id: folder.id)
                             } label: {
-                                Image(systemName: collections.isFolderGloballyVisible(folder.id)
-                                      ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 30))
-                                    .foregroundStyle(collections.isFolderGloballyVisible(folder.id)
-                                                     ? theme.palette.focusRing : theme.palette.textTertiary)
+                                CheckToggleIcon(isOn: collections.isFolderGloballyVisible(folder.id))
                             }
                             .buttonStyle(PlainCardButtonStyle())
 
@@ -798,7 +846,7 @@ struct CollectionEditorView: View {
                                 folders.removeAll { $0.id == folder.id }
                                 persist()
                             } label: {
-                                Image(systemName: "trash").font(.system(size: 22))
+                                RowControlIcon(icon: "trash")
                             }
                         }
                     }
@@ -808,10 +856,13 @@ struct CollectionEditorView: View {
                     HStack(spacing: OrivioSpacing.lg) {
                         Button("Done") {
                             titlePersistTask?.cancel()
-                            persist()
+                            persist(finalizing: true)
                             onDone()
                         }
-                        if collections.collections.contains(where: { $0.id == collectionID }) {
+                        // Against the LIBRARY, not the visible subset: a
+                        // collection switched off for all profiles is exactly
+                        // the one with no other way to be deleted.
+                        if collections.library.contains(where: { $0.id == collectionID }) {
                             Button("Delete Collection", role: .destructive) {
                                 collections.remove(id: collectionID)
                                 onDone()
@@ -858,7 +909,7 @@ struct CollectionEditorView: View {
         // Changes are already saved — flush any debounced title edit and dismiss.
         .onExitCommand {
             titlePersistTask?.cancel()
-            persist()
+            persist(finalizing: true)
             onDone()
         }
         .fullScreenCover(isPresented: $addingFolder) {
@@ -885,14 +936,27 @@ struct CollectionEditorView: View {
     /// Upsert the current editor state into the store. A brand-new collection
     /// isn't materialized until it has a name, so opening "New Collection" and
     /// backing straight out doesn't leave an empty row behind.
-    private func persist() {
+    /// `finalizing` marks the LAST write of an editing session (Done / Back).
+    /// Only then may an unnamed collection take its name from its first
+    /// folder: doing it on the autosave path would stamp a name onto the
+    /// collection the instant a folder was added, mid-typing.
+    private func persist(finalizing: Bool = false) {
         guard didLoad else { return }
         // Never autosave an empty name — mid-retype the field passes through
         // "" and the old Save button refused it too. The last good title holds
         // until a non-empty one is typed.
-        let trimmed = title.trimmingCharacters(in: .whitespaces)
+        var trimmed = title.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty, finalizing {
+            // Built the folders, never typed a name, pressed Done: name it
+            // after what's in it rather than throwing the work away silently.
+            trimmed = folders.first { !$0.title.trimmingCharacters(in: .whitespaces).isEmpty }?
+                .title.trimmingCharacters(in: .whitespaces) ?? ""
+        }
         guard !trimmed.isEmpty else { return }
-        let existing = collections.collections.first(where: { $0.id == collectionID })
+        // The LIBRARY copy. Looking the id up in the visible list missed any
+        // collection switched off in Settings, so every Back out of its editor
+        // treated it as new and appended a duplicate.
+        let existing = collections.library.first(where: { $0.id == collectionID })
         var c = existing ?? OrivioCollection(id: collectionID, title: trimmed)
         c.title = trimmed
         c.folders = folders
@@ -944,6 +1008,8 @@ private struct FolderEditorView: View {
     @State private var tileShape = "SQUARE"
     @State private var coverURL = ""
     @State private var showSourcePicker = false
+    /// Shown next to Save when there is genuinely nothing to save.
+    @State private var saveError: String?
 
     private static let shapes: [(id: String, label: String)] =
         [("SQUARE", "Square"), ("POSTER", "Poster"), ("LANDSCAPE", "Landscape")]
@@ -974,19 +1040,30 @@ private struct FolderEditorView: View {
                     }
                     .buttonStyle(PlainCardButtonStyle())
 
+                    // ONE focusable control per row, and the row itself is it.
+                    // The label used to be a plain `SettingsActionRow` with a
+                    // separate trash button beside it, so the only thing that
+                    // could be selected on a source was Delete — "cannot select
+                    // Netflix, only delete". Selecting the row is now what
+                    // removes it, and the row says so.
                     ForEach(Array(passthroughSources.enumerated()), id: \.offset) { index, source in
-                        HStack(spacing: OrivioSpacing.md) {
-                            SettingsActionRow(
-                                title: source.title?.isEmpty == false ? source.title! : (source.tmdbSourceType ?? "Trakt List"),
-                                subtitle: source.isTraktSource ? "Trakt list" : "TMDB \((source.tmdbSourceType ?? "").capitalized)",
-                                leadingIcon: source.isTraktSource ? "checkmark.seal.fill" : "film.fill"
-                            )
-                            Button(role: .destructive) {
-                                passthroughSources.remove(at: index)
-                            } label: {
-                                Image(systemName: "trash").font(.system(size: 22))
+                        Button {
+                            guard passthroughSources.indices.contains(index) else { return }
+                            passthroughSources.remove(at: index)
+                        } label: {
+                            HStack(spacing: OrivioSpacing.md) {
+                                SettingsActionRow(
+                                    title: source.title?.isEmpty == false ? source.title! : (source.tmdbSourceType ?? "Trakt List"),
+                                    subtitle: (source.isTraktSource ? "Trakt list" : "TMDB \((source.tmdbSourceType ?? "").capitalized)")
+                                        + " — select to remove",
+                                    leadingIcon: source.isTraktSource ? "checkmark.seal.fill" : "film.fill"
+                                )
+                                Image(systemName: "trash")
+                                    .font(.system(size: 22))
+                                    .foregroundStyle(OrivioPrimitives.error)
                             }
                         }
+                        .buttonStyle(PlainCardButtonStyle())
                     }
 
                     // Tile shape — Square / Poster / Landscape.
@@ -1015,12 +1092,25 @@ private struct FolderEditorView: View {
                         .frame(maxWidth: 900)
 
                     HStack(spacing: OrivioSpacing.lg) {
+                        // NEVER `.disabled` here. A disabled tvOS button is not
+                        // focusable, and a ScrollView only scrolls when focus
+                        // moves — so with the name field left blank (which is
+                        // the normal state right after adding a source from the
+                        // picker) Save was both unreachable AND unscrollable-to,
+                        // which is the "can't scroll down to save" report. The
+                        // name is derived from the first source instead, and
+                        // `save()` explains itself if there is nothing to name.
                         Button("Save", action: save)
-                            .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
                         Button("Cancel", role: .cancel) { onDone(nil) }
                     }
                     .font(.system(size: 24, weight: .semibold))
                     .padding(.top, OrivioSpacing.lg)
+
+                    if let saveError {
+                        Text(saveError)
+                            .font(.system(size: 20))
+                            .foregroundStyle(OrivioPrimitives.error)
+                    }
                 }
                 .padding(OrivioSpacing.huge)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1047,8 +1137,21 @@ private struct FolderEditorView: View {
     }
 
     private func save() {
-        let trimmed = title.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
+        // An unnamed folder takes the name of what's in it — "Netflix", not a
+        // refusal. Typing a name is still what most people do; this just stops
+        // the form from being a dead end when they don't.
+        var trimmed = title.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty {
+            trimmed = passthroughSources.compactMap { source in
+                let candidate = source.title?.trimmingCharacters(in: .whitespaces) ?? ""
+                return candidate.isEmpty ? nil : candidate
+            }.first ?? ""
+        }
+        guard !trimmed.isEmpty else {
+            saveError = "Give the folder a name, or add a source to name it after."
+            return
+        }
+        saveError = nil
         var result = folder ?? OrivioCollectionFolder(id: UUID().uuidString, title: trimmed, sources: [])
         result.title = trimmed
         // Addon rows ride along untouched: they resolve to nothing here, but

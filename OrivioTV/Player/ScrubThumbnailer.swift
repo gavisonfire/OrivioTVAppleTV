@@ -109,7 +109,10 @@ final class ScrubThumbnailer: @unchecked Sendable {
     /// Ceiling on frames held in memory. At 256x144 RGBA a frame is ~147 KB, so
     /// 240 is ~35 MB — the most this is worth spending next to a live decode.
     /// A film longer than 2 hours simply gets a coarser spacing than 30s.
-    static let maxFrames = 240
+    /// Tiered: these are held for the whole scrub on a 3 GB box.
+    static var maxFrames: Int {
+        PerformanceProfile.isLowPower ? 60 : (PerformanceProfile.isMidPower ? 100 : 240)
+    }
 
     /// Frames for a runtime, at one every `secondsPerFrame`.
     static func frameCount(forDuration duration: Double) -> Int {
@@ -117,9 +120,14 @@ final class ScrubThumbnailer: @unchecked Sendable {
         return max(12, min(Int(duration / secondsPerFrame), maxFrames))
     }
 
-    /// Fine-tune pass: one frame every two seconds, matching the wheel's own
-    /// resolution (24 seconds a turn), over a window either side of the
-    /// playhead.
+    /// Density while SCRUBBING across cached film: one frame every 15 seconds
+    /// of runtime. Used by the cache-driven coarse pass (its target spacing,
+    /// memory permitting) and by the wide dense pass that fills in around the
+    /// finger during a drag.
+    static let scrubSecondsPerFrame: Double = 15
+    /// Density while FINE-TUNING (the wheel is engaged): one frame every two
+    /// seconds, over a narrow window either side of the playhead — a distinct
+    /// picture under every couple of steps of the wheel.
     static let fineSecondsPerFrame: Double = 2
     static let fineWindowSeconds: Double = 90
 
@@ -168,10 +176,23 @@ final class ScrubThumbnailer: @unchecked Sendable {
     /// immediately and step aside whenever the buffer dips.
     private let shouldProceed: (@Sendable () -> Bool)?
 
+    /// Pause between frames — the pass's DUTY CYCLE against live playback.
+    ///
+    /// `shouldProceed` stands the pass down when the engine's buffer dips, but
+    /// a healthy buffer is not the same as a spare CPU: on the 3 GB Apple TV 4K
+    /// a background pass software-decoding 4K keyframes visibly juddered the
+    /// picture while every buffer reading looked fine. Standing the pass down
+    /// entirely while playing fixed the judder and cost the previews — the
+    /// probe then read `coarse=0` for whole sessions with nothing to fall back
+    /// on. A longer breath is the setting between those two: coverage still
+    /// builds, just slowly, at a fraction of the contention.
+    private let breathSeconds: TimeInterval
+
     init(
         url: URL, count: Int = 36, thumbWidth: Int32 = 256,
         budgetSeconds: TimeInterval = 60, headers: [String: String]? = nil,
         range: ClosedRange<Double>? = nil,
+        breathSeconds: TimeInterval = 0.08,
         shouldProceed: (@Sendable () -> Bool)? = nil
     ) {
         self.url = url
@@ -180,6 +201,7 @@ final class ScrubThumbnailer: @unchecked Sendable {
         self.budgetSeconds = budgetSeconds
         self.headers = headers
         self.range = range
+        self.breathSeconds = breathSeconds
         self.shouldProceed = shouldProceed
     }
 
@@ -210,6 +232,12 @@ final class ScrubThumbnailer: @unchecked Sendable {
     private func run(onProgress: (([ScrubThumbnail]) -> Void)? = nil) -> [ScrubThumbnail] {
         let deadline = Date().addingTimeInterval(budgetSeconds)
         var thumbnails: [ScrubThumbnail] = []
+        // Progress publishes are throttled to ~1 Hz: each one sorts the whole
+        // set and hands a fresh array cross-actor, and per-frame that was
+        // O(n² log n) over a long pass — with a main-actor hop and a bar
+        // re-render per decoded frame on the other side. The completed set is
+        // returned (and published) regardless, so nothing is lost.
+        var lastProgressAt: CFAbsoluteTime = 0
 
         var formatCtx = avformat_alloc_context()
         guard let inCtx = formatCtx else { return [] }
@@ -287,6 +315,15 @@ final class ScrubThumbnailer: @unchecked Sendable {
         // the container declared), which would have silently disabled previews.
         var scaler: OpaquePointer?
         var scalerFormat: Int32 = -1   // AV_PIX_FMT_NONE
+        // The scaler's SOURCE geometry is tracked alongside its format. It used
+        // to be built once from `codecCtx.width/height` and then fed
+        // `frame.pointee.height` as the slice height — so a decoder that handed
+        // back a frame of a different size than the container declared (a
+        // resolution change mid-file, or a container that simply lies) had
+        // sws_scale reading past the end of the source planes. Rebuilding on a
+        // geometry change as well as a format change makes that impossible.
+        var scalerWidth: Int32 = 0
+        var scalerHeight: Int32 = 0
         defer { if let scaler { sws_freeContext(scaler) } }
 
         guard let packet = av_packet_alloc() else { return [] }
@@ -333,11 +370,18 @@ final class ScrubThumbnailer: @unchecked Sendable {
             if cancelled || Date() >= deadline { break }
             // A short breath between frames regardless, so a healthy buffer
             // isn't hammered flat by a back-to-back run of seeks either.
-            Thread.sleep(forTimeInterval: 0.08)
+            Thread.sleep(forTimeInterval: breathSeconds)
             let target = spanStart + interval * Int64(index) + startTime
             avcodec_flush_buffers(codecCtx)
+            // SKIP THE SLOT, DON'T ABANDON THE PASS. `break` here left one
+            // refused seek deciding the whole set: the cache-only lane answers
+            // 416/503 for any byte range it does not already hold, so a single
+            // slot over an evicted or not-yet-fetched stretch returned ZERO
+            // frames for the entire window — and `scanOrder` deliberately puts
+            // the middle slot first, which on a fresh scrub is the one least
+            // likely to be cached. Every other slot was perfectly fetchable.
             guard av_seek_frame(formatCtx, Int32(videoIndex), target, AVSEEK_FLAG_BACKWARD) >= 0
-            else { break }
+            else { continue }
 
             // Read until this stream yields a decodable frame. EVERY packet is
             // unref'd — the whole point of this file.
@@ -364,11 +408,16 @@ final class ScrubThumbnailer: @unchecked Sendable {
                 defer { av_frame_unref(frame) }
                 // (Re)build the scaler when the decoded format first appears or
                 // changes mid-file.
-                if scaler == nil || scalerFormat != frame.pointee.format {
+                if scaler == nil || scalerFormat != frame.pointee.format
+                    || scalerWidth != frame.pointee.width
+                    || scalerHeight != frame.pointee.height {
                     if let existing = scaler { sws_freeContext(existing) }
                     scalerFormat = frame.pointee.format
+                    scalerWidth = frame.pointee.width
+                    scalerHeight = frame.pointee.height
+                    guard scalerWidth > 0, scalerHeight > 0 else { break }
                     scaler = sws_getContext(
-                        srcW, srcH, AVPixelFormat(rawValue: scalerFormat),
+                        scalerWidth, scalerHeight, AVPixelFormat(rawValue: scalerFormat),
                         dstW, dstH, AV_PIX_FMT_BGRA,
                         SWS_BILINEAR, nil, nil, nil
                     )
@@ -381,14 +430,24 @@ final class ScrubThumbnailer: @unchecked Sendable {
                         ? target : frame.pointee.best_effort_timestamp
                     let seconds = Double(stamp - startTime) * av_q2d(timeBase)
                     thumbnails.append(ScrubThumbnail(image: image, time: max(seconds, 0)))
-                    if !cancelled {
-                        onProgress?(thumbnails.sorted { $0.time < $1.time })
+                    if !cancelled, onProgress != nil {
+                        let now = CFAbsoluteTimeGetCurrent()
+                        if now - lastProgressAt >= 1 {
+                            lastProgressAt = now
+                            onProgress?(thumbnails.sorted { $0.time < $1.time })
+                        }
                     }
                 }
                 break
             }
         }
-        return cancelled ? [] : thumbnails
+        // KEEP WHAT WAS DECODED. Discarding the lot on cancel threw away real
+        // work at exactly the moment it was most wanted: the fine pass is
+        // cancelled and re-centred as the finger moves, so a scrub that travels
+        // at all cancelled every pass mid-flight and published nothing, however
+        // many frames had already been decoded. A frame from a window the
+        // viewer has just left is still a better preview than no frame.
+        return thumbnails
     }
 
     /// Scale one decoded frame into a BGRA CGImage-backed UIImage.

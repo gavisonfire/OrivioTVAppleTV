@@ -35,7 +35,11 @@ actor DiskCache<Value: Codable & Sendable> {
     /// session — uncapped it grows for the app's lifetime (every catalog /
     /// meta / enrichment response ever touched stays decoded in memory).
     /// Eviction is invisible: entries re-read from disk on the next hit.
-    private let memoryLimit = 64
+    /// Tier-scaled: the "meta" cache's values are FULL-SERIES MetaItems —
+    /// among the largest payloads in the app — and 64 of them decoded in RAM
+    /// is not something the 2 GB box can idle on.
+    private let memoryLimit = PerformanceProfile.isLowPower ? 16
+        : PerformanceProfile.isMidPower ? 32 : 64
 
     private func capMemory() {
         guard memory.count > memoryLimit else { return }

@@ -64,7 +64,7 @@ enum CollectionResolver {
         let sources = folder.effectiveSources
         guard !sources.isEmpty else { return .empty }
         let tmdb = sources.contains(where: \.isTMDBSource)
-        let trakt = sources.contains(where: \.isTraktSource)
+        let trakt = sources.contains(where: \.isUsableTraktSource)
         // Anything at all that can run right now means the folder is fine.
         if (tmdb && providers.tmdb) || (trakt && providers.trakt) { return .none }
         if tmdb && trakt { return .needsEither }
@@ -96,7 +96,7 @@ enum CollectionResolver {
         // (TMDB disconnected, or a Trakt-only folder).
         let resolvableTmdb = providers.tmdb ? folder.effectiveSources.filter(\.isTMDBSource) : []
         let traktSources = (providers.trakt && resolvableTmdb.isEmpty)
-            ? folder.effectiveSources.filter(\.isTraktSource) : []
+            ? folder.effectiveSources.filter(\.isUsableTraktSource) : []
         guard !resolvableTmdb.isEmpty || !traktSources.isEmpty else { return [] }
 
         let isContinuation = tmdbStartPage > 1
@@ -143,13 +143,19 @@ enum CollectionResolver {
     /// installed meta add-on (Cinemeta) so the grid still has posters; the rest
     /// still display (title only) rather than being dropped.
     static func resolveTrakt(source: CollectionSourceDTO, addonManager: AddonManager) async -> [MetaItem] {
-        guard let traktListId = source.traktListId else { return [] }
         let type = (source.mediaType ?? "movie").lowercased() == "tv" ? "show" : "movie"
-        let sortBy = source.sortBy ?? "rank"
-        let sortHow = source.sortHow ?? "asc"
-        let raw = await TraktService.publicListItems(
-            traktListId: traktListId, type: type, sortBy: sortBy, sortHow: sortHow
-        )
+        let raw: [TraktService.PublicListItem]
+        if let endpoint = source.traktEndpoint {
+            // A browse endpoint (the community categories' Trakt side).
+            raw = await TraktService.endpointItems(path: endpoint, query: source.traktQuery, type: type)
+        } else {
+            guard let traktListId = source.traktListId else { return [] }
+            let sortBy = source.sortBy ?? "rank"
+            let sortHow = source.sortHow ?? "asc"
+            raw = await TraktService.publicListItems(
+                traktListId: traktListId, type: type, sortBy: sortBy, sortHow: sortHow
+            )
+        }
         // Flatten first: every entry gets its placeholder, and the first 30 get
         // upgraded in place if their meta lookup lands.
         struct Entry { let id: String; let type: String; let placeholder: MetaItem }

@@ -76,6 +76,42 @@ final class OrivioSyncManager: ObservableObject {
     private var pulledAddonProfiles: Set<Int> = []
     private var pulledPluginProfiles: Set<Int> = []
 
+    /// A full sync was requested while one was running. It used to be
+    /// DROPPED ("sync already running"), so a change made during a run —
+    /// which takes tens of seconds on a big account — waited for the next
+    /// 30-second tick, and a second change during THAT run waited again.
+    /// Now the request is remembered and the sync runs once more when the
+    /// current one ends.
+    private var rerunRequested = false
+
+    /// Profiles that have completed one full pull+push cycle this session on
+    /// the current account. The FIRST cycle uploads every store whether or
+    /// not it is marked dirty — that is what merges a device's pre-sign-in
+    /// data into the account. After it, a store goes up only when something
+    /// local changed (its dirty flag), which turns the periodic sync from a
+    /// re-upload of the entire library, history and collections every 30s
+    /// into a handful of small round trips.
+    private var completedFullSyncProfiles: Set<Int> = []
+
+    /// Set during a run when a pull grew the shared collections library
+    /// (another profile's or device's packs merged in). Those pushes are
+    /// gated on their dirty flags now, and a merge fires no change hook, so
+    /// the run has to remember to upload the grown library itself.
+    private var libraryGrewDuringSync = false
+
+    /// When each profile's badge blobs were last read. Six settings-blob
+    /// round trips per sync for a cosmetic chip set is too many; steady state
+    /// re-reads every ten minutes, and the manual "sync badges" button is
+    /// unthrottled.
+    private var lastBadgePull: [Int: Date] = [:]
+    private static let badgePullInterval: TimeInterval = 10 * 60
+
+    /// The account has no `sync_delete_profile_data` (learned from a PGRST202
+    /// answer this session), so profile deletions fall back to the legacy
+    /// `p_deleted_profile_ids` hint on the profile push.
+    private var profileDeleteRPCMissing = false
+    private var legacyProfileDeleteHintMissing = false
+
     struct PendingSyncCounts {
         let progressDeletes: Int
         let libraryDeletes: Int
@@ -124,6 +160,7 @@ final class OrivioSyncManager: ObservableObject {
     /// The active profile scopes all personal-data sync. Addons stay global
     /// (profile 1) so the same sources are available on every profile.
     private var pid: Int { profileStore.activeProfileID }
+
 
     /// Thrown when the active profile changes part-way through a sync run.
     ///
@@ -206,6 +243,13 @@ final class OrivioSyncManager: ObservableObject {
         profilesDirty = false
         pluginsDirty = false
         appPreferencesDirty = false
+        collectionsDirty = false
+        homeCatalogDirty = false
+        badgeSettingsDirty = false
+        providerCredentialsDirty = false
+        // Whoever signs in next gets a full first cycle again.
+        completedFullSyncProfiles.removeAll()
+        lastBadgePull.removeAll()
         // progress / library / watched dirty flags are persisted per profile
         // (`orivio.sync.dirty.*`): the sweep above dropped them for a
         // different account and kept them for a plain sign-out.
@@ -416,6 +460,11 @@ final class OrivioSyncManager: ObservableObject {
         // deleted would hide the NEW user's collections of the same id — and
         // the reset above tombstoned every one of the previous account's.
         collectionsStore.forgetRemovalTombstones()
+        // And the profile deletions still waiting to reach the previous
+        // account: run against this one they would delete ITS profiles.
+        profileStore.forgetProfileDeletions()
+        profileDeleteRPCMissing = false
+        legacyProfileDeleteHintMissing = false
         // Anything already armed before this point is also account A's — every
         // one of these pushes is scoped to the signed-in account, so letting a
         // debounced one land now uploads A's data into B.
@@ -461,6 +510,11 @@ final class OrivioSyncManager: ObservableObject {
         static let deleteWatchedItems = "sync_delete_watched_items"
         static let pushProfiles = "sync_push_profiles"
         static let pullProfiles = "sync_pull_profiles"
+        /// Drops a profile row AND everything stored under it — the RPC the
+        /// Android app deletes a profile with. `sync_push_profiles` only ever
+        /// upserts the rows it is given, so this is the one way a deletion
+        /// reaches the account.
+        static let deleteProfileData = "sync_delete_profile_data"
         static let pullProfileLocks = "sync_pull_profile_locks"
         static let setProfilePin = "set_profile_pin"
         static let verifyProfilePin = "verify_profile_pin"
@@ -535,7 +589,13 @@ final class OrivioSyncManager: ObservableObject {
             .store(in: &cancellables)
 
         // Push local changes upward (debounced for addons/library/watched/profiles, immediate for progress).
-        addonManager.onLocalChange = { [weak self] in self?.scheduleAddonPush() }
+        addonManager.onLocalChange = { [weak self] in
+            self?.scheduleAddonPush()
+            // An add-on's catalogs are rows in the shared home layout, and the
+            // layout push is gated on its own dirty flag now (the full sync
+            // used to re-upload it every run, which is how new rows got there).
+            self?.scheduleHomeCatalogPush()
+        }
         // "Sync Add-ons" → TWO-WAY. Pending local edits go up first, then the
         // account comes down with reconciliation so a removal made on another
         // device lands here. Ordering matters: pull-then-push would let a stale
@@ -598,6 +658,8 @@ final class OrivioSyncManager: ObservableObject {
             self?.schedulePluginsPush()
         }
         torrentSettings?.onLocalChange = { [weak self] in self?.scheduleAppPreferencesPush() }
+        // Live TV favourites / home-pinned channels ride the same blob.
+        LiveChannelFavorites.shared.onLocalChange = { [weak self] in self?.scheduleAppPreferencesPush() }
         // Trakt tokens live only in the dedicated provider_credentials table.
         traktStore?.onLocalChange = { [weak self] in self?.scheduleProviderCredentialsPush() }
         homeCatalogSettings.onPresentationChange = { [weak self] in self?.scheduleAppPreferencesPush() }
@@ -700,7 +762,13 @@ final class OrivioSyncManager: ObservableObject {
     // MARK: - Periodic auto-sync
 
     /// Seconds between automatic full syncs while signed in and foregrounded.
-    static let autoSyncInterval: TimeInterval = 30
+    /// Tier-scaled: the full sync has no server-side change detection, so
+    /// every idle tick pulls and decodes complete progress/library/watched
+    /// snapshots — recurring work the A8/A10X pays in focus hitches while the
+    /// user browses. 90s there still keeps devices current (the per-change
+    /// SyncCoordinator push path is what carries urgency, not this timer).
+    static let autoSyncInterval: TimeInterval =
+        (PerformanceProfile.isLowPower || PerformanceProfile.isMidPower) ? 90 : 30
     private var autoSyncTask: Task<Void, Never>?
     /// Set by the player. While a stream plays the tick runs `syncLight`
     /// instead of the full multi-endpoint sync: a few small JSON requests that
@@ -724,14 +792,13 @@ final class OrivioSyncManager: ObservableObject {
                 // behind it.
                 guard !isSyncing else { continue }
                 if Self.playbackActive {
-                    // The light pass still decodes JSON and merges three
-                    // stores ON THE MAIN ACTOR — thousands of watched rows on
-                    // a long-lived install — while the A8/A10X is decoding a
-                    // film beside it. Every third tick there (90s) keeps the
-                    // other devices current without a periodic hiccup.
+                    // The light pass still merges three stores ON THE MAIN
+                    // ACTOR — thousands of watched rows on a long-lived
+                    // install — while the A8/A10X is decoding a film beside
+                    // it. Those tiers' tick is already stretched to 90s by
+                    // `autoSyncInterval`, which is the in-playback cadence
+                    // the old every-third-tick skip produced.
                     playbackTicks += 1
-                    let constrained = PerformanceProfile.isLowPower || PerformanceProfile.isMidPower
-                    if constrained, playbackTicks % 3 != 1 { continue }
                     await syncLight(reason: "auto, playback active")
                     continue
                 }
@@ -751,24 +818,44 @@ final class OrivioSyncManager: ObservableObject {
         guard account.accessToken != nil, account.currentUserID != nil else { return }
         guard !isSyncing, !isRetiringAccountState else { return }
         isSyncing = true
-        defer { isSyncing = false }
+        // A full sync requested while THIS light pass was running was neither
+        // run nor re-run: `rerunRequested` was consumed only by syncNow's
+        // defer, so the request sat until the next 30s tick. Same rule here.
+        defer {
+            isSyncing = false
+            if rerunRequested {
+                rerunRequested = false
+                Task { [weak self] in await self?.syncNow() }
+            }
+        }
         let profile = pid
         do {
             if profilesDirty { try await pushProfiles() }
+            await drainProfileDeletes()
             if isDirty("addons", profile: profile) { try await pushAddons(profile: profile) }
-            if progressDirty { try await pushWatchProgressAll(profile: profile) }
-            await reconcileProgressDeletesBeforePull(profile: profile)
-            // Still-pending deletes postpone the progress pull so it cannot
-            // resurrect them (same rule as refreshContinueWatching).
-            if loadPendingDeletes(profile: profile).isEmpty {
-                try await pullWatchProgress(profile: profile)
-            }
-            if libraryDirty { try await pushLibrary(profile: profile) }
-            await reconcileLibraryDeletesBeforePull(profile: profile)
-            try await pullLibrary(profile: profile)
-            if watchedDirty { try await pushWatchedItems(profile: profile) }
-            await reconcileWatchedDeletesBeforePull(profile: profile)
-            try await pullWatchedItems(profile: profile)
+            // The three content stores are independent of one another: their
+            // push → flush-deletes → pull chains run side by side.
+            try await runConcurrently([
+                { [self] in
+                    if isDirty("progress", profile: profile) { try await pushWatchProgressAll(profile: profile) }
+                    await reconcileProgressDeletesBeforePull(profile: profile)
+                    // Still-pending deletes postpone the progress pull so it
+                    // cannot resurrect them (same rule as refreshContinueWatching).
+                    if loadPendingDeletes(profile: profile).isEmpty {
+                        try await pullWatchProgress(profile: profile)
+                    }
+                },
+                { [self] in
+                    if isDirty("library", profile: profile) { try await pushLibrary(profile: profile) }
+                    await reconcileLibraryDeletesBeforePull(profile: profile)
+                    try await pullLibrary(profile: profile)
+                },
+                { [self] in
+                    if isDirty("watched", profile: profile) { try await pushWatchedItems(profile: profile) }
+                    await reconcileWatchedDeletesBeforePull(profile: profile)
+                    try await pullWatchedItems(profile: profile)
+                }
+            ])
             NSLog("[OrivioSync] light sync ok — %@", reason)
         } catch let change as ProfileChangedMidSync {
             NSLog("[OrivioSync] light sync abandoned — profile switched %d -> %d mid-run",
@@ -796,20 +883,33 @@ final class OrivioSyncManager: ObservableObject {
             return
         }
         guard !isSyncing else {
-            NSLog("[OrivioSync] syncNow skipped — sync already running")
-            OrivioSyncDiagnostics.record(.warning, area: "Orivio", "Sync skipped because another sync is already running.")
+            // Not dropped: the running sync runs once more when it ends, so
+            // whatever prompted this request still goes up promptly.
+            NSLog("[OrivioSync] syncNow deferred — sync already running; will run again after it")
+            rerunRequested = true
             return
         }
         NSLog("[OrivioSync] syncNow starting")
         OrivioSyncDiagnostics.record(.info, area: "Orivio", "Full sync started for profile \(pid).")
         isSyncing = true
         lastSyncError = nil
-        defer { isSyncing = false }
+        libraryGrewDuringSync = false
+        let started = Date()
+        defer {
+            isSyncing = false
+            if rerunRequested {
+                rerunRequested = false
+                Task { [weak self] in await self?.syncNow() }
+            }
+        }
         do {
             // Flush any pending local profile edit FIRST — a just-created
             // profile whose debounced push hasn't landed would otherwise be
             // wiped by the pull's replaceRemote below.
             if profilesDirty { try await pushProfiles() }
+            // Then any deletion: it has its own RPC, and the pull below is
+            // the only thing that retires its tombstone.
+            await drainProfileDeletes()
             // Flush a pending app-preferences push (collections, player/TMDB/
             // theme edits) BEFORE the pulls below, or a re-sync would clobber
             // the not-yet-pushed local edit with the stale server copy.
@@ -826,7 +926,7 @@ final class OrivioSyncManager: ObservableObject {
             // profile's server data into the newly-selected profile's store and
             // then push the result back up under the new profile's id.
             //
-            // The pin is now threaded INTO every step as a parameter as well.
+            // The pin is threaded INTO every step as a parameter as well.
             // Checking between steps left the damaging window wide open INSIDE
             // them: `pullLibrary` issued its request with the old profile id and
             // wrote the response under whatever profile was current when it
@@ -834,42 +934,25 @@ final class OrivioSyncManager: ObservableObject {
             // then built its body from a freshly-read id — sending one profile's
             // items to a replace-semantics RPC under another profile's id.
             let runProfile = pid
+            let firstFullSync = !completedFullSyncProfiles.contains(runProfile)
             repairAccidentalWatchHistoryClearState(profile: runProfile)
-            // Pull first so remote wins on first login, then push the merged
-            // set — but flush a pending add-on edit first. `addonsDirty` exists
-            // for exactly this ("dirty ⇒ push first"), yet only the manual
-            // "Sync Add-ons" button consulted it: a periodic full sync landing
-            // inside the 1.2s debounce would reconcile an add-on you had just
-            // removed back onto the device, and then push it up again.
-            if isDirty("addons", profile: runProfile) { try await pushAddons(profile: runProfile) }
-            try await pullAddons(profile: runProfile)
+
+            // The per-store chains below are independent of one another —
+            // each one flushes its own dirty edits, then its own queued
+            // removals, then pulls its own snapshot — so they run SIDE BY
+            // SIDE. Run one after another, a full sync was forty-odd
+            // sequential round trips (plus a run of metadata lookups inside
+            // two of them), which is the "takes forever to sync" a big
+            // account saw every 30 seconds. Every chain still pins and
+            // re-checks `runProfile`; a switch abandons the whole run.
+            try await runConcurrently([
+                { [self] in try await syncAddonsChain(profile: runProfile) },
+                { [self] in try await syncProgressChain(profile: runProfile) },
+                { [self] in try await syncLibraryChain(profile: runProfile) },
+                { [self] in try await syncWatchedChain(profile: runProfile) },
+                { [self] in try await syncPreferencesChain(profile: runProfile) }
+            ])
             try ensureProfile(runProfile)
-            // Flush local progress edits before pulling. The account pull is a
-            // full snapshot, so pulling first can interpret a just-watched row
-            // as remotely deleted before its upload lands.
-            if progressDirty { try await pushWatchProgressAll(profile: runProfile) }
-            // Flush removals queued in a previous session before pulling, and
-            // tombstone them, so a not-yet-deleted row can't come back here.
-            await reconcileProgressDeletesBeforePull(profile: runProfile)
-            try await pullWatchProgress(profile: runProfile)
-            try ensureProfile(runProfile)
-            await reconcileLibraryDeletesBeforePull(profile: runProfile)
-            try await pullLibrary(profile: runProfile)
-            try ensureProfile(runProfile)
-            // Marks whose debounced push never landed go up BEFORE the pull,
-            // or the reconcile below reads them as deleted elsewhere.
-            if watchedDirty { try await pushWatchedItems(profile: runProfile) }
-            await reconcileWatchedDeletesBeforePull(profile: runProfile)
-            try await pullWatchedItems(profile: runProfile)
-            // Collections ride the tvOS-preferences blob (pullAppPreferences).
-            // The dedicated RPC is best-effort — if the backend lacks it a
-            // throw here must NOT abort the rest of the sync.
-            try ensureProfile(runProfile)
-            try? await pullCollections(profile: runProfile)
-            try await pullHomeCatalogSettings(profile: runProfile)
-            await pullBadgeSettings(profile: runProfile)   // best-effort; badge chips are cosmetic
-            await pullAppPreferences(profile: runProfile)  // player/TMDB/theme prefs + collections
-            await pullProviderCredentials(profile: runProfile)  // debrid keys + Trakt (Android table)
             // Trakt and the player key the same episode differently; collapse
             // any pair that already exists so the hub holds ONE row per episode.
             let collapsed = progressStore.collapseDuplicateEpisodes()
@@ -879,24 +962,56 @@ final class OrivioSyncManager: ObservableObject {
                     "Collapsed \(collapsed.count) duplicate Continue Watching row(s) keyed differently by another source."
                 )
             }
-            // Local repo edits go up before the reconciling pull, or a removal
-            // still inside its debounce is restored and then re-uploaded.
-            if pluginsDirty { try? await pushPlugins(profile: runProfile) }
-            await pullPlugins(profile: runProfile)   // plugin repos (Android table)
             // Last and most important gate: every push below REPLACES the
             // account's copy for `pid`, so one that runs after a switch
             // overwrites the newly-selected profile with this one's data.
             try ensureProfile(runProfile)
-            try await pushProfiles()
-            try await pushAddons(profile: runProfile)
-            try await pushWatchProgressAll(profile: runProfile)
-            try await pushLibrary(profile: runProfile)
-            try await pushWatchedItems(profile: runProfile)
-            try? await pushCollections(profile: runProfile)   // best-effort; see pull note above
-            try await pushHomeCatalogSettings(profile: runProfile)
-            await pushAppPreferences(profile: runProfile)
-            await pushProviderCredentials(profile: runProfile)  // dual-write to the Android table
-            try? await pushPlugins(profile: runProfile)
+            // The first cycle for a profile uploads EVERYTHING (that is how a
+            // device's local data merges into the account); afterwards only
+            // what changed locally, by each store's dirty flag. Every merge
+            // from a tracker marks its store dirty (`requestSyncPush`), so
+            // nothing that used to ride the unconditional tail push is lost.
+            if firstFullSync || profilesDirty { try await pushProfiles() }
+            if firstFullSync || isDirty("addons", profile: runProfile) {
+                try await pushAddons(profile: runProfile)
+            }
+            if firstFullSync || isDirty("progress", profile: runProfile) {
+                try await pushWatchProgressAll(profile: runProfile)
+            }
+            if firstFullSync || isDirty("library", profile: runProfile)
+                || !loadPendingLibraryDeletes(profile: runProfile).isEmpty {
+                try await pushLibrary(profile: runProfile)
+            }
+            if firstFullSync || isDirty("watched", profile: runProfile) {
+                try await pushWatchedItems(profile: runProfile)
+            }
+            // Persist the "the shared library grew" signal into the real
+            // dirty flags before the tail runs. `libraryGrewDuringSync` is
+            // in-memory and reset at the top of every run, and
+            // `mergeIntoLibrary` is idempotent — so if a chain threw after the
+            // merge, the flag was lost and the next run's merge reported no
+            // change. Those collections would never have been uploaded.
+            if libraryGrewDuringSync {
+                collectionsDirty = true
+                homeCatalogDirty = true
+                appPreferencesDirty = true
+            }
+            if firstFullSync || collectionsDirty || libraryGrewDuringSync {
+                try? await pushCollections(profile: runProfile)   // best-effort; see the pull note
+            }
+            if firstFullSync || homeCatalogDirty || libraryGrewDuringSync {
+                try await pushHomeCatalogSettings(profile: runProfile)
+            }
+            if firstFullSync || appPreferencesDirty || libraryGrewDuringSync {
+                await pushAppPreferences(profile: runProfile)
+            }
+            if firstFullSync || providerCredentialsDirty {
+                await pushProviderCredentials(profile: runProfile)  // dual-write to the Android table
+            }
+            if firstFullSync || pluginsDirty { try? await pushPlugins(profile: runProfile) }
+            completedFullSyncProfiles.insert(runProfile)
+            NSLog("[OrivioSync] syncNow finished ok in %.1fs (%@)",
+                  Date().timeIntervalSince(started), firstFullSync ? "first full cycle" : "incremental")
         } catch let change as ProfileChangedMidSync {
             // Not a failure: the user moved to another profile, and that switch
             // schedules its own sync. Abandoning here is the point.
@@ -906,6 +1021,9 @@ final class OrivioSyncManager: ObservableObject {
                 .info, area: "Orivio",
                 "Sync for profile \(change.from) abandoned because the active profile changed to \(change.to); the new profile syncs on its own."
             )
+            // The switch handler is already waiting to run a full sync for
+            // the new profile; a rerun on top of it would be a third one.
+            rerunRequested = false
             return
         } catch {
             // A full-sync failure used to vanish into `lastSyncError` with no
@@ -917,8 +1035,106 @@ final class OrivioSyncManager: ObservableObject {
             OrivioSyncDiagnostics.record(.failure, area: "Orivio", lastSyncError ?? "Sync failed.")
             return
         }
-        NSLog("[OrivioSync] syncNow finished ok")
         OrivioSyncDiagnostics.record(.success, area: "Orivio", "Full sync finished for profile \(pid).")
+    }
+
+    // MARK: Per-store chains (run concurrently by syncNow)
+
+    /// Pull first so remote wins on first login, then push the merged set —
+    /// but flush a pending add-on edit first. `addonsDirty` exists for exactly
+    /// this ("dirty ⇒ push first"): a periodic full sync landing inside the
+    /// 1.2s debounce would otherwise reconcile an add-on you had just removed
+    /// back onto the device, and then push it up again.
+    private func syncAddonsChain(profile: Int) async throws {
+        try ensureProfile(profile)
+        if isDirty("addons", profile: profile) { try await pushAddons(profile: profile) }
+        try await pullAddons(profile: profile)
+    }
+
+    /// Flush local progress edits before pulling (the account pull is a full
+    /// snapshot, so pulling first can read a just-watched row as remotely
+    /// deleted before its upload lands), then flush removals queued in a
+    /// previous session and tombstone them, so a not-yet-deleted row can't
+    /// come back here.
+    private func syncProgressChain(profile: Int) async throws {
+        try ensureProfile(profile)
+        if isDirty("progress", profile: profile) { try await pushWatchProgressAll(profile: profile) }
+        await reconcileProgressDeletesBeforePull(profile: profile)
+        try await pullWatchProgress(profile: profile)
+    }
+
+    private func syncLibraryChain(profile: Int) async throws {
+        try ensureProfile(profile)
+        // Flush local edits BEFORE the pull, and let a failure abort the
+        // chain. `pullLibrary` reconciles — it deletes every local row the
+        // server snapshot lacks — so running it after a push that failed
+        // (expired token, timeout on a large body) deletes the titles the
+        // user just saved, and they were never on the account either.
+        // `reconcileLibraryDeletesBeforePull` swallows its push with `try?`,
+        // which is why this cannot be left to it.
+        if isDirty("library", profile: profile) { try await pushLibrary(profile: profile) }
+        await reconcileLibraryDeletesBeforePull(profile: profile)
+        try await pullLibrary(profile: profile)
+    }
+
+    /// Marks whose debounced push never landed go up BEFORE the pull, or the
+    /// reconcile reads them as deleted elsewhere.
+    private func syncWatchedChain(profile: Int) async throws {
+        try ensureProfile(profile)
+        if isDirty("watched", profile: profile) { try await pushWatchedItems(profile: profile) }
+        await reconcileWatchedDeletesBeforePull(profile: profile)
+        try await pullWatchedItems(profile: profile)
+    }
+
+    /// Collections, the home layout, badges, the app-preferences blob,
+    /// provider credentials and plugin repos. These stay in ONE chain: the
+    /// preferences blob carries the collections library and the layout reads
+    /// it, so their order matters — but nothing in here touches the content
+    /// stores, so the whole chain runs beside them.
+    ///
+    /// Each pull is a full-snapshot replace, so a local edit still sitting in
+    /// its 1.2-1.5s debounce goes up FIRST or the server's stale copy wins
+    /// and the edit is lost (see `collectionsDirty`). The dedicated
+    /// collections RPC is best-effort — if the backend lacks it a throw must
+    /// NOT abort the rest.
+    private func syncPreferencesChain(profile: Int) async throws {
+        try ensureProfile(profile)
+        if collectionsDirty { try? await pushCollections(profile: profile) }
+        try? await pullCollections(profile: profile)
+        if homeCatalogDirty { try? await pushHomeCatalogSettings(profile: profile) }
+        try await pullHomeCatalogSettings(profile: profile)
+        if badgeSettingsDirty { await pushBadgeSettings(profile: profile) }
+        await pullBadgeSettingsIfDue(profile: profile)   // best-effort; badge chips are cosmetic
+        if appPreferencesDirty { await pushAppPreferences(profile: profile) }
+        await pullAppPreferences(profile: profile)  // player/TMDB/theme prefs + collections
+        if providerCredentialsDirty { await pushProviderCredentials(profile: profile) }
+        await pullProviderCredentials(profile: profile)  // debrid keys + Trakt (Android table)
+        // Local repo edits go up before the reconciling pull, or a removal
+        // still inside its debounce is restored and then re-uploaded.
+        if pluginsDirty { try? await pushPlugins(profile: profile) }
+        await pullPlugins(profile: profile)   // plugin repos (Android table)
+    }
+
+    /// Run independent chains at once and wait for ALL of them. One chain
+    /// failing does not cancel the others — each leaves its own store
+    /// consistent and its dirty flags set when it fails, so the next run
+    /// retries just that part. A profile switch is reported ahead of any
+    /// other error, because it means the run is being abandoned on purpose.
+    private func runConcurrently(_ chains: [@MainActor @Sendable () async throws -> Void]) async throws {
+        let errors: [Error] = await withTaskGroup(of: Error?.self) { group in
+            for chain in chains {
+                group.addTask { @MainActor in
+                    do { try await chain(); return nil } catch { return error }
+                }
+            }
+            var collected: [Error] = []
+            for await error in group {
+                if let error { collected.append(error) }
+            }
+            return collected
+        }
+        if let change = errors.first(where: { $0 is ProfileChangedMidSync }) { throw change }
+        if let first = errors.first { throw first }
     }
 
     func pullAccountUpdates() async {
@@ -960,6 +1176,10 @@ final class OrivioSyncManager: ObservableObject {
         tmdbSettings?.setProfile(id)
         themeManager?.setProfile(id)
         streamBadges?.setProfile(id)
+        // Was missing: favorites relied solely on the app-level profile
+        // closure, so any rescope driven from HERE applied one profile's
+        // account blob into another profile's favourites store.
+        LiveChannelFavorites.shared.setProfile(id)
     }
 
     // MARK: - Addons
@@ -1063,30 +1283,49 @@ final class OrivioSyncManager: ObservableObject {
         let path = "/rest/v1/addons?user_id=eq.\(userID)&profile_id=eq.\(addonPID(for: profile))&select=url,sort_order,enabled,name"
         let data = try await authedGet(path)
         let rows = try JSONDecoder().decode([SupabaseAddon].self, from: data)
+        // The response is for `profile`; refuse to apply it under another one.
+        try ensureProfile(profile)
+        let localEditPending = isDirty("addons", profile: profile)
         let orderedAddons = rows.sorted { $0.sortOrder < $1.sortOrder }.map {
-            AddonManager.RemoteAddonState(manifestURL: $0.url, enabled: $0.enabled)
+            AddonManager.RemoteAddonState(
+                manifestURL: $0.url,
+                enabled: $0.enabled,
+                enabledIsAuthoritative: !localEditPending
+            )
         }
         // This account's own list has now been read, so a push may run.
         pulledAddonProfiles.insert(profile)
         NSLog("[OrivioAddonSync] pullAddons: %d rows for user %@", rows.count, userID)
 
+        // A local edit is waiting on its push, so this snapshot predates it —
+        // applying it at all is wrong, not just the enabled/reconcile parts.
+        // The additive install path used to run anyway, and the snapshot still
+        // lists the add-on the user JUST removed: the pull re-installed it,
+        // and the debounced push then uploaded the resurrected list, undoing
+        // the removal for good. The dirty push goes first on the next cycle
+        // (`syncAddonsChain`), and the pull after it applies a snapshot that
+        // reflects the edit — new add-ons from other devices land then.
+        if localEditPending {
+            NSLog("[OrivioAddonSync] pullAddons: skipped applying — a local add-on edit is awaiting its push")
+            return
+        }
+
         // Same seeded policy library/watched use. Reconciling (deleting local
         // add-ons the account doesn't list) is only correct once we know the
         // account genuinely represents this profile's add-ons — otherwise a
         // first sign-in against a fresh account would wipe the device.
-        // The response is for `profile`; refuse to apply it under another one.
-        try ensureProfile(profile)
         let seeded = isSeeded("addons", profile: profile)
+        let mayReconcile = seeded && !localEditPending
         if orderedAddons.isEmpty {
             // Empty account list: only a real "removed everything elsewhere"
-            // when seeded. Unseeded + empty = fresh account; keep local and let
-            // the push upload it.
-            guard seeded else { return }
+            // when seeded and no local edit is waiting. Unseeded + empty = fresh
+            // account; dirty + empty = stale pull racing a local edit.
+            guard mayReconcile else { return }
             await addonManager.applyRemote(urls: [], reconcile: true)
             return
         }
-        await addonManager.applyRemote(addons: orderedAddons, reconcile: seeded)
-        setSeeded("addons", profile: profile)
+        await addonManager.applyRemote(addons: orderedAddons, reconcile: mayReconcile)
+        if !localEditPending { setSeeded("addons", profile: profile) }
     }
 
     // MARK: - Watch progress
@@ -1117,6 +1356,12 @@ final class OrivioSyncManager: ObservableObject {
         guard account.accessToken != nil else { return }
         Task { [weak self] in
             guard let self else { return }
+            // The 30s Home poll and the 30s auto-sync tick run on separate
+            // timers, and this method pulls the library as well — so on Home
+            // the account was being pulled roughly twice per window, with the
+            // two runs overlapping in `libraryStore.mergeRemote`. Every other
+            // entry point has this guard; this one didn't.
+            guard !self.isSyncing, !self.isRetiringAccountState else { return }
             // Pinned exactly like syncNow: this is a miniature sync, and the
             // profile can change between any two of these awaits.
             let profile = self.pid
@@ -1195,13 +1440,15 @@ final class OrivioSyncManager: ObservableObject {
 
     /// Queue a Continue Watching removal for durable server deletion. Persists
     /// immediately (survives offline / relaunch) and kicks a drain.
-    private func deleteWatchProgress(keys: [String]) {
+    /// - Parameter profile: the profile the removal belongs to. The store
+    ///   callback passes nothing (the removal happened on the profile that is
+    ///   active NOW); a caller that has already suspended passes its pin.
+    private func deleteWatchProgress(keys: [String], profile explicitProfile: Int? = nil) {
         let trimmed = keys.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         guard !trimmed.isEmpty else { return }
-        // The removal happened on the profile that is active NOW; queue and
-        // drain it under that id rather than whichever one the drain's response
-        // happens to land under.
-        let profile = pid
+        // Queue and drain under that id rather than whichever one the drain's
+        // response happens to land under.
+        let profile = explicitProfile ?? pid
         var pending = loadPendingDeletes(profile: profile)
         pending.formUnion(trimmed)
         savePendingDeletes(pending, profile: profile)
@@ -1428,11 +1675,19 @@ final class OrivioSyncManager: ObservableObject {
             loggedWatchProgressColumns = true
             NSLog("[OrivioSync] watch_progress columns: %@", first.keys.sorted().joined(separator: ","))
         }
-        let rows = try JSONDecoder().decode([SupabaseWatchProgress].self, from: data)
+        // Decoded OFF the main actor, like the collections pull: thousands of
+        // rows every 30s (90s during playback) on @MainActor was the periodic
+        // focus/scroll stutter for signed-in accounts.
+        let rows = try await Task.detached(priority: .utility) {
+            try JSONDecoder().decode([SupabaseWatchProgress].self, from: data)
+        }.value
+        try ensureProfile(profile)
         let seeded = isSeeded("progress", profile: profile)
         if rows.isEmpty && !seeded {
             // Fresh account: keep local app/Stremio/Trakt rows and let the
             // following push upload them instead of treating empty as deletion.
+            // (Nothing to converge either: no rows means no removed show can
+            // still be sitting on the account.)
             return
         }
         // NB: after the first successful non-empty sync, an empty result is a
@@ -1468,6 +1723,20 @@ final class OrivioSyncManager: ObservableObject {
         // itself already deletes the account rows (clearWatchHistoryEverywhere),
         // so nothing here needs to re-litigate it. The horizon still filters
         // TRAKT re-imports, which is what it was built for.
+        // Rows for a show the user REMOVED here (and has not watched since)
+        // are still on the account — the delete lost a race with a push, was
+        // rejected, or the row is keyed the way another client keys it. The
+        // store would refuse them, but hiding them locally is not enough:
+        // queue their keys for deletion so the account converges and every
+        // other device drops the card too. Dropped from this snapshot so
+        // they cost no metadata lookups.
+        let blocked = Set(progressStore.remoteKeysBlockedByRemoval(pulled))
+        if !blocked.isEmpty {
+            pulled.removeAll { blocked.contains($0.id) }
+            NSLog("[OrivioCWSync] pullWatchProgress: %d row(s) belong to removed shows — queued for deletion",
+                  blocked.count)
+            deleteWatchProgress(keys: Array(blocked), profile: profile)
+        }
         // Metadata enrichment is a run of network calls; the store write after
         // it must still be going to the profile these rows came from.
         pulled = await enrichMetadata(pulled)
@@ -1490,10 +1759,10 @@ final class OrivioSyncManager: ObservableObject {
     private func enrichRawContinueWatchingTitles(profile: Int) async {
         guard pid == profile else { return }
         let raw = progressStore.continueWatching(sortMode: .recentlyWatched)
-            .filter { isRawSyncTitle($0.name, id: $0.metaID) }
+            .filter { Self.isRawSyncTitle($0.name, id: $0.metaID) }
         guard !raw.isEmpty else { return }
         let enriched = await enrichMetadata(raw)
-            .filter { !isRawSyncTitle($0.name, id: $0.metaID) }
+            .filter { !Self.isRawSyncTitle($0.name, id: $0.metaID) }
         // Rows read from one profile's store, written back after a run of meta
         // fetches — the write has to land in the store they came from.
         guard !enriched.isEmpty, pid == profile else { return }
@@ -1522,11 +1791,11 @@ final class OrivioSyncManager: ObservableObject {
         // screen; only genuinely new rows (added on another device) enrich.
         // Their name/art then flows through mergeRemote's local-field coalesce.
         let localNamed = Set(progressStore.items.values
-            .filter { !isRawSyncTitle($0.name, id: $0.metaID) }
+            .filter { !Self.isRawSyncTitle($0.name, id: $0.metaID) }
             .map(\.metaID))
         // Raw-title rows resolve unconditionally so no card shows a bare "tt…".
         let rawTitleTokens = visible
-            .filter { isRawSyncTitle($0.name, id: $0.metaID) }
+            .filter { Self.isRawSyncTitle($0.name, id: $0.metaID) }
             .map { "\($0.metaID)|\($0.type)" }
         // Artwork-only backfill for already-titled rows is what the setting gates.
         let missingLocalTokens = enrichArtwork
@@ -1535,13 +1804,17 @@ final class OrivioSyncManager: ObservableObject {
                 .map { "\($0.metaID)|\($0.type)" }
             : []
         let ids = Array(NSOrderedSet(array: rawTitleTokens + missingLocalTokens).compactMap { $0 as? String }).prefix(30)
-        var metaByID: [String: MetaItem] = [:]
-        for token in ids {
+        let requests: [(id: String, type: String)] = ids.compactMap { token in
             let parts = token.split(separator: "|", maxSplits: 1).map(String.init)
-            guard parts.count == 2 else { continue }
-            if let meta = await resolveSyncMetadata(id: parts[0], type: parts[1]) {
-                metaByID[parts[0]] = meta
-            }
+            guard parts.count == 2 else { return nil }
+            return (parts[0], parts[1])
+        }
+        // A few lookups at a time instead of thirty in series — this ran
+        // inside every progress pull, so it set the pace of the whole sync.
+        let metas = await resolveSyncMetadata(requests)
+        var metaByID: [String: MetaItem] = [:]
+        for (request, meta) in zip(requests, metas) {
+            if let meta { metaByID[request.id] = meta }
         }
         guard !metaByID.isEmpty else { return entries }
         return entries.map { wp in
@@ -1566,7 +1839,7 @@ final class OrivioSyncManager: ObservableObject {
                 streamSignature: wp.streamSignature,
                 updatedAt: wp.updatedAt,
                 syncSource: wp.syncSource,
-                hasNewEpisode: wp.hasNewEpisode
+                newEpisodeCount: wp.newEpisodeCount
             )
         }
     }
@@ -1698,14 +1971,14 @@ final class OrivioSyncManager: ObservableObject {
         }
     }
 
-    private func metadataTypes(for type: String, id: String) -> [String] {
+    private nonisolated static func metadataTypes(for type: String, id: String) -> [String] {
         let normalized = type.lowercased()
         let preferred = ["series", "tv", "show", "tvshow"].contains(normalized) ? "series" : "movie"
         guard id.hasPrefix("tt") else { return [preferred] }
         return preferred == "series" ? ["series", "movie"] : ["movie", "series"]
     }
 
-    private func isRawSyncTitle(_ title: String, id: String) -> Bool {
+    private nonisolated static func isRawSyncTitle(_ title: String, id: String) -> Bool {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return true }
         if trimmed == id { return true }
@@ -1713,14 +1986,13 @@ final class OrivioSyncManager: ObservableObject {
         return false
     }
 
-    private func isUsefulMetadata(_ meta: MetaItem, for id: String) -> Bool {
+    private nonisolated static func isUsefulMetadata(_ meta: MetaItem, for id: String) -> Bool {
         (!meta.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && meta.name != id)
         || meta.poster != nil
         || meta.background != nil
     }
 
-    private func resolveSyncMetadata(id: String, type: String) async -> MetaItem? {
-        let cinemeta = AddonManager.bundledCinemeta()
+    private nonisolated static func resolveSyncMetadata(cinemeta: InstalledAddon, id: String, type: String) async -> MetaItem? {
         for lookupType in metadataTypes(for: type, id: id) {
             if let meta = try? await StremioAPI.meta(addon: cinemeta, type: lookupType, id: id),
                isUsefulMetadata(meta, for: id) {
@@ -1730,22 +2002,44 @@ final class OrivioSyncManager: ObservableObject {
         return nil
     }
 
+    /// Cinemeta lookups for a batch, a few at a time, results in input order.
+    /// Bounded so a big backlog can't fan out into dozens of simultaneous
+    /// requests on an Apple TV HD — but no longer one after another, which
+    /// was most of what a sync spent its time on.
+    private func resolveSyncMetadata(_ requests: [(id: String, type: String)]) async -> [MetaItem?] {
+        guard !requests.isEmpty else { return [] }
+        let cinemeta = AddonManager.bundledCinemeta()
+        let limit = PerformanceProfile.isLowPower ? 2 : 4
+        return await boundedConcurrentMap(requests, limit: limit) { request in
+            await Self.resolveSyncMetadata(cinemeta: cinemeta, id: request.id, type: request.type)
+        }
+    }
+
+    /// Library keys whose ARTWORK backfill has already been attempted this
+    /// session. An item Cinemeta has no art for was looked up again on every
+    /// push and pull — thirty round trips per sync, forever. Titles still
+    /// showing a raw id are exempt (a real title matters more than a
+    /// repeat lookup).
+    private var artworkBackfillAttempted: Set<String> = []
+
     private func enrichLibraryMetadata(_ items: [SavedLibraryItem]) async -> [SavedLibraryItem] {
         if Self.playbackActive { return items }   // see enrichMetadata
-        let rawTitleItems = items.filter { isRawSyncTitle($0.name, id: $0.id) }
+        let rawTitleItems = items.filter { Self.isRawSyncTitle($0.name, id: $0.id) }
         let rawTitleKeys = Set(rawTitleItems.map(\.key))
         let artworkItems = items.filter { item in
-            !rawTitleKeys.contains(item.key) && (item.poster == nil || item.background == nil)
+            !rawTitleKeys.contains(item.key)
+                && (item.poster == nil || item.background == nil)
+                && !artworkBackfillAttempted.contains(item.key)
         }
-        let candidates = rawTitleItems + Array(artworkItems.prefix(30))
+        var seen = Set<String>()
+        let candidates = (rawTitleItems + Array(artworkItems.prefix(30))).filter { seen.insert($0.key).inserted }
         guard !candidates.isEmpty else { return items }
+        artworkBackfillAttempted.formUnion(artworkItems.prefix(30).map(\.key))
 
+        let metas = await resolveSyncMetadata(candidates.map { (id: $0.id, type: $0.type) })
         var metaByKey: [String: MetaItem] = [:]
-        for item in candidates {
-            guard metaByKey[item.key] == nil else { continue }
-            if let meta = await resolveSyncMetadata(id: item.id, type: item.type) {
-                metaByKey[item.key] = meta
-            }
+        for (item, meta) in zip(candidates, metas) {
+            if let meta { metaByKey[item.key] = meta }
         }
         guard !metaByKey.isEmpty else { return items }
         return items.map { item in
@@ -1784,34 +2078,41 @@ final class OrivioSyncManager: ObservableObject {
         // was missing.
         guard !items.isEmpty || pulledLibraryProfiles.contains(profile) || !pendingDeletes.isEmpty
         else { return }
-        let entries: [[String: Any]] = items.compactMap { item in
-            guard let addedAt = Self.epochMilliseconds(item.addedAt) else { return nil }
-            var obj: [String: Any] = [
-                "content_id": item.id,
-                "content_type": item.type,
-                "name": item.name,
-                "title": item.name,
-                "poster_shape": item.posterShape,
-                "genres": item.genres,
-                "added_at": addedAt
+        // Built AND serialized off the main actor: a Trakt-watchlist-sized
+        // library is thousands of dictionary rows, and this ran on @MainActor
+        // every push tick.
+        let clientID = self.clientID
+        let payload = try await Task.detached(priority: .utility) {
+            let entries: [[String: Any]] = items.compactMap { item in
+                guard let addedAt = Self.epochMilliseconds(item.addedAt) else { return nil }
+                var obj: [String: Any] = [
+                    "content_id": item.id,
+                    "content_type": item.type,
+                    "name": item.name,
+                    "title": item.name,
+                    "poster_shape": item.posterShape,
+                    "genres": item.genres,
+                    "added_at": addedAt
+                ]
+                if let poster = item.poster { obj["poster"] = poster }
+                if let background = item.background { obj["background"] = background }
+                if let description = item.description { obj["description"] = description }
+                if let releaseInfo = item.releaseInfo { obj["release_info"] = releaseInfo }
+                if let rating = item.imdbRating { obj["imdb_rating"] = rating }
+                if let base = item.addonBaseURL { obj["addon_base_url"] = base }
+                return obj
+            }
+            let body: [String: Any] = [
+                "p_items": entries,
+                "p_profile_id": profile,
+                "p_origin_client_id": clientID
             ]
-            if let poster = item.poster { obj["poster"] = poster }
-            if let background = item.background { obj["background"] = background }
-            if let description = item.description { obj["description"] = description }
-            if let releaseInfo = item.releaseInfo { obj["release_info"] = releaseInfo }
-            if let rating = item.imdbRating { obj["imdb_rating"] = rating }
-            if let base = item.addonBaseURL { obj["addon_base_url"] = base }
-            return obj
-        }
-        let body: [String: Any] = [
-            "p_items": entries,
-            "p_profile_id": profile,
-            "p_origin_client_id": clientID
-        ]
+            return try JSONSerialization.data(withJSONObject: body)
+        }.value
         // Last gate before a replace: the id in the body and the id the store
         // was read from are the same `profile`, and it is still the live one.
         try ensureProfile(profile)
-        _ = try await authedPost(RPC.url(RPC.pushLibrary), body: body)
+        _ = try await authedPost(RPC.url(RPC.pushLibrary), payload: payload)
         let accountDeleteKeys = pendingDeletes.union(staleAlternateLibraryDeleteKeys(for: items))
         try await deleteLibraryItems(keys: accountDeleteKeys, profile: profile)
         // The push landed, so the account now holds exactly `items` — every
@@ -1845,25 +2146,34 @@ final class OrivioSyncManager: ObservableObject {
                 body: ["p_profile_id": profile, "p_limit": pageSize, "p_offset": offset]
             )
             try ensureProfile(profile)
-            let page = try JSONDecoder().decode([SupabaseLibraryItem].self, from: data)
-            let pageItems = page.map { row in
-                SavedLibraryItem(
-                    id: row.contentID,
-                    type: row.contentType,
-                    name: row.name,
-                    poster: row.poster,
-                    posterShape: row.posterShape,
-                    background: row.background,
-                    description: row.description,
-                    releaseInfo: row.releaseInfo,
-                    imdbRating: row.imdbRating,
-                    genres: row.genres,
-                    addonBaseURL: row.addonBaseURL,
-                    addedAt: Date(timeIntervalSince1970: Double(row.addedAt) / 1000.0)
-                )
-            }
+            // Off-main decode: 500-row pages of nested JSON on @MainActor
+            // stalled the UI on every library pull.
+            // Map inside the same detached hop as the decode — the struct
+            // construction over a 500-row page is main-actor work the sync
+            // tick doesn't need.
+            let (pageItems, rowCount) = try await Task.detached(priority: .utility) {
+                let page = try JSONDecoder().decode([SupabaseLibraryItem].self, from: data)
+                let mapped = page.map { row in
+                    SavedLibraryItem(
+                        id: row.contentID,
+                        type: row.contentType,
+                        name: row.name,
+                        poster: row.poster,
+                        posterShape: row.posterShape,
+                        background: row.background,
+                        description: row.description,
+                        releaseInfo: row.releaseInfo,
+                        imdbRating: row.imdbRating,
+                        genres: row.genres,
+                        addonBaseURL: row.addonBaseURL,
+                        addedAt: Date(timeIntervalSince1970: Double(row.addedAt) / 1000.0)
+                    )
+                }
+                return (mapped, page.count)
+            }.value
+            try ensureProfile(profile)
             collected.append(contentsOf: await enrichLibraryMetadata(pageItems))
-            if page.count < pageSize { break }
+            if rowCount < pageSize { break }
             offset += pageSize
         }
         // The enrichment inside the loop suspends too, so re-check before any
@@ -2014,26 +2324,33 @@ final class OrivioSyncManager: ObservableObject {
         // Nothing to push means nothing left unpushed (removals travel by the
         // delete queue): clear the flag or it could never clear again.
         guard !items.isEmpty else { setDirty("watched", profile: profile, false); return }
-        let entries: [[String: Any]] = items.compactMap { item in
-            guard let watchedAt = Self.epochMilliseconds(item.watchedAt) else { return nil }
-            var obj: [String: Any] = [
-                "content_id": item.contentID,
-                "content_type": item.contentType,
-                "title": item.title,
-                "watched_at": watchedAt,
-                "season": item.season as Any,
-                "episode": item.episode as Any
+        // Built AND serialized off the main actor — watched history reaches
+        // Trakt-import scale (thousands of rows) and this ran on @MainActor.
+        let clientID = self.clientID
+        let payload = try await Task.detached(priority: .utility) {
+            let entries: [[String: Any]] = items.compactMap { item in
+                guard let watchedAt = Self.epochMilliseconds(item.watchedAt) else { return nil }
+                var obj: [String: Any] = [
+                    "content_id": item.contentID,
+                    "content_type": item.contentType,
+                    "title": item.title,
+                    "watched_at": watchedAt,
+                    "season": item.season as Any,
+                    "episode": item.episode as Any
+                ]
+                if item.season == nil { obj["season"] = NSNull() }
+                if item.episode == nil { obj["episode"] = NSNull() }
+                return obj
+            }
+            let body: [String: Any] = [
+                "p_items": entries,
+                "p_profile_id": profile,
+                "p_origin_client_id": clientID
             ]
-            if item.season == nil { obj["season"] = NSNull() }
-            if item.episode == nil { obj["episode"] = NSNull() }
-            return obj
-        }
-        let body: [String: Any] = [
-            "p_items": entries,
-            "p_profile_id": profile,
-            "p_origin_client_id": clientID
-        ]
-        _ = try await authedPost(RPC.url(RPC.pushWatchedItems), body: body)
+            return try JSONSerialization.data(withJSONObject: body)
+        }.value
+        try ensureProfile(profile)
+        _ = try await authedPost(RPC.url(RPC.pushWatchedItems), payload: payload)
         setSeeded("watched", profile: profile)   // items is non-empty (guarded above)
         setDirty("watched", profile: profile, false)
     }
@@ -2052,18 +2369,29 @@ final class OrivioSyncManager: ObservableObject {
                 body: ["p_profile_id": profile, "p_page": page, "p_page_size": pageSize]
             )
             try ensureProfile(profile)
-            let rows = try JSONDecoder().decode([SupabaseWatchedItem].self, from: data)
-            collected.append(contentsOf: rows.map { row in
-                WatchedItem(
-                    contentID: row.contentID,
-                    contentType: row.contentType,
-                    title: row.title,
-                    season: row.season,
-                    episode: row.episode,
-                    watchedAt: Date(timeIntervalSince1970: Double(row.watchedAt) / 1000.0)
-                )
-            })
-            if rows.count < pageSize { break }
+            // Off-main decode: watched history reaches Trakt-import scale
+            // (900-row pages, thousands of rows) and was parsed on @MainActor
+            // every sync tick.
+            // Map inside the same detached hop as the decode: thousands of
+            // struct constructions per 900-row page were landing back on the
+            // main actor every sync tick.
+            let (mapped, rowCount) = try await Task.detached(priority: .utility) {
+                let rows = try JSONDecoder().decode([SupabaseWatchedItem].self, from: data)
+                let mapped = rows.map { row in
+                    WatchedItem(
+                        contentID: row.contentID,
+                        contentType: row.contentType,
+                        title: row.title,
+                        season: row.season,
+                        episode: row.episode,
+                        watchedAt: Date(timeIntervalSince1970: Double(row.watchedAt) / 1000.0)
+                    )
+                }
+                return (mapped, rows.count)
+            }.value
+            try ensureProfile(profile)
+            collected.append(contentsOf: mapped)
+            if rowCount < pageSize { break }
             page += 1
         }
         if collected.isEmpty {
@@ -2100,7 +2428,19 @@ final class OrivioSyncManager: ObservableObject {
         }
     }
 
-    private func pushProfiles() async throws {
+    func syncProfilesNow() {
+        guard !isRetiringAccountState else { return }
+        profilesDirty = true
+        pushProfilesTask?.cancel()
+        fullSyncTask?.cancel()
+        fullSyncTask = Task { [weak self] in
+            await self?.syncNow()
+        }
+    }
+
+    /// - Parameter legacyDeletedIDs: only from `drainProfileDeletes`, on a
+    ///   deployment without the dedicated delete RPC.
+    private func pushProfiles(legacyDeletedIDs: [Int] = []) async throws {
         guard account.accessToken != nil else { return }
         let profiles = profileStore.allForSync()
         guard !profiles.isEmpty else { return }
@@ -2116,19 +2456,83 @@ final class OrivioSyncManager: ObservableObject {
             obj["avatar_url"] = p.avatarURL ?? NSNull()
             return obj
         }
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "p_client_max_profiles": ProfileStore.maxProfiles,
             "p_profiles": entries,
             "p_origin_client_id": clientID
         ]
+        // Deletions do NOT ride this push any more. The RPC upserts the rows
+        // it is given and ignores what is missing, and a deployment without
+        // the `p_deleted_profile_ids` hint refused the whole call — so every
+        // profile push with a pending deletion was a 404 and a retry, and the
+        // deletion itself never happened. See `drainProfileDeletes`.
+        if !legacyDeletedIDs.isEmpty {
+            body["p_deleted_profile_ids"] = legacyDeletedIDs
+        }
         _ = try await authedPost(RPC.url(RPC.pushProfiles), body: body)
         profilesDirty = false   // only clear once the account actually has them
+    }
+
+    /// Send every profile deletion this device still owes the account, via
+    /// `sync_delete_profile_data` — the same call the Android app makes. The
+    /// tombstone in `ProfileStore` outlives this: only a pull that no longer
+    /// lists the id retires it (`confirmProfileDeletions`), so a deletion the
+    /// server has not accepted keeps being retried and keeps the profile out
+    /// of the local list meanwhile.
+    ///
+    /// Deleting a profile used to be a local-only act. Its push carried a
+    /// `p_deleted_profile_ids` hint the backend does not know, the push
+    /// therefore failed and was retried without it, and nothing ever told the
+    /// account to drop the row — so the next pull after a relaunch (when the
+    /// in-memory tombstone was gone) put the profile straight back.
+    private func drainProfileDeletes() async {
+        let pending = profileStore.deletedProfileIDs
+        guard !pending.isEmpty, account.accessToken != nil else { return }
+        if profileDeleteRPCMissing {
+            // No dedicated RPC on this deployment: the legacy hint on the
+            // profile push is the only remaining way to say it.
+            guard !legacyProfileDeleteHintMissing else { return }
+            do {
+                try await pushProfiles(legacyDeletedIDs: pending.sorted())
+            } catch {
+                if ignoresMissingRPC(error) { legacyProfileDeleteHintMissing = true }
+                NSLog("[OrivioSync] legacy profile-deletion hint failed: %@", String(describing: error))
+            }
+            return
+        }
+        for id in pending.sorted() {
+            do {
+                _ = try await authedPost(RPC.url(RPC.deleteProfileData), body: ["p_profile_id": id])
+                NSLog("[OrivioSync] deleted profile %d on the account", id)
+                OrivioSyncDiagnostics.record(.info, area: "Orivio", "Deleted profile \(id) on the account.")
+            } catch {
+                if ignoresMissingRPC(error) {
+                    profileDeleteRPCMissing = true
+                    OrivioSyncDiagnostics.record(
+                        .warning, area: "Orivio",
+                        "This account has no profile-delete RPC; falling back to the profile push."
+                    )
+                    await drainProfileDeletes()
+                    return
+                }
+                // Transport or auth trouble: the tombstone stays, the next
+                // sync retries.
+                NSLog("[OrivioSync] profile %d delete failed (retried next sync): %@", id, String(describing: error))
+                OrivioSyncDiagnostics.record(
+                    .warning, area: "Orivio",
+                    "Couldn't delete profile \(id) on the account yet (\(describe(error))); it will be retried."
+                )
+            }
+        }
     }
 
     private func pullProfiles() async throws {
         guard account.accessToken != nil else { return }
         let data = try await authedPost(RPC.url(RPC.pullProfiles), body: [:])
         let rows = try JSONDecoder().decode([SupabaseProfile].self, from: data)
+        // Retire the tombstone for any locally-deleted profile the account no
+        // longer reports — that pull is the only proof the delete landed.
+        profileStore.confirmProfileDeletions(remoteIDs: Set(rows.map(\.profileIndex)))
         if !rows.isEmpty {
             profileStore.replaceRemote(rows.map { row in
                 UserProfile(
@@ -2189,11 +2593,27 @@ final class OrivioSyncManager: ObservableObject {
 
     // MARK: - Collections
 
+    /// A local edit is waiting on its debounced push.
+    ///
+    /// Same rule as `profilesDirty` / `addonsDirty` / `libraryDirty`, and it
+    /// was missing here: these four stores each push on a 1.2-1.5s debounce
+    /// and each PULL is a full-snapshot replace, so any sync that landed
+    /// inside that window read the server's stale copy over the edit the user
+    /// had just made — a deleted collection reappearing, a layout change
+    /// reverting, a debrid key coming back — and then pushed the reverted
+    /// state up as the new truth. `syncNow` now flushes each of these before
+    /// the matching pull.
+    private var collectionsDirty = false
+    private var homeCatalogDirty = false
+    private var badgeSettingsDirty = false
+    private var providerCredentialsDirty = false
+
     private func scheduleCollectionsPush() {
         // Never while the previous account's state is being retired: the
         // store callbacks that retirement fires would arm a push of account A's
         // data into account B. See `isRetiringAccountState`.
         guard !isRetiringAccountState else { return }
+        collectionsDirty = true
         pushCollectionsTask?.cancel()
         pushCollectionsTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -2206,14 +2626,26 @@ final class OrivioSyncManager: ObservableObject {
         guard account.accessToken != nil else { return }
         try ensureProfile(profile)
         // The RPC replaces the whole blob; ship the JSON array as-is.
-        let json = collectionsStore.exportJSON()
-        let collectionsValue = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) ?? []
+        // Encode + re-parse OFF the main actor: this is the same ~700 KB /
+        // hundreds-of-folders blob whose synchronous main-thread DECODE froze
+        // the 4K gen 1 (see CollectionsStore.load()) — the encode side was
+        // still paying two full main-actor passes per push.
+        let snapshot = collectionsStore.librarySnapshotForSync
+        let collectionsValue: Any = await Task.detached(priority: .utility) {
+            guard !snapshot.isEmpty,
+                  let data = try? JSONEncoder().encode(snapshot),
+                  let obj = try? JSONSerialization.jsonObject(with: data) else { return [Any]() }
+            return obj
+        }.value
+        // The encode suspended; the blob belongs to `profile`.
+        try ensureProfile(profile)
         let body: [String: Any] = [
             "p_profile_id": profile,
             "p_collections_json": collectionsValue,
             "p_origin_client_id": clientID
         ]
         _ = try await authedPost(RPC.url(RPC.pushCollections), body: body)
+        collectionsDirty = false   // only once the account actually has them
         NSLog("[OrivioCollections] pushed %d collections to the shared table (p%d)",
               (collectionsValue as? [Any])?.count ?? 0, profile)
     }
@@ -2272,10 +2704,16 @@ final class OrivioSyncManager: ObservableObject {
         // abandoned, and the migration must stay pending so the next sync
         // retries it rather than being marked done having applied nothing.
         try ensureProfile(profile)
+        // A local edit is sitting un-flushed (its push failed, or it landed
+        // while this request was in flight): merging now would replace the
+        // edited copy with the account's stale one — the pull-clobber class.
+        // Leave the adoption pending; the next sync retries after the flush.
+        guard !collectionsDirty else { return }
         // The scan completed: record it now, on the success path only.
         adoptedAllProfileCollections = true
         guard !adopted.isEmpty else { return }
         let changed = collectionsStore.mergeIntoLibrary(adopted)
+        if changed { libraryGrewDuringSync = true }
         NSLog("[OrivioCollections] shared library now %d collections (changed=%@)",
               collectionsStore.library.count, changed ? "yes" : "no")
     }
@@ -2295,7 +2733,12 @@ final class OrivioSyncManager: ObservableObject {
         }.value
         guard let decoded, !decoded.isEmpty else { return }
         try ensureProfile(profile)
-        collectionsStore.mergeIntoLibrary(decoded)
+        // Same dirty guard as pullPlugins/pullAppPreferences: an edit whose
+        // debounced push has not landed (or failed — the RPC is best-effort
+        // and absent on the shared backend) must not be replaced by the
+        // account's older copy, which the ID-keyed merge would let win.
+        guard !collectionsDirty else { return }
+        if collectionsStore.mergeIntoLibrary(decoded) { libraryGrewDuringSync = true }
     }
 
     // MARK: - Home catalog settings
@@ -2305,6 +2748,7 @@ final class OrivioSyncManager: ObservableObject {
         // store callbacks that retirement fires would arm a push of account A's
         // data into account B. See `isRetiringAccountState`.
         guard !isRetiringAccountState else { return }
+        homeCatalogDirty = true
         pushHomeCatalogTask?.cancel()
         pushHomeCatalogTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -2345,6 +2789,7 @@ final class OrivioSyncManager: ObservableObject {
         // `profile`'s row; the write has to go back to the same one.
         try ensureProfile(profile)
         _ = try await authedPost(RPC.url(RPC.pushHomeCatalogSettings), body: body)
+        homeCatalogDirty = false   // only once the account actually has them
     }
 
     private func pullHomeCatalogSettings(profile: Int) async throws {
@@ -2462,17 +2907,32 @@ final class OrivioSyncManager: ObservableObject {
         guard pid == profile else { return "Profile changed" }
         // Collect EVERY platform blob that carries a badge config, so the user
         // can pick between badge profiles instead of silently taking the first.
+        // The six platform reads go out together — in series they were a
+        // noticeable slice of every full sync.
+        let blobs: [(platform: String, data: Data)] = await withTaskGroup(of: (Int, Data?).self) { group in
+            for (index, platform) in Self.settingsBlobPlatforms.enumerated() {
+                group.addTask { @MainActor [weak self] in
+                    guard let self else { return (index, nil) }
+                    let data = try? await self.authedPost(
+                        RPC.url(RPC.pullProfileSettingsBlob),
+                        body: ["p_profile_id": profile, "p_platform": platform]
+                    )
+                    return (index, data)
+                }
+            }
+            var results = [Data?](repeating: nil, count: Self.settingsBlobPlatforms.count)
+            for await (index, data) in group { results[index] = data }
+            return zip(Self.settingsBlobPlatforms, results).compactMap { platform, data in
+                data.map { (platform, $0) }
+            }
+        }
+        // Bail if the profile moved while the reads were out rather than
+        // mixing another profile's badge packs into this set.
+        guard pid == profile else { return "Profile changed" }
         var found: [(platform: String, rules: String, count: Int)] = []
         var sawAnyBlob = false
-        for platform in Self.settingsBlobPlatforms {
-            guard let data = try? await authedPost(
-                RPC.url(RPC.pullProfileSettingsBlob),
-                body: ["p_profile_id": profile, "p_platform": platform]
-            ) else { continue }
-            // One request per platform: bail the moment the profile moves
-            // rather than mixing another profile's badge packs into this set.
-            guard pid == profile else { return "Profile changed" }
-            guard let blob = Self.settingsBlob(from: data) else { continue }
+        for (platform, data) in blobs {
+            guard let blob = await Self.settingsBlobDetached(from: data) else { continue }
             sawAnyBlob = true
             guard let features = blob["features"] as? [String: Any],
                   let badgeFeature = features["stream_badge_settings"] as? [String: Any],
@@ -2488,6 +2948,9 @@ final class OrivioSyncManager: ObservableObject {
             }
             if count > 0 { found.append((platform, rulesJSON, count)) }
         }
+        // The detached parses above suspend — re-check the profile before
+        // applying, same reason as the guard above the loop.
+        guard pid == profile else { return "Profile changed" }
         streamBadges.setRemoteRules(Dictionary(found.map { ($0.platform, $0.rules) }, uniquingKeysWith: { a, _ in a }))
         guard !found.isEmpty else {
             NSLog("[OrivioBadges] no badge rules in any settings blob (sawAnyBlob=%d)", sawAnyBlob ? 1 : 0)
@@ -2505,7 +2968,17 @@ final class OrivioSyncManager: ObservableObject {
 
     /// Rows may arrive as an array or a bare object; settings_json may be an
     /// object or a double-encoded JSON string. Accept all of it.
-    private static func settingsBlob(from data: Data) -> [String: Any]? {
+    ///
+    /// Off-main wrapper: the blob physically contains the ~700 KB collections
+    /// library as a string value, and the callers run on the 30s sync tick —
+    /// parsing it on the main actor was tens of ms of recurring stall on the
+    /// A8. (The INNER preferences decode was already off main; this outer
+    /// parse was the missed half.)
+    private static func settingsBlobDetached(from data: Data) async -> [String: Any]? {
+        await Task.detached(priority: .utility) { settingsBlob(from: data) }.value
+    }
+
+    private nonisolated static func settingsBlob(from data: Data) -> [String: Any]? {
         guard let parsed = try? JSONSerialization.jsonObject(with: data) else { return nil }
         let row: [String: Any]?
         if let rows = parsed as? [[String: Any]] {
@@ -2531,11 +3004,23 @@ final class OrivioSyncManager: ObservableObject {
         return entry as? String
     }
 
+    /// The periodic sync's badge read, throttled per profile (see
+    /// `lastBadgePull`). The Settings card's manual button calls
+    /// `pullBadgeSettings` directly and is never throttled.
+    private func pullBadgeSettingsIfDue(profile: Int) async {
+        if let last = lastBadgePull[profile], Date().timeIntervalSince(last) < Self.badgePullInterval {
+            return
+        }
+        lastBadgePull[profile] = Date()
+        await pullBadgeSettings(profile: profile)
+    }
+
     private func scheduleBadgeSettingsPush() {
         // Never while the previous account's state is being retired: the
         // store callbacks that retirement fires would arm a push of account A's
         // data into account B. See `isRetiringAccountState`.
         guard !isRetiringAccountState else { return }
+        badgeSettingsDirty = true
         pushBadgeSettingsTask?.cancel()
         pushBadgeSettingsTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -2557,7 +3042,7 @@ final class OrivioSyncManager: ObservableObject {
             RPC.url(RPC.pullProfileSettingsBlob),
             body: ["p_profile_id": profile, "p_platform": Self.settingsBlobPlatform]
         ),
-           let existing = Self.settingsBlob(from: data) {
+           let existing = await Self.settingsBlobDetached(from: data) {
             blob = existing
         }
         // Read-merge-WRITE: the blob we just read belongs to `profile`, so the
@@ -2576,7 +3061,11 @@ final class OrivioSyncManager: ObservableObject {
             "p_platform": Self.settingsBlobPlatform,
             "p_origin_client_id": clientID,
         ]
-        _ = try? await authedPost(RPC.url(RPC.pushProfileSettingsBlob), body: body)
+        // Same rule as the credentials push: a failed upload must stay dirty
+        // or the gated tail push never retries it.
+        if (try? await authedPost(RPC.url(RPC.pushProfileSettingsBlob), body: body)) != nil {
+            badgeSettingsDirty = false
+        }
     }
 
     // MARK: - App preferences (player / TMDB / theme)
@@ -2623,6 +3112,9 @@ final class OrivioSyncManager: ObservableObject {
         /// Container-local only, this let any other install of the app flood
         /// the account with the full Trakt history the user had cleared.
         var watchHistoryClearedAt: Date?
+        /// Live TV channels this profile favourited, and which of them are
+        /// pinned to Home. Optional for backward-compat.
+        var liveChannels: [FavoriteChannel]?
     }
 
     /// Set when a local app-pref-backed change (collections included) is waiting
@@ -2697,7 +3189,11 @@ final class OrivioSyncManager: ObservableObject {
         // This blob is `profile`'s. Applying it to another profile's stores
         // would import that profile's collections, hidden sets and theme.
         guard pid == profile else { return }
-        guard let blob = Self.settingsBlob(from: data),
+        let parsed = await Self.settingsBlobDetached(from: data)
+        // The detached parse suspends — a profile switch during it must not
+        // touch this profile's bookkeeping at all.
+        guard pid == profile else { return }
+        guard let blob = parsed,
               let features = blob["features"] as? [String: Any],
               let feature = features[Self.appPrefsFeatureKey] as? [String: Any],
               let json = Self.preferenceString(feature["value"])
@@ -2722,20 +3218,35 @@ final class OrivioSyncManager: ObservableObject {
             )
             return
         }
+        // The account now holds something different from whatever this
+        // session last pushed, so the "identical payload, skip the push" memo
+        // below is stale. Left set, changing a preference back to its previous
+        // value cleared the dirty flag WITHOUT pushing, and the next pull
+        // reverted it.
+        lastPushedAppPrefs = nil
         playerSettings.applyRemote(snapshot.player)
         tmdbSettings.applyRemote(snapshot.tmdb)
         themeManager.applyRemote(snapshot.theme)
         WatchHistoryClearState.adopt(snapshot.watchHistoryClearedAt)
         if let home = snapshot.home { homeCatalogSettings.applyRemotePresentation(home) }
         if let debrid = snapshot.debrid { debridStore?.applyRemote(debrid) }
-        if let plugins = snapshot.plugins, let pluginStore {
-            Task { await pluginStore.applyRemote(plugins) }
+        // Awaited, not fired into an unstructured Task: this used to return
+        // while repos were still installing, and `pushPlugins` — which is
+        // replace-semantics — could read a half-applied list and delete the
+        // rest from the account. The dirty guard matches `pullPlugins`: a
+        // snapshot fetched before a local repo edit must not re-install what
+        // the user just removed.
+        if let plugins = snapshot.plugins, let pluginStore, !pluginsDirty {
+            await pluginStore.applyRemote(plugins)
+            guard pid == profile else { return }
         }
         if let torrent = snapshot.torrent { torrentSettings?.applyRemote(torrent) }
-        if let collections = snapshot.collections {
+        if let collections = snapshot.collections, !collectionsDirty {
             // Merge rather than replace: another profile's blob may carry packs
-            // this one has never seen, and the library is account-wide.
-            collectionsStore.mergeIntoLibrary(collections)
+            // this one has never seen, and the library is account-wide. Dirty-
+            // guarded like the pulls above: a blob fetched before a local edit
+            // must not clobber it.
+            if collectionsStore.mergeIntoLibrary(collections) { libraryGrewDuringSync = true }
         }
         collectionsStore.applyRemoteHidden(snapshot.hiddenCollectionIDs.map(Set.init))
         // Only apply when the remote blob actually CARRIES these keys. A blob
@@ -2750,6 +3261,9 @@ final class OrivioSyncManager: ObservableObject {
             collectionsStore.applyRemoteHiddenFolders(
                 profile: Set(snapshot.hiddenFolderIDs ?? []),
                 global: Set(snapshot.globalHiddenFolderIDs ?? []))
+        }
+        if let liveChannels = snapshot.liveChannels {
+            LiveChannelFavorites.shared.applyRemote(liveChannels)
         }
     }
 
@@ -2775,7 +3289,8 @@ final class OrivioSyncManager: ObservableObject {
             hiddenFolderIDs: collectionsStore.hiddenFolderIDsForSync,
             globalHiddenFolderIDs: collectionsStore.globalHiddenFolderIDsForSync,
             globalHiddenCollectionIDs: collectionsStore.globalHiddenCollectionIDsForSync,
-            watchHistoryClearedAt: WatchHistoryClearState.clearedAt
+            watchHistoryClearedAt: WatchHistoryClearState.clearedAt,
+            liveChannels: LiveChannelFavorites.shared.snapshot
         )
         guard let json = await Self.encodeAppPreferences(snapshot) else { return }
         // syncNow flushes a dirty push BEFORE the pulls and pushes again at the
@@ -2797,7 +3312,7 @@ final class OrivioSyncManager: ObservableObject {
             RPC.url(RPC.pullProfileSettingsBlob),
             body: ["p_profile_id": profile, "p_platform": Self.settingsBlobPlatform]
         ),
-           let existing = Self.settingsBlob(from: existingData) {
+           let existing = await Self.settingsBlobDetached(from: existingData) {
             blob = existing
         }
         guard pid == profile else { return }
@@ -2834,6 +3349,7 @@ final class OrivioSyncManager: ObservableObject {
 
     private func scheduleProviderCredentialsPush() {
         guard !isRetiringAccountState else { return }
+        providerCredentialsDirty = true
         pushProviderCredentialsTask?.cancel()
         pushProviderCredentialsTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -2876,7 +3392,13 @@ final class OrivioSyncManager: ObservableObject {
             "p_profile_id": profile,
             "p_origin_client_id": clientID
         ]
-        _ = try? await authedPost(RPC.url(RPC.pushProviderCredentials), body: body)
+        // Only once the account actually has them. Clearing unconditionally
+        // meant a single failed POST (Wi-Fi blip, 502) dropped the debrid key
+        // or Trakt login for good: with the tail push now gated on this flag,
+        // nothing ever retried it.
+        if (try? await authedPost(RPC.url(RPC.pushProviderCredentials), body: body)) != nil {
+            providerCredentialsDirty = false
+        }
     }
 
     /// Pull provider credentials and apply them. Tolerant: `credential_json` may
@@ -3031,6 +3553,14 @@ final class OrivioSyncManager: ObservableObject {
               let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return }
         guard pid == profile else { return }
         pulledPluginProfiles.insert(profile)
+        // Same rule as pullAddons: a snapshot fetched while a local repo edit
+        // awaits its push predates that edit, and applying it re-installs the
+        // repo the user just removed — which the debounced push then uploads
+        // back to the account. Skip; the dirty push goes first next cycle.
+        guard !pluginsDirty else {
+            NSLog("[OrivioSync] pullPlugins: skipped applying — a local repo edit is awaiting its push")
+            return
+        }
         let urls = rows
             .filter { ($0["repo_type"] as? String)?.uppercased() != "EXTERNAL_DEX" }  // JS only
             .filter { ($0["enabled"] as? Bool) ?? true }   // don't install repos disabled elsewhere
@@ -3052,6 +3582,12 @@ final class OrivioSyncManager: ObservableObject {
     private func authedPost(_ endpoint: String, body: [String: Any]) async throws -> Data {
         let payload = try JSONSerialization.data(withJSONObject: body)
         return try await send(endpoint: endpoint, method: "POST", body: payload)
+    }
+
+    /// For bodies whose JSON was built off the main actor (the Trakt-scale
+    /// library/watched pushes) — the serialization is the expensive half.
+    private func authedPost(_ endpoint: String, payload: Data) async throws -> Data {
+        try await send(endpoint: endpoint, method: "POST", body: payload)
     }
 
     private func authedGet(_ endpoint: String) async throws -> Data {

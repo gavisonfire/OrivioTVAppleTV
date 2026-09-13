@@ -98,9 +98,25 @@ enum CommunityCollections {
     /// installed Home rows — reads the same live choice for that category.
     static let coverStyleKey = "orivio.communitycoverstyle.v1"
 
+    /// Memoized on the raw JSON string: every collection tile reads this map
+    /// in its body, and the strips hold 100–200 folders — a fresh JSONDecoder
+    /// per tile body was a per-scroll-frame allocation storm on the A8. The
+    /// map only changes when someone flips a style in the community picker.
+    private static let coverStyleLock = NSLock()
+    private static var coverStyleMemo: (json: String, map: [String: Bool])?
+
     static func decodeCoverStyles(_ json: String) -> [String: Bool] {
+        coverStyleLock.lock()
+        if let memo = coverStyleMemo, memo.json == json {
+            defer { coverStyleLock.unlock() }
+            return memo.map
+        }
+        coverStyleLock.unlock()
         guard let data = json.data(using: .utf8),
               let dict = try? JSONDecoder().decode([String: Bool].self, from: data) else { return [:] }
+        coverStyleLock.lock()
+        coverStyleMemo = (json, dict)
+        coverStyleLock.unlock()
         return dict
     }
 
@@ -116,8 +132,14 @@ enum CommunityCollections {
     /// works for movies too) — checked per-service since it isn't always
     /// better (Apple TV+/FX/BBC's watch-provider data undercounts vs. their
     /// network data, so those stay network-only with no override).
+    /// `traktNetwork` is the name Trakt's `networks=` filter knows the service
+    /// by (verified live against `shows/popular`); nil for a service Trakt
+    /// has no network for. It gives the category a Trakt side, so a viewer
+    /// signed in to Trakt with no TMDB key still gets the shows — the
+    /// resolver keeps preferring TMDB whenever it is connected.
     private static func network(_ slug: String, _ title: String, _ tmdbId: Int,
-                                 watchProviderID: Int? = nil) -> CommunityCollectionPreset {
+                                 watchProviderID: Int? = nil,
+                                 traktNetwork: String? = nil) -> CommunityCollectionPreset {
         var filters: TmdbFiltersDTO?
         if let wpid = watchProviderID {
             filters = TmdbFiltersDTO(watchRegion: "US", withWatchProviders: String(wpid))
@@ -130,11 +152,25 @@ enum CommunityCollections {
         // A watch-provider override serves movies AND shows; network-only
         // (TMDB's with_networks) is TV-only, full stop — so those categories
         // only ever get the tv source, same as before.
-        let sources = filters != nil ? [makeSource(mediaType: "movie"), makeSource(mediaType: "tv")]
-                                      : [makeSource(mediaType: "tv")]
+        var sources = filters != nil ? [makeSource(mediaType: "movie"), makeSource(mediaType: "tv")]
+                                     : [makeSource(mediaType: "tv")]
+        if let traktNetwork {
+            sources.append(CollectionSourceDTO(
+                traktEndpoint: "shows/popular", traktQuery: "networks=" + traktQueryValue(traktNetwork),
+                title: title, mediaType: "tv"
+            ))
+        }
         return CommunityCollectionPreset(
             id: idPrefix + "streaming." + slug, group: .streaming, kind: .network, title: title, sources: sources
         )
+    }
+
+    /// Percent-encode a filter value for a Trakt query ("Apple TV+" →
+    /// "Apple%20TV%2B" — a bare "+" would read as a space).
+    private static func traktQueryValue(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
     /// `extraCompanyIDs` combines several TMDB company records into one
     /// OR-matched query (verified live against TMDB) for franchises legally
@@ -158,16 +194,26 @@ enum CommunityCollections {
     /// surfaces unreleased 2029-2099 placeholder entries with zero votes, so
     /// this instead restricts to a rolling recent window (computed fresh at
     /// query time) and sorts by popularity within it. Trending needs neither.
+    /// `traktEndpoint`/`traktQuery` give the category its Trakt side (see
+    /// `network`): trending → `movies/trending`, top rated → `movies/popular`
+    /// (Trakt's popular is rating-and-votes), newest → popular within the
+    /// current year.
     private static func discover(_ slug: String, _ title: String, kind: CommunityCollectionPreset.Kind,
                                   mediaType: String, sortBy: String,
-                                  minVoteCount: Int? = nil, recentDaysWindow: Int? = nil) -> CommunityCollectionPreset {
+                                  minVoteCount: Int? = nil, recentDaysWindow: Int? = nil,
+                                  traktEndpoint: String? = nil, traktQuery: String? = nil) -> CommunityCollectionPreset {
         var source = CollectionSourceDTO(tmdbSourceType: "DISCOVER", title: title, tmdbId: nil,
                                           mediaType: mediaType, sortBy: sortBy)
         if minVoteCount != nil || recentDaysWindow != nil {
             source.filters = TmdbFiltersDTO(voteCountGte: minVoteCount, recentDays: recentDaysWindow)
         }
+        var sources = [source]
+        if let traktEndpoint {
+            sources.append(CollectionSourceDTO(traktEndpoint: traktEndpoint, traktQuery: traktQuery,
+                                               title: title, mediaType: mediaType))
+        }
         return CommunityCollectionPreset(
-            id: idPrefix + "trending." + slug, group: .trending, kind: kind, title: title, sources: [source]
+            id: idPrefix + "trending." + slug, group: .trending, kind: kind, title: title, sources: sources
         )
     }
 
@@ -179,17 +225,17 @@ enum CommunityCollections {
         // watch-provider isn't TV-only); left unset = the network id already
         // wins (Apple TV+ 238>221, FX 97>14, BBC 2644>9 — their watch-provider
         // data is oddly sparse and would make those categories WORSE).
-        network("netflix", "Netflix", 213, watchProviderID: 8),              // 2798 -> 3426
-        network("disneyplus", "Disney+", 2739, watchProviderID: 337),        //  472 ->  931
-        network("max", "Max", 49, watchProviderID: 1899),                    //  378 -> 1798 (HBO Max)
-        network("primevideo", "Prime Video", 1024, watchProviderID: 9),      // 1455 -> 4907
-        network("appletvplus", "Apple TV+", 2552),                          // network wins, no override
-        network("hulu", "Hulu", 453, watchProviderID: 15),                   //  362 -> 1914
-        network("paramountplus", "Paramount+", 4330, watchProviderID: 2303), //  151 ->  712 (Premium tier)
-        network("peacock", "Peacock", 3353, watchProviderID: 386),           //  206 -> 1079 (Premium tier)
-        network("fx", "FX", 88),                                            // network wins, no override
-        network("amc", "AMC", 174, watchProviderID: 526),                    //   80 ->  263 (AMC+ bundle)
-        network("bbc", "BBC", 4),                                           // network wins, no override
+        network("netflix", "Netflix", 213, watchProviderID: 8, traktNetwork: "Netflix"),              // 2798 -> 3426
+        network("disneyplus", "Disney+", 2739, watchProviderID: 337, traktNetwork: "Disney+"),        //  472 ->  931
+        network("max", "Max", 49, watchProviderID: 1899, traktNetwork: "Max"),                        //  378 -> 1798 (HBO Max)
+        network("primevideo", "Prime Video", 1024, watchProviderID: 9, traktNetwork: "Prime Video"),  // 1455 -> 4907
+        network("appletvplus", "Apple TV+", 2552, traktNetwork: "Apple TV+"),                        // network wins, no override
+        network("hulu", "Hulu", 453, watchProviderID: 15, traktNetwork: "Hulu"),                      //  362 -> 1914
+        network("paramountplus", "Paramount+", 4330, watchProviderID: 2303, traktNetwork: "Paramount+"), //  151 ->  712 (Premium tier)
+        network("peacock", "Peacock", 3353, watchProviderID: 386, traktNetwork: "Peacock"),           //  206 -> 1079 (Premium tier)
+        network("fx", "FX", 88, traktNetwork: "FX"),                                                 // network wins, no override
+        network("amc", "AMC", 174, watchProviderID: 526, traktNetwork: "AMC"),                        //   80 ->  263 (AMC+ bundle)
+        network("bbc", "BBC", 4, traktNetwork: "BBC One"),                                           // network wins, no override
         // Crunchyroll's network id is its ORIGINALS only (RWBY, ...) — TMDB
         // credits Crunchyroll's vast licensed anime catalog (One Piece,
         // Naruto, Jujutsu Kaisen, ...) to their original Japanese broadcast
@@ -223,17 +269,19 @@ enum CommunityCollections {
         studio("blumhouse", "Blumhouse", 3172),
 
         // MARK: Trending & Top Rated — each its own installable category.
-        discover("moviesnow", "Trending Movies", kind: .trending, mediaType: "movie", sortBy: "popularity.desc"),
-        discover("showsnow", "Trending Shows", kind: .trending, mediaType: "tv", sortBy: "popularity.desc"),
+        discover("moviesnow", "Trending Movies", kind: .trending, mediaType: "movie", sortBy: "popularity.desc",
+                 traktEndpoint: "movies/trending"),
+        discover("showsnow", "Trending Shows", kind: .trending, mediaType: "tv", sortBy: "popularity.desc",
+                 traktEndpoint: "shows/trending"),
         // Verified live: sorting by vote_average with no vote-count floor is
         // pure noise (obscure titles with a single 10/10 vote outrank The
         // Shawshank Redemption). 1000 for movies / 800 for shows: clean,
         // recognizable results (Shawshank, Godfather, Schindler's List /
         // Breaking Bad, Arcane, Chernobyl) while still ~4900 / ~700 titles.
         discover("moviestop", "Top Rated Movies", kind: .topRated, mediaType: "movie",
-                 sortBy: "vote_average.desc", minVoteCount: 1000),
+                 sortBy: "vote_average.desc", minVoteCount: 1000, traktEndpoint: "movies/popular"),
         discover("showstop", "Top Rated Shows", kind: .topRated, mediaType: "tv",
-                 sortBy: "vote_average.desc", minVoteCount: 800),
+                 sortBy: "vote_average.desc", minVoteCount: 800, traktEndpoint: "shows/popular"),
         // Verified live: plain primary_release_date.desc surfaced unreleased
         // 2029-2099 placeholder entries with zero votes (e.g. "Avatar 5",
         // "100 Years"), not watchable new releases. recentDaysWindow instead
@@ -241,7 +289,8 @@ enum CommunityCollections {
         // excludes anything not yet released) sorted by popularity within
         // that window — Toy Story 5, Supergirl, The Devil Wears Prada 2, etc.
         discover("newest", "Newest Releases", kind: .newest, mediaType: "movie",
-                 sortBy: "popularity.desc", recentDaysWindow: 120),
+                 sortBy: "popularity.desc", recentDaysWindow: 120,
+                 traktEndpoint: "movies/popular", traktQuery: "years=$YEAR"),
     ]
 
     static func presets(in group: CommunityCollectionPreset.Group) -> [CommunityCollectionPreset] {
@@ -262,7 +311,11 @@ enum CommunityCollections {
     static func addFolder(_ folder: OrivioCollectionFolder, to group: CommunityCollectionPreset.Group,
                            collections: CollectionsStore) {
         let groupID = groupCollectionID(for: group)
-        if var existing = collections.collections.first(where: { $0.id == groupID }) {
+        // The LIBRARY, not the visible subset: a group switched off (or with
+        // every category hidden) is absent from the visible list, and the
+        // install then appended a second copy of the group instead of adding
+        // the category to it — which is why an install "didn't take".
+        if var existing = collections.library.first(where: { $0.id == groupID }) {
             if let idx = existing.folders.firstIndex(where: { $0.id == folder.id }) {
                 existing.folders[idx] = folder
             } else {
@@ -297,7 +350,7 @@ enum CommunityCollections {
     @MainActor
     static func consolidateIndividualCollections(collections: CollectionsStore) {
         for preset in presets {
-            guard let standalone = collections.collections.first(where: { $0.id == preset.id }),
+            guard let standalone = collections.library.first(where: { $0.id == preset.id }),
                   var folder = standalone.folders.first else { continue }
             collections.remove(id: preset.id)
             folder.id = preset.id
@@ -310,10 +363,18 @@ enum CommunityCollections {
     /// Rated/Newest had no quality filter). Already-installed folders keep
     /// whatever source they were given at install time, so without this
     /// they'd stay stuck on the old query even after the app fixes it.
+    /// One-shot per REVISION: community folders are editable in Settings, and
+    /// an unconditional per-launch rewrite silently reverted any source or
+    /// filter the user had added to one. Bump the key when the presets change
+    /// and every install picks the new sources up exactly once.
+    private static let sourceResyncKey = "orivio.community.sourceResync.v3-trakt"
+
     @MainActor
     static func resyncPresetSources(collections: CollectionsStore) {
+        guard !UserDefaults.standard.bool(forKey: sourceResyncKey) else { return }
+        UserDefaults.standard.set(true, forKey: sourceResyncKey)
         for preset in presets {
-            for collection in collections.collections where collection.id.hasPrefix(idPrefix) {
+            for collection in collections.library where collection.id.hasPrefix(idPrefix) {
                 guard let idx = collection.folders.firstIndex(where: { $0.id == preset.id }),
                       collection.folders[idx].sources != preset.sources else { continue }
                 var updated = collection
@@ -410,7 +471,7 @@ struct CommunityCollectionsView: View {
     /// categories), not per top-level collection.
     private var installedPresetIDs: Set<String> {
         var ids = Set<String>()
-        for collection in collections.collections where collection.id.hasPrefix(CommunityCollections.idPrefix) {
+        for collection in collections.library where collection.id.hasPrefix(CommunityCollections.idPrefix) {
             for folder in collection.folders { ids.insert(folder.id) }
         }
         return ids
@@ -529,7 +590,7 @@ struct CommunityCollectionsView: View {
     /// deleting the whole group collection only if it was the last one left.
     private func remove(_ preset: CommunityCollectionPreset) {
         let groupID = CommunityCollections.groupCollectionID(for: preset.group)
-        guard var existing = collections.collections.first(where: { $0.id == groupID }) else { return }
+        guard var existing = collections.library.first(where: { $0.id == groupID }) else { return }
         existing.folders.removeAll { $0.id == preset.id }
         if existing.folders.isEmpty {
             collections.remove(id: groupID)
@@ -665,7 +726,9 @@ private struct CommunityCollectionCard: View {
             RoundedRectangle(cornerRadius: OrivioRadius.md, style: .continuous)
                 .fill(isBright ? AnyShapeStyle(OrivioPrimitives.neutral100) : AnyShapeStyle(tintColor.opacity(0.18)))
             if let logoURL {
-                RemoteImage(url: logoURL, contentMode: .fit)
+                // 64pt tile: decode small — the w500 brand logo decoded full
+                // size wasted ~1 MB per card on this settings screen.
+                RemoteImage(url: logoURL, contentMode: .fit, maxDimension: 128)
                     .padding(8)
             } else if let emoji = preset.kind.emoji {
                 Text(emoji).font(.system(size: 30))

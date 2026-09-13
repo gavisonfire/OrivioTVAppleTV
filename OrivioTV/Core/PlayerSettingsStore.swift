@@ -100,7 +100,28 @@ struct PlayerSettings: Codable, Equatable {
     var reuseBingeGroup: Bool = true
     /// Countdown before auto-advancing. 0 = instant; `timeoutUnlimited` = wait
     /// for the user (no auto-advance, Up Next stays until dismissed/confirmed).
-    var autoPlayTimeoutSeconds: Int = 3
+    ///
+    /// Ten, not three. Three is long enough to notice the card and nowhere near
+    /// long enough to act on it — by the time you have read which episode is
+    /// next and reached for the remote, the advance has already happened.
+    var autoPlayTimeoutSeconds: Int = 10
+    /// Set once the 3 → 10 migration below has run for this profile, so a
+    /// viewer who deliberately goes back to 3 keeps it.
+    var didMigrateUpNextTimeout = false
+
+    /// Raise a stored 3 to 10, exactly once per profile.
+    ///
+    /// Changing the default alone reaches nobody who has ever launched the app:
+    /// the whole settings struct is persisted, so every existing install
+    /// carries the old default as a stored value and goes on counting down from
+    /// three. A blanket overwrite would be wrong too — it would stamp on a
+    /// deliberate choice — so this only moves the value that IS the old
+    /// default, and only the first time.
+    mutating func migrateUpNextTimeout() {
+        guard !didMigrateUpNextTimeout else { return }
+        didMigrateUpNextTimeout = true
+        if autoPlayTimeoutSeconds == 3 { autoPlayTimeoutSeconds = 10 }
+    }
     var stillWatchingEnabled: Bool = false
     var stillWatchingEpisodeThreshold: Int = 3
     /// Fallback for files WITHOUT an end-credits chapter: how many seconds
@@ -229,7 +250,13 @@ struct PlayerSettings: Codable, Equatable {
     /// disk — the RAM read-ahead tops out at a few hundred MB, so deep seeks
     /// otherwise always stall on the network. Direct-file streams only (HLS
     /// bypasses); anything unexpected falls back to direct playback.
-    var hybridDiskCacheEnabled: Bool = false
+    /// ON by default. It was shipped off behind a "beta" label while the
+    /// sliding window, the eviction policy and the download pool were being
+    /// settled; it is the difference between instant seeking and re-fetching
+    /// the film every time, and leaving it off by default meant almost nobody
+    /// got that. A stream the cache cannot handle (HLS, an origin that refuses
+    /// byte ranges) still plays — the proxy fails open to the origin.
+    var hybridDiskCacheEnabled: Bool = true
     /// Links shown per size tier (250 MB–4 GB / 4–10 / 10–20 / 20–30 / 30+).
     var sourcesPerSizeTier: Int = 6
     // --- Stream filters (applied before curation) ---
@@ -305,8 +332,12 @@ struct PlayerSettings: Codable, Equatable {
     /// VLC you lose that title's scrub-thumbnail preview for the session.
     var fullAssSubtitles: Bool = false
 
-    /// Selectable subtitle sizes.
-    static let subtitleSizeValues: [Int] = [28, 32, 36, 42, 48, 56]
+    /// Selectable subtitle sizes. The two smallest were added after reports of
+    /// captions "filling the entire screen": the real cause was an embedded ASS
+    /// style overriding this setting (see `SubtitleOverlayView.restyled`), but
+    /// once the setting actually applies, 28pt is still bigger than some people
+    /// want on a 1080p canvas.
+    static let subtitleSizeValues: [Int] = [20, 24, 28, 32, 36, 42, 48, 56]
 
     /// Caption typeface choices (family name, label). "" = system font. All
     /// families tvOS actually ships, so `Font.custom` always resolves.
@@ -392,6 +423,9 @@ struct PlayerSettings: Codable, Equatable {
         preferBingeGroupForNextEpisode = (try? c.decode(Bool.self, forKey: .preferBingeGroupForNextEpisode)) ?? d.preferBingeGroupForNextEpisode
         reuseBingeGroup = (try? c.decode(Bool.self, forKey: .reuseBingeGroup)) ?? d.reuseBingeGroup
         autoPlayTimeoutSeconds = (try? c.decode(Int.self, forKey: .autoPlayTimeoutSeconds)) ?? d.autoPlayTimeoutSeconds
+        // MUST be decoded, or the 3 → 10 migration re-runs on every launch and
+        // overwrites a viewer who deliberately set it back to 3.
+        didMigrateUpNextTimeout = (try? c.decode(Bool.self, forKey: .didMigrateUpNextTimeout)) ?? false
         stillWatchingEnabled = (try? c.decode(Bool.self, forKey: .stillWatchingEnabled)) ?? d.stillWatchingEnabled
         stillWatchingEpisodeThreshold = (try? c.decode(Int.self, forKey: .stillWatchingEpisodeThreshold)) ?? d.stillWatchingEpisodeThreshold
         upNextLeadSeconds = (try? c.decode(Int.self, forKey: .upNextLeadSeconds)) ?? d.upNextLeadSeconds
@@ -502,7 +536,8 @@ final class PlayerSettingsStore: ObservableObject {
 
     private static func load(profile: Int) -> PlayerSettings {
         if let data = ProfileScopedDefaults.data(key, feature: feature, profile),
-           let decoded = try? JSONDecoder().decode(PlayerSettings.self, from: data) {
+           var decoded = try? JSONDecoder().decode(PlayerSettings.self, from: data) {
+            decoded.migrateUpNextTimeout()
             return decoded
         }
         return .default

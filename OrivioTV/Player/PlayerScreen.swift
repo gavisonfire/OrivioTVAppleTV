@@ -8,6 +8,9 @@ struct PlayerScreen: View {
     /// Observed (not the view model's load-time snapshot) so caption style
     /// edits made in the Subtitles panel restyle the captions on screen live.
     @EnvironmentObject private var playerSettingsStore: PlayerSettingsStore
+    /// Only for the active profile's Auto Link Selector, which bounds which
+    /// addons an auto-advance may use — see PlayerViewModel.autoLinkPrefs.
+    @EnvironmentObject private var profiles: ProfileStore
     @StateObject private var viewModel: PlayerViewModel
     @FocusState private var catcherFocused: Bool
     /// Focus on the "Skip Intro" pill. Kept in sync both ways with
@@ -100,8 +103,7 @@ struct PlayerScreen: View {
             // Diagnostics HUD (Settings → Performance → Developer). Above the
             // subtitles, below the controls; hidden while any panel is open so
             // it never fights the UI for the corner.
-            if PerformanceSettingsStore.shared.settings.showPlayerDiagnostics
-                || ProcessInfo.processInfo.arguments.contains("-playerHUD"),
+            if PerformanceSettingsStore.shared.settings.showPlayerDiagnostics || PlayerDevFlags.playerHUD,
                viewModel.overlay == .none || viewModel.overlay == .controls {
                 PlayerDiagnosticsHUD(viewModel: viewModel)
             }
@@ -127,7 +129,14 @@ struct PlayerScreen: View {
             // Window-level Back interceptor: Menu is ALWAYS routed through
             // handleExit while the player is up, even when a side panel left
             // focus in limbo (the "Back closes the whole player" bug).
-            RemoteMenuCatcher { _ = viewModel.handleExit() }
+            //
+            // AND IT MUST HONOUR THE RESULT. This discarded it, which was
+            // harmless only while `handleExit` always returned true — with the
+            // "Exit Player?" confirmation gone it returns FALSE to mean "the
+            // view should leave now", so a Menu press arriving through this
+            // path instead of `onExitCommand` would have been swallowed and
+            // the player would simply refuse to close.
+            RemoteMenuCatcher { if !viewModel.handleExit() { exitPlayer() } }
                 .allowsHitTesting(false)
                 .frame(width: 0, height: 0)
 
@@ -149,11 +158,17 @@ struct PlayerScreen: View {
             }
 
             // Invisible focus catcher: owns focus whenever no other focusable
-            // UI is up (bare video, the pause overlay, and the info pull-down),
-            // turning remote presses into player actions. Without it those
-            // states would be focus dead-zones and remote commands (including
-            // Menu) would stop arriving.
-            if viewModel.overlay == .none {
+            // UI is up — bare video, and the whole of the info sheet's
+            // slide-out. Without it those states are focus dead-zones and
+            // remote commands (including Menu) stop arriving.
+            //
+            // `sheetClosing` is in here because the closing sheet is still
+            // mounted and `.disabled()`, so for the ~400ms of its animation
+            // NOTHING in the window was focusable and every press but Menu
+            // (which the window recognizer catches separately) was dropped.
+            // Kept as one `if` so the catcher is the same view across the
+            // hand-off and focus doesn't flicker when the sheet finally goes.
+            if viewModel.overlay == .none || viewModel.sheetClosing {
                 remoteCatcher
             }
 
@@ -180,16 +195,6 @@ struct PlayerScreen: View {
                 bufferingIndicator
                     .transition(.opacity)
             }
-
-            // Peek bar (light tap): position + when you started / when you'll
-            // finish — no menu. Click drops into scrub to edit the time.
-            if viewModel.peekVisible, viewModel.overlay == .none, !viewModel.isScrubbing {
-                // Fusion shows its OWN bar here rather than the stock peek bar,
-                // so a light tap — and the quick-seek below — look like the
-                // controls you get a moment later instead of a different player.
-                FusionInertOverlay(viewModel: viewModel).transition(.opacity)
-            }
-
 
             bottomScrim
 
@@ -225,6 +230,16 @@ struct PlayerScreen: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
 
+            // ABOVE the transport, BELOW every modal. It is a near-opaque
+            // cover, and sitting at the end of the stack it was painted over
+            // the exit confirmation and the error screen — a viewer who
+            // pressed Back during a failover got a dialog they could not see
+            // and buttons they could not reach.
+            if viewModel.isSwitchingSource, !loadingBackdropOwnsScreen {
+                SwitchingSourceOverlay(label: viewModel.switchingSourceLabel)
+                    .transition(.opacity)
+            }
+
             if viewModel.overlay == .upNext {
                 UpNextOverlay(viewModel: viewModel)
                     .transition(.opacity)
@@ -240,11 +255,6 @@ struct PlayerScreen: View {
                     .transition(.opacity)
             }
 
-            if viewModel.overlay == .exitConfirm {
-                ExitConfirmOverlay(viewModel: viewModel, exit: exitPlayer)
-                    .transition(.opacity)
-            }
-
             if case .error(let message) = viewModel.overlay {
                 PlayerErrorOverlay(message: message, viewModel: viewModel, dismiss: exitPlayer)
             }
@@ -257,19 +267,14 @@ struct PlayerScreen: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
-            if viewModel.isSwitchingSource {
-                SwitchingSourceOverlay(label: "Loading next episode")
-            }
 
             // Quick-seek HUD: shown while accumulating D-pad skips over the
             // bare video (controls hidden). Reflects the running total.
-            if viewModel.pendingSeekDelta != 0, viewModel.overlay != .controls, !viewModel.isScrubbing {
-                // Not drawn twice: the peek bar above already renders this
-                // same block, and a skip over bare video is exactly when a
-                // light tap may also have raised it.
-                if !viewModel.peekVisible {
-                    FusionInertOverlay(viewModel: viewModel).transition(.opacity)
-                }
+            // `!controlsVisible`, not `!= .controls`: pauseInfo (and the track
+            // popovers) already draw the full transport, and a nudge there
+            // stacked a second bottom block on top of it.
+            if viewModel.pendingSeekDelta != 0, !controlsVisible, !viewModel.isScrubbing {
+                FusionInertOverlay(viewModel: viewModel).transition(.opacity)
             }
 
             // "Skip Intro" pill while inside an intro-like chapter.
@@ -281,7 +286,16 @@ struct PlayerScreen: View {
         // slower, softer one — `controlsDismiss` (0.26) had never reached the
         // screen. Dismissal is where a ten-foot UI most needs to be gentle: the
         // viewer is looking at the picture underneath, not at the thing leaving.
-        .animation(viewModel.sheetMoving ? PlayerViewModel.sheetMotion
+        // A8/A10X: overlays SNAP instead of fading. The fade composites the
+        // full-screen transport + scrim through an offscreen transparency
+        // layer over live video for its whole duration — and the FFmpeg
+        // engine delivers every frame from the main run loop, so those
+        // composite frames come straight out of the picture ("bringing up
+        // the overlay drops the frames of the movie"). A snap at ten feet is
+        // barely distinguishable from an 0.18s fade; the 4 GB boxes keep it.
+        .animation(PerformanceProfile.isLowPower || PerformanceProfile.isMidPower
+                   ? nil
+                   : viewModel.sheetMoving ? PlayerViewModel.sheetMotion
                    : viewModel.overlay == .none ? FusionMotion.controlsDismiss
                    : FusionMotion.controlsAppear,
                    value: viewModel.overlay)
@@ -295,7 +309,6 @@ struct PlayerScreen: View {
         // These four were 0.16/0.16/0.2/0.16 — a 40ms spread nobody can see,
         // multiplying transactions over the same stack for no gain. One token.
         .animation(FusionMotion.controlsAppear, value: viewModel.isScrubbing)
-        .animation(FusionMotion.controlsAppear, value: viewModel.peekVisible)
         .animation(FusionMotion.controlsAppear, value: viewModel.showBufferSpinner)
         .animation(FusionMotion.controlsAppear, value: viewModel.pendingSeekDelta != 0)
         // The first frame appearing is a page-scale moment, not a control one.
@@ -303,9 +316,26 @@ struct PlayerScreen: View {
         .onPlayPauseCommand {
             if viewModel.isScrubbing {
                 viewModel.commitScrub()
-            } else if viewModel.skipIntroActive {
+            // ⏯ SKIPS THE INTRO ONLY OVER BARE, RUNNING VIDEO.
+            //
+            // It used to skip whenever the pill was on screen, which includes
+            // while PAUSED (a pause raises the transport, and the pill stays up
+            // under it). Pressing play/pause on a paused film and having it
+            // jump the intro instead of resuming is the single least forgivable
+            // thing this button can do — it is the most-used control in the
+            // player and it has to mean one thing. Over bare running video
+            // there is nothing else it could mean, so the shortcut stays there;
+            // everywhere else the pill is still reachable by focus and Select.
+            } else if skipIntroPillVisible && viewModel.overlay == .none && viewModel.isPlaying {
                 // While the Skip Intro pill is up, ⏯ skips (focus never has to
                 // leave the video).
+                //
+                // Keyed to the PILL, not to `skipIntroActive`. The flag stays
+                // raised for the whole intro chapter no matter what is on
+                // screen, so opening the info sheet or a picker during an
+                // opening turned ⏯ into an invisible seek: the pill isn't
+                // drawn over those, and the only thing the viewer could see
+                // was the film jumping forward instead of pausing.
                 viewModel.skipIntro()
             } else {
                 viewModel.togglePlayPause()
@@ -392,6 +422,7 @@ struct PlayerScreen: View {
             // metadata is in place.
             if let onNowPlayingChanged {
                 viewModel.onNowPlayingChanged = onNowPlayingChanged
+                viewModel.autoLinkPrefs = profiles.activeAutoLink
             }
             // Hand the view model a debrid resolver so torrent sources can be
             // switched to (and failed over to) mid-playback. Tries every
@@ -434,7 +465,7 @@ struct PlayerScreen: View {
         // Dev-only: `-playerControlsDemo` keeps the transport controls pinned up
         // (re-showing them past the idle auto-hide) so the overlay skin can be
         // screenshot-verified in the sim, where the remote can't be driven.
-        if ProcessInfo.processInfo.arguments.contains("-playerControlsDemo") {
+        if PlayerDevFlags.controlsDemo {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if viewModel.hasStartedPlayback { viewModel.showControls() }
@@ -443,7 +474,7 @@ struct PlayerScreen: View {
         }
         // Dev-only: `-playerInfoDemo` pulls the info sheet down once playback
         // is running (the gesture that opens it can't be sent to the sim).
-        if ProcessInfo.processInfo.arguments.contains("-playerInfoDemo") {
+        if PlayerDevFlags.infoDemo {
             while !viewModel.hasStartedPlayback, !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
@@ -452,7 +483,7 @@ struct PlayerScreen: View {
             viewModel.showInfoPanel()
             return
         }
-        guard ProcessInfo.processInfo.arguments.contains("-playerDemoTour") else { return }
+        guard PlayerDevFlags.demoTour else { return }
         try? await Task.sleep(nanoseconds: 8_000_000_000)
         viewModel.togglePlayPause()             // → pause overlay
         try? await Task.sleep(nanoseconds: 6_000_000_000)
@@ -503,11 +534,13 @@ struct PlayerScreen: View {
     private var remoteCatcher: some View {
         Button {
             viewModel.noteInput("click")
+            viewModel.noteSelectPressed()   // so the lift isn't also a tap
+            // Present only to hold focus while the info sheet slides away —
+            // a press landing inside that animation belongs to the gesture
+            // that closed it, not to the video underneath.
+            if viewModel.sheetClosing { return }
             if viewModel.isScrubbing {
                 viewModel.commitScrub()
-            } else if viewModel.peekVisible {
-                // Peek is up → a click drops into scrub so you can edit the time.
-                viewModel.beginScrub()
             } else {
                 // Infuse: a click on the bare picture is play / pause. The
                 // transport comes up with it and hides again on its own.
@@ -522,10 +555,16 @@ struct PlayerScreen: View {
         .onAppear { catcherFocused = true }
         .onMoveCommand { direction in
             viewModel.noteInput("move \(direction)")
+            if viewModel.sheetClosing { return }
             // A trackpad SWIPE emits a move command too, but a swipe is already
             // handled by the pan recognizer (which sets moveSuppressed). So
             // ONLY a real directional CLICK gets past here.
             if viewModel.moveSuppressed { return }
+            // A directional press is the same physical pad-depress-and-lift a
+            // Select click is: without this the LIFT also counted as a light
+            // tap, so every skip press over bare video raised the transport
+            // and every bar press silently flipped the clock readout.
+            viewModel.noteSelectPressed()
             // Fine-tune has the pad locked: swallow the move commands a
             // circling thumb generates at the edges rather than letting them
             // through to the jump/seek paths below.
@@ -538,7 +577,7 @@ struct PlayerScreen: View {
                 }
                 return
             }
-            // Bare video / peek bar — directional CLICKS: left/right skip by the
+            // Bare video — directional CLICKS: left/right skip by the
             // configured amount, up/down open the controls. (The info panel is
             // swipe-down only, handled by the pan recognizer.)
             switch direction {
@@ -553,6 +592,15 @@ struct PlayerScreen: View {
         }
     }
 
+    /// The pill is actually on screen: over bare video (focusable) or under
+    /// the transport (a static ⏯ hint). Everything else — the info sheet, a
+    /// picker, Up Next, the exit prompt — covers it, and while it is covered
+    /// ⏯ has to mean play/pause again.
+    private var skipIntroPillVisible: Bool {
+        viewModel.skipIntroActive && !viewModel.isScrubbing
+            && (viewModel.overlay == .none || controlsVisible)
+    }
+
     /// "Skip Intro" pill.
     ///
     /// Over bare video it is a REAL focusable button — it highlights, Select
@@ -561,8 +609,7 @@ struct PlayerScreen: View {
     /// they own focus, so there it degrades to a static hint and ⏯ skips.
     @ViewBuilder
     private var skipIntroPill: some View {
-        if viewModel.skipIntroActive, !viewModel.isScrubbing,
-           viewModel.overlay == .none || controlsVisible {
+        if skipIntroPillVisible {
             VStack {
                 Spacer()
                 HStack {
@@ -576,6 +623,7 @@ struct PlayerScreen: View {
                         .onMoveCommand { direction in
                             viewModel.noteInput("move \(direction) (skip)")
                             if viewModel.moveSuppressed { return }
+                            viewModel.noteSelectPressed()   // see the catcher's note
                             switch direction {
                             // Keep going past the pill → the transport controls.
                             case .up, .down:
@@ -601,6 +649,25 @@ struct PlayerScreen: View {
         }
     }
 
+    /// The full-screen initial-load backdrop is the thing on screen — and it
+    /// already carries a spinner and a status line of its own.
+    ///
+    /// A failover BEFORE the first frame — the load watchdog giving up on a
+    /// source that never opened, so `isSwitchingSource` goes true while
+    /// `hasStartedPlayback` is still false — used to mount the switching cover
+    /// on top of this backdrop. That cover is only 0.75 black, so it dimmed the
+    /// backdrop instead of replacing it: two spinners and two status lines,
+    /// stacked and overlapping, for as long as the failover had to await
+    /// (a source list fetch, a torrent resolve, the once-per-chain re-scrape).
+    /// The backdrop speaks `switchingSourceLabel` itself instead, and the cover
+    /// stands down. It still mounts for every case where the backdrop is NOT
+    /// up: mid-session switches and episode advances, the error screen, and the
+    /// plain-black path when the overlay is turned off in Settings.
+    private var loadingBackdropOwnsScreen: Bool {
+        !viewModel.hasStartedPlayback && !viewModel.isShowingError
+            && viewModel.settings.loadingOverlayEnabled
+    }
+
     /// The transport is on screen: controls, paused, or a track popover.
     private var controlsVisible: Bool {
         switch viewModel.overlay {
@@ -612,7 +679,6 @@ struct PlayerScreen: View {
     private var bottomBlockVisible: Bool {
         if controlsVisible { return true }
         if viewModel.isScrubbing { return true }
-        if viewModel.peekVisible, viewModel.overlay == .none { return true }
         if viewModel.pendingSeekDelta != 0, viewModel.overlay != .controls { return true }
         return false
     }
@@ -768,14 +834,28 @@ struct PlayerLoadingOverlay: View {
         return false
     }
 
-    /// "Loading" while the stream opens, then "Caching" (with progress) while
-    /// the initial forward buffer builds; playback starts when it completes.
+    /// ONE loading language, in the viewer's words.
+    ///
+    /// "Caching" is an implementation concept — it names a buffer the viewer
+    /// has no idea exists. What is actually happening during that phase is that
+    /// the player is building enough of a head start to play without stuttering,
+    /// which is "Preparing". "Resuming" is worth saying separately because the
+    /// wait has a reason the viewer already understands: they are going back to
+    /// where they were.
     private var phaseLabel: String {
+        // A failover that lands before the first frame leaves THIS backdrop on
+        // screen, so the switching cover stands down rather than stacking a
+        // second spinner and a second status line over it (see
+        // `PlayerScreen.loadingBackdropOwnsScreen`) — which makes this the only
+        // place left to say what the wait is for.
+        if viewModel.isSwitchingSource { return viewModel.switchingSourceLabel }
         switch viewModel.loadPhase {
         case .caching:
-            return viewModel.cacheProgress > 0 ? "Caching \(viewModel.cacheProgress)%" : "Caching"
+            return viewModel.cacheProgress > 0
+                ? "Preparing video… \(viewModel.cacheProgress)%"
+                : "Preparing video…"
         default:
-            return "Loading"
+            return viewModel.isResumingFromSavedPosition ? "Resuming…" : "Loading…"
         }
     }
 
@@ -1065,42 +1145,14 @@ struct PostPlayOverlay: View {
     }
 }
 
-/// "Exit Player?" confirmation. Reached only via Back from a top-level player
-/// surface — Back never leaves playback without passing through here. Focus
-/// defaults to "Keep Watching" so a stray press doesn't drop out of the video.
-struct ExitConfirmOverlay: View {
-    @EnvironmentObject private var theme: ThemeManager
-    @ObservedObject var viewModel: PlayerViewModel
-    let exit: () -> Void
-    @FocusState private var keepFocused: Bool
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.9).ignoresSafeArea()
-            VStack(spacing: OrivioSpacing.xl) {
-                Text("Exit Player?")
-                    .font(.system(size: 42, weight: .bold))
-                    .foregroundStyle(.white)
-                HStack(spacing: OrivioSpacing.lg) {
-                    Button("Keep Watching") { viewModel.cancelExitConfirm() }
-                        .font(.system(size: 25, weight: .semibold))
-                        .focused($keepFocused)
-                    Button("Exit", action: exit)
-                        .font(.system(size: 25, weight: .semibold))
-                }
-                .padding(.top, OrivioSpacing.md)
-            }
-            .padding(OrivioSpacing.huge)
-        }
-        .onAppear { keepFocused = true }
-    }
-}
-
 struct PlayerErrorOverlay: View {
     @EnvironmentObject private var theme: ThemeManager
     let message: String
     @ObservedObject var viewModel: PlayerViewModel
     let dismiss: () -> Void
+    @FocusState private var retryFocused: Bool
+    @FocusState private var sourcesFocused: Bool
+    @FocusState private var closeFocused: Bool
 
     var body: some View {
         ZStack {
@@ -1115,13 +1167,28 @@ struct PlayerErrorOverlay: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 900)
                 HStack(spacing: OrivioSpacing.lg) {
+                    // TRY AGAIN FIRST, and focused by default. Most terminal
+                    // errors here are a CDN that timed out or a debrid link
+                    // that expired — transient things where one more attempt
+                    // genuinely works, and where the alternative was asking the
+                    // viewer to leave the film and start over from the browser.
+                    Button("Try Again") { viewModel.retryPlayback() }
+                        .focused($retryFocused)
                     if viewModel.allEntries.count > 1 {
                         Button("Other Sources") {
-                            viewModel.overlay = .sources
+                            viewModel.showSourcesFromError()
                         }
+                        .focused($sourcesFocused)
                     }
                     Button("Close Player", action: dismiss)
+                        .focused($closeFocused)
                 }
+                // Land focus explicitly. Left to the engine, the first pass on
+                // a screen whose only focusables are these two buttons picked
+                // by geometry, and on the one-button variant it sometimes
+                // picked nothing at all — a full-screen error with a dead
+                // remote, which is the last place that can be afforded.
+                .onAppear { retryFocused = true }
             }
         }
     }

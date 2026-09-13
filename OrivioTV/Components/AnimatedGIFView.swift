@@ -80,7 +80,18 @@ enum GIFDecoder {
         return cache[key]
     }
 
+    /// Registered once, for the life of the process. The observer used to be
+    /// added per mounted GIF view and removed on dismantle — so after leaving
+    /// a collections screen the cache's whole byte budget (8–40 MB decoded)
+    /// sat unreclaimable: no view mounted, no observer, memory warnings
+    /// ignored exactly when the box most needed the bytes back.
+    private static let purgeObserver: NSObjectProtocol = NotificationCenter.default.addObserver(
+        forName: UIApplication.didReceiveMemoryWarningNotification,
+        object: nil, queue: .main
+    ) { _ in GIFDecoder.purge() }
+
     static func store(_ image: UIImage, cost: Int, for key: String) {
+        _ = purgeObserver
         lock.lock(); defer { lock.unlock() }
         if cache[key] == nil { order.append(key) }
         cache[key] = image
@@ -198,6 +209,14 @@ struct AnimatedGIFView: UIViewRepresentable {
     /// art change on focus for a fraction of the cost — a single ~0.5 MB image
     /// instead of dozens of frames.
     var stillOnly: Bool = false
+    /// False = mounted but dormant: no fetch, no decode, no animation, frames
+    /// released. Callers that show a GIF only on focus keep the view MOUNTED
+    /// and flip this instead — structurally inserting/removing a
+    /// UIViewRepresentable on every focus step forces a UIKit focus-hierarchy
+    /// re-resolve, which strands the native card platter's raise mid-move
+    /// (the "frozen poster" bug; same mechanism HeroTrailerLayer fixed with
+    /// its MOUNTED ALWAYS note).
+    var active: Bool = true
     /// Called once the GIF is ready (or fails), so the parent can decide whether
     /// to hide the still artwork behind it.
     var onLoaded: ((Bool) -> Void)?
@@ -216,14 +235,25 @@ struct AnimatedGIFView: UIViewRepresentable {
         view.setContentHuggingPriority(.defaultLow, for: .vertical)
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        context.coordinator.memoryWarning = NotificationCenter.default.addObserver(
-            forName: UIApplication.didReceiveMemoryWarningNotification,
-            object: nil, queue: .main
-        ) { _ in GIFDecoder.purge() }
+        // Memory-warning purge is registered once inside GIFDecoder itself —
+        // a per-view observer left the cache unreclaimable the moment the
+        // last GIF view unmounted.
         return view
     }
 
     func updateUIView(_ view: UIImageView, context: Context) {
+        // Dormant: cancel any load, stop animating, release the frames — but
+        // stay in the tree (see `active`). The decoded frames live on in
+        // GIFDecoder's cache, so re-focusing is a cache hit, not a re-decode.
+        guard active else {
+            context.coordinator.task?.cancel()
+            context.coordinator.loadedURL = nil
+            if view.image != nil {
+                view.stopAnimating()
+                view.image = nil
+            }
+            return
+        }
         // Normalize FIRST so the cache key, the coordinator's dedupe key and
         // the fetch all agree — keying the cache on the raw URL while fetching
         // the repaired one would miss on every focus.
@@ -257,7 +287,18 @@ struct AnimatedGIFView: UIViewRepresentable {
                 NSLog("[OrivioGIF] bad URL")
                 await MainActor.run { if coordinator.loadedURL == url { onLoaded?(false) } }; return
             }
-            guard let (data, _) = try? await URLSession.shared.data(from: remote), !Task.isCancelled
+            // The encoded bytes go through ImageCache's disk layer + download
+            // coalescer. These are 3–4 MB files, and the decoded-frame cache
+            // on the A8 holds ~2 GIFs — so traversing a 100-folder collection
+            // used to re-DOWNLOAD the same GIF on nearly every focus move
+            // (URLSession.shared won't HTTP-cache bodies this large). Now the
+            // refetch is a local disk read; only the decode repeats.
+            var data = await ImageCache.shared.diskData(for: url)
+            if data == nil {
+                data = try? await ImageCache.shared.download(remote)
+                if let data { ImageCache.shared.insertData(data, for: url) }
+            }
+            guard let data, !Task.isCancelled
             else {
                 NSLog("[OrivioGIF] fetch FAILED %@", url.suffix(40).description)
                 await MainActor.run { if coordinator.loadedURL == url { onLoaded?(false) } }; return
@@ -296,9 +337,6 @@ struct AnimatedGIFView: UIViewRepresentable {
         coordinator.task?.cancel()
         view.stopAnimating()
         view.image = nil          // release the frames with the view
-        if let token = coordinator.memoryWarning {
-            NotificationCenter.default.removeObserver(token)
-        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -306,6 +344,5 @@ struct AnimatedGIFView: UIViewRepresentable {
     final class Coordinator {
         var loadedURL: String?
         var task: Task<Void, Never>?
-        var memoryWarning: NSObjectProtocol?
     }
 }

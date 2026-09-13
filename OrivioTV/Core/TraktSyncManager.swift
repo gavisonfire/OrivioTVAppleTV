@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import UIKit
 
 /// Two-way sync between the app and Trakt: watch history / watched badges
 /// (WatchedStore ↔ Trakt history) and Continue Watching (Trakt playback
@@ -75,6 +76,61 @@ final class TraktSyncManager: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+
+        // Being signed in is all it takes for the sync to run on its own —
+        // the Orivio account is not a prerequisite for it. See `startAutoSync`.
+        trakt.$accessToken
+            .map { $0 != nil }
+            .removeDuplicates()
+            .sink { [weak self] signedIn in
+                if signedIn { self?.startAutoSync() } else { self?.stopAutoSync() }
+            }
+            .store(in: &cancellables)
+
+        // Coming back to the app is the other moment a viewer expects their
+        // history to be current — another device may have watched things while
+        // this one was asleep.
+        NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in
+                guard self?.trakt.isSignedIn == true else { return }
+                self?.syncNow()   // throttled; a foreground burst can't stack
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Auto sync
+
+    /// How often a signed-in Trakt account reconciles on its own.
+    ///
+    /// There was NO periodic Trakt sync at all: history and Continue Watching
+    /// only reconciled at sign-in, on a local change, or when a setting was
+    /// flipped — so anything watched on another device (the phone, the web,
+    /// another box) never appeared until the app was relaunched. Five minutes
+    /// is well inside Trakt's rate limits for the handful of list endpoints a
+    /// run touches, and `syncNow`'s own 60s throttle still collapses this
+    /// against sign-in and foreground triggers.
+    private static let autoSyncInterval: TimeInterval = 5 * 60
+    private var autoSyncTask: Task<Void, Never>?
+
+    private func startAutoSync() {
+        autoSyncTask?.cancel()
+        autoSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.autoSyncInterval * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                guard trakt.isSignedIn else { continue }
+                // Never mid-stream: the account sync drops to a light pass
+                // during playback for the same reason — a multi-endpoint
+                // reconcile competing with the movie for bandwidth.
+                guard !OrivioSyncManager.playbackActive else { continue }
+                syncNow()
+            }
+        }
+    }
+
+    private func stopAutoSync() {
+        autoSyncTask?.cancel()
+        autoSyncTask = nil
     }
 
     // MARK: - Full sync
@@ -159,18 +215,40 @@ final class TraktSyncManager: ObservableObject {
         let remote = await TraktService.watchedHistory(accessToken: token)
         guard profileStillActive(profile) else { return 0 }
         let clearedAt = WatchHistoryClearState.clearedAt
-        let remoteItems = remote.compactMap(watchedItem(from:)).filter { item in
-            guard let clearedAt else { return true }
-            return item.watchedAt > clearedAt
-        }
+        // The transform is O(remote × local) value work — struct building,
+        // key-string interpolation, set construction over a flattened
+        // per-episode history that runs to thousands after a Trakt import.
+        // The JSON decode was already off main; this landed the transform
+        // back on the main actor every 5-min tick and every foreground.
+        // Local rows are snapshotted BEFORE the merge below: a row the merge
+        // adds is one Trakt already has, so it is excluded by `remoteKeys`
+        // either way.
+        let localRows = watched.allForSync()
+        let (remoteItems, pushable) = await Task.detached(
+            priority: .utility
+        ) { [self] () -> ([WatchedItem], [TraktService.SyncItem]) in
+            let remoteItems = remote.compactMap(watchedItem(from:)).filter { item in
+                guard let clearedAt else { return true }
+                return item.watchedAt > clearedAt
+            }
+            // Push anything local that Trakt is missing. Keyed off EVERY
+            // remote row in both id forms — a row dropped by the
+            // clear-horizon filter above is still a row Trakt has, and
+            // re-sending it achieves nothing.
+            let remoteKeys = Set(remote.flatMap { s in
+                localIDs(from: s).map { WatchedItem.key(contentID: $0, season: s.season, episode: s.episode) }
+            })
+            let pushable = localRows.filter { !remoteKeys.contains($0.key) }
+                .compactMap(syncItem(from:))
+            return (remoteItems, pushable)
+        }.value
+        guard profileStillActive(profile) else { return 0 }
         // Add Trakt items missing locally (additive — never delete local
-        // history from a partial Trakt response).
-        if !remoteItems.isEmpty { watched.mergeRemote(remoteItems, reconcile: false) }
-
-        // Push anything local that Trakt is missing.
-        let remoteKeys = Set(remoteItems.map(\.key))
-        let localOnly = watched.allForSync().filter { !remoteKeys.contains($0.key) }
-        let pushable = localOnly.compactMap(syncItem(from:))
+        // history from a partial Trakt response). Anything new goes on to the
+        // Orivio account as well.
+        if !remoteItems.isEmpty, watched.mergeRemote(remoteItems, reconcile: false) {
+            watched.requestSyncPush()
+        }
         if !pushable.isEmpty {
             _ = await TraktService.addToHistory(pushable, accessToken: token)
         }
@@ -195,10 +273,20 @@ final class TraktSyncManager: ObservableObject {
             guard let clearedAt else { return true }
             return (item.watchedAt ?? .distantPast) > clearedAt
         }
+        // Artwork/runtime for the first 25, fetched a few at a time rather
+        // than one after another: twenty-five sequential meta round trips was
+        // most of the time a Trakt sync took.
+        let mapped: [(item: TraktService.SyncItem, metaID: String, addon: InstalledAddon?)] =
+            items.enumerated().compactMap { index, s in
+                guard let metaID = localID(from: s) else { return nil }
+                let addon = index < 25 ? addonManager.metaAddon(for: s.type, id: metaID) : nil
+                return (s, metaID, addon)
+            }
+        let metas = await Self.fetchMetas(mapped.map { ($0.addon, $0.item.type, $0.metaID) })
         var rows: [WatchProgress] = []
-        var enriched = 0
-        for s in items {
-            guard let metaID = localID(from: s) else { continue }
+        for (index, entry) in mapped.enumerated() {
+            let s = entry.item
+            let metaID = entry.metaID
             let key: String
             if s.type == "series", let sea = s.season, let ep = s.episode {
                 key = "\(metaID):\(sea):\(ep)"
@@ -208,9 +296,7 @@ final class TraktSyncManager: ObservableObject {
             var poster: String?
             var background: String?
             var runtimeMin: Int?
-            if enriched < 25, let addon = addonManager.metaAddon(for: s.type, id: metaID),
-               let meta = try? await StremioAPI.meta(addon: addon, type: s.type, id: metaID) {
-                enriched += 1
+            if let meta = metas[index] {
                 if !meta.name.isEmpty { name = meta.name }
                 poster = meta.poster
                 background = meta.background
@@ -225,7 +311,7 @@ final class TraktSyncManager: ObservableObject {
                 positionSeconds: pos, durationSeconds: dur, streamURL: nil,
                 updatedAt: s.watchedAt ?? Date(), syncSource: "trakt"))
         }
-        // The meta enrichment above awaits per row.
+        // The meta enrichment above awaits.
         guard profileStillActive(profile) else { return 0 }
         progress.mergeExternal(rows)
 
@@ -390,30 +476,36 @@ final class TraktSyncManager: ObservableObject {
     private func syncWatchlist(token: String, profile: Int) async -> Int {
         let remote = await TraktService.watchlist(accessToken: token)
         guard profileStillActive(profile) else { return 0 }
+        let missing: [(item: TraktService.SyncItem, id: String)] = remote.compactMap { s in
+            guard let id = localID(from: s), !library.contains(id: id, type: s.type) else { return nil }
+            return (s, id)
+        }
+        let metas = await Self.fetchMetas(missing.enumerated().map { index, entry in
+            (index < 25 ? addonManager.metaAddon(for: entry.item.type, id: entry.id) : nil,
+             entry.item.type, entry.id)
+        })
         var added: [SavedLibraryItem] = []
-        var enriched = 0
-        for s in remote {
-            guard let id = localID(from: s) else { continue }
-            guard !library.contains(id: id, type: s.type) else { continue }
+        for (index, entry) in missing.enumerated() {
+            let s = entry.item
             var name = s.title
             var poster: String?
             var background: String?
-            if enriched < 25, let addon = addonManager.metaAddon(for: s.type, id: id),
-               let meta = try? await StremioAPI.meta(addon: addon, type: s.type, id: id) {
-                enriched += 1
+            if let meta = metas[index] {
                 if !meta.name.isEmpty { name = meta.name }
                 poster = meta.poster
                 background = meta.background
             }
-            added.append(SavedLibraryItem(id: id, type: s.type, name: name,
+            added.append(SavedLibraryItem(id: entry.id, type: s.type, name: name,
                                           poster: poster, background: background))
         }
         guard profileStillActive(profile) else { return 0 }
-        if !added.isEmpty { library.mergeRemote(added, reconcile: false) }
+        if !added.isEmpty, library.mergeRemote(added, reconcile: false) {
+            library.requestSyncPush()   // on to the Orivio account too
+        }
 
         // Push local-only.
-        let remoteKeys = Set(remote.compactMap { s -> String? in
-            localID(from: s).map { "\(s.type)|\($0)" }
+        let remoteKeys = Set(remote.flatMap { s in
+            localIDs(from: s).map { "\(s.type)|\($0)" }
         })
         let localOnly = library.allForSync()
             .filter { !remoteKeys.contains($0.key) }
@@ -432,7 +524,9 @@ final class TraktSyncManager: ObservableObject {
         }
         if !mapped.isEmpty { ratings.mergeRemote(mapped) }
 
-        let remoteIDs = Set(mapped.map(\.metaID))
+        // Both id forms of every title Trakt already holds a rating for. Not
+        // every title it knows — an unrated one should still receive ours.
+        let remoteIDs = Set(remote.filter { $0.rating != nil }.flatMap(localIDs(from:)))
         let pushable = ratings.allForSync()
             .filter { !remoteIDs.contains($0.metaID) }
             .compactMap { r -> TraktService.SyncItem? in syncItem(metaID: r.metaID, type: r.type, rating: r.rating) }
@@ -488,6 +582,13 @@ final class TraktSyncManager: ObservableObject {
     private func pushMark(_ item: WatchedItem) {
         guard trakt.isSignedIn, trakt.syncWatchHistory,
               let s = syncItem(from: item) else { return }
+        // The player finishing a title is reported by the stop scrobble
+        // (Trakt logs a stop past 80% as a play). A history add on top of it
+        // recorded a second play for every title watched to the end. Skip it
+        // here; if the scrobble is lost, the next full sync's "local rows
+        // Trakt is missing" pass still uploads the mark.
+        if trakt.scrobbleEnabled, item.contentID.hasPrefix("tt"),
+           watched.wasFinishedByPlayback(item.key) { return }
         let profile = trakt.profileID   // the profile whose store fired this
         Task { [weak self] in
             guard let self, let token = await self.validToken(),
@@ -568,7 +669,10 @@ final class TraktSyncManager: ObservableObject {
 
     // MARK: - ID mapping
 
-    private func syncItem(from w: WatchedItem) -> TraktService.SyncItem? {
+    // The four mappers below are pure value transforms (args + static `ids`
+    // only) — nonisolated so the history transform can run off the main
+    // actor (see syncWatchHistory).
+    private nonisolated func syncItem(from w: WatchedItem) -> TraktService.SyncItem? {
         let (imdb, tmdb) = Self.ids(from: w.contentID)
         guard imdb != nil || tmdb != nil else { return nil }
         return TraktService.SyncItem(
@@ -576,14 +680,28 @@ final class TraktSyncManager: ObservableObject {
             season: w.season, episode: w.episode, progress: nil, watchedAt: w.watchedAt)
     }
 
-    private func watchedItem(from s: TraktService.SyncItem) -> WatchedItem? {
+    private nonisolated func watchedItem(from s: TraktService.SyncItem) -> WatchedItem? {
         guard let cid = localID(from: s) else { return nil }
         return WatchedItem(
             contentID: cid, contentType: s.type, title: s.title,
             season: s.season, episode: s.episode, watchedAt: s.watchedAt ?? Date())
     }
 
-    private func localID(from s: TraktService.SyncItem) -> String? {
+    /// EVERY local id form this remote row could correspond to.
+    ///
+    /// `pullPlayback` already builds both forms for its own key set, with a
+    /// comment explaining why; the history, watchlist and ratings phases each
+    /// keyed off `localID` alone, so a title held locally under `tmdb:` never
+    /// matched the same title returned by Trakt under `tt…` and was re-pushed
+    /// on every sync.
+    private nonisolated func localIDs(from s: TraktService.SyncItem) -> [String] {
+        var out: [String] = []
+        if let imdb = s.imdb, imdb.hasPrefix("tt") { out.append(imdb) }
+        if let tmdb = s.tmdb { out.append("tmdb:\(tmdb)") }
+        return out
+    }
+
+    private nonisolated func localID(from s: TraktService.SyncItem) -> String? {
         if let imdb = s.imdb, imdb.hasPrefix("tt") { return imdb }
         if let tmdb = s.tmdb { return "tmdb:\(tmdb)" }
         return nil
@@ -601,10 +719,22 @@ final class TraktSyncManager: ObservableObject {
         return TraktService.SyncItem(imdb: imdb, tmdb: tmdb, type: type, title: "", rating: rating)
     }
 
-    private static func ids(from contentID: String) -> (imdb: String?, tmdb: Int?) {
+    private nonisolated static func ids(from contentID: String) -> (imdb: String?, tmdb: Int?) {
         if contentID.hasPrefix("tt") { return (contentID, nil) }
         if contentID.hasPrefix("tmdb:"), let n = Int(contentID.dropFirst("tmdb:".count)) { return (nil, n) }
         return (nil, nil)
+    }
+
+    /// Meta lookups for a batch of titles, a few at a time, results in input
+    /// order (nil where there was no add-on to ask or the lookup failed).
+    /// Shared with the SIMKL manager. Bounded so a large list cannot fan out
+    /// into dozens of simultaneous add-on requests on an Apple TV HD.
+    static func fetchMetas(_ requests: [(addon: InstalledAddon?, type: String, id: String)]) async -> [MetaItem?] {
+        let limit = PerformanceProfile.isLowPower ? 2 : 4
+        return await boundedConcurrentMap(requests, limit: limit) { request in
+            guard let addon = request.addon else { return nil }
+            return try? await StremioAPI.meta(addon: addon, type: request.type, id: request.id)
+        }
     }
 
     /// "120 min" / "1h 30min" / "45min" → minutes.

@@ -48,16 +48,30 @@ final class DiscoverViewModel: ObservableObject {
         guard let current, !isLoading, !reachedEnd else { return }
         let token = generation
         isLoading = true
-        let page = (try? await StremioAPI.catalog(
+        // `reset` deliberately keeps the OUTGOING selection's items on screen
+        // (so the grid doesn't blank and lose focus), which means `items.count`
+        // is the previous catalog's length until the first new page lands.
+        // Paging from it skipped that many entries of the NEW catalog: switch
+        // genre after scrolling 400 items into a catalog with fewer than 400
+        // and the first request returns empty, which latches `reachedEnd` and
+        // shows "Nothing here" for a catalog that has content — with no last
+        // cell left to retrigger a load.
+        let offset = replacingSelection ? 0 : items.count
+        // nil = the request FAILED (timeout, network blip): not the end of
+        // the catalog, and not an empty selection — leave everything as it
+        // was so the trigger cell (or a selector wiggle) can try again,
+        // instead of latching `reachedEnd` on a page that never arrived.
+        let fetched = try? await StremioAPI.catalog(
             addon: current.addon, catalog: current.catalog,
-            genre: genre, skip: items.count
-        )) ?? []
+            genre: genre, skip: offset
+        )
         // The selection changed while this page was loading. Its items belong to
         // a catalog nobody is looking at, and its emptiness (a cancelled request
         // returns []) must not mark the NEW selection as finished. Leave
         // `isLoading` alone too — it now belongs to the newer request.
         guard token == generation else { return }
         isLoading = false
+        guard let page = fetched else { return }
         // First page of a NEW selection: this is the moment to replace what is
         // on screen, so the swap happens once, with content, instead of via an
         // empty grid.
@@ -103,13 +117,16 @@ struct DiscoverView: View {
         }
     }
 
-    private var selected: (addon: InstalledAddon, catalog: ManifestCatalog)? {
-        let list = catalogs
-        guard !list.isEmpty else { return nil }
-        return list[min(catalogIndex, list.count - 1)]
-    }
 
     var body: some View {
+        // Derived ONCE per body pass. `catalogs` flatMaps every installed
+        // addon's manifest, and the body used to touch it four times per pass
+        // (dropdown options, `selected` twice, `reloadKey`) — `focusedID` is
+        // `@FocusState` here, so a 40-addon install paid thousands of struct
+        // copies per D-pad move in the grid on an A8.
+        let catalogs = self.catalogs
+        let selected: (addon: InstalledAddon, catalog: ManifestCatalog)? =
+            catalogs.isEmpty ? nil : catalogs[min(catalogIndex, catalogs.count - 1)]
         ZStack {
             ATVBackground()
             ScrollViewReader { proxy in
@@ -180,7 +197,7 @@ struct DiscoverView: View {
             .onExitCommand { backToTop(proxy) }
             }
         }
-        .task(id: reloadKey) {
+        .task(id: "\(type)#\(catalogIndex)#\(selected?.catalog.id ?? "")#\(genre)") {
             if let sel = selected {
                 await viewModel.reset(addon: sel.addon, catalog: sel.catalog,
                                       genre: genre.isEmpty ? nil : genre)
@@ -200,5 +217,4 @@ struct DiscoverView: View {
         DispatchQueue.main.async { focusedID = first }
     }
 
-    private var reloadKey: String { "\(type)#\(catalogIndex)#\(selected?.catalog.id ?? "")#\(genre)" }
 }
