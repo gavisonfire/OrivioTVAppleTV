@@ -71,6 +71,12 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UIUserInterfaceStyle: Dark
+        # Export compliance, declared once so TestFlight stops holding every
+        # upload behind the "Missing Compliance" question. The app ships no
+        # non-exempt encryption of its own — its network traffic is HTTPS via
+        # the OS stack, which is exempt — so this is the accurate answer, not a
+        # shortcut around one.
+        ITSAppUsesNonExemptEncryption: false
         # Picture in Picture keeps rendering while the app is not frontmost, and
         # AVKit refuses to start PiP at all without the audio background mode.
         UIBackgroundModes:
