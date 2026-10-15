@@ -116,13 +116,13 @@ targets:
         # registered here — every archive failed on it. An archive under
         # this id installs as its own app, separate from historical
         # sideloads of the original id.
-        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev
+        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv
         # Signing team for device builds, HERE rather than only in the
         # generated pbxproj: Xcode's GUI writes the team into project.pbxproj,
         # where any xcodegen regeneration (or a git checkout of the file)
         # silently drops it — and a device build then dies with "Signing for
         # 'OrivioTV' requires a development team".
-        DEVELOPMENT_TEAM: CYCSPZ5MTR
+        DEVELOPMENT_TEAM: 4YNDT6Z6BH
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
@@ -179,7 +179,7 @@ targets:
           # signing again. Debug now has an id of its own, Top Shelf below
           # following it. Release keeps `.dev`: the Sideload IPA ships it
           # as built and existing installs are keyed on it.
-          PRODUCT_BUNDLE_IDENTIFIER: com.prestonhakanson.orivio.tv
+          PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev
           CODE_SIGN_ENTITLEMENTS: Config/OrivioTV-Debug.entitlements
     preBuildScripts:
       # FFmpegKit (pulled in transitively by KSPlayer) ships
@@ -252,6 +252,12 @@ targets:
       path: OrivioTopShelf/Info.plist
       properties:
         CFBundleDisplayName: OrivioTV
+        # App Store validation rejects a 64-bit extension whose Info.plist
+        # omits this: "has a 64-bit architecture slice, so you must include the
+        # arm64 value for the UIRequiredDeviceCapabilities key". tvOS is
+        # arm64-only, so the requirement is accurate as well as mandatory.
+        UIRequiredDeviceCapabilities:
+          - arm64
         # From the build setting, not a literal: the app's own version keys
         # were hardcoded here once and went stale silently.
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
@@ -267,8 +273,8 @@ targets:
         # Debug id, and the two MOVE TOGETHER — a per-config override here is
         # only safe as long as it mirrors the app's, which is what a lone
         # override once got wrong (Debug passed, the Release archive failed).
-        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev.topshelf
-        DEVELOPMENT_TEAM: CYCSPZ5MTR
+        PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.topshelf
+        DEVELOPMENT_TEAM: 4YNDT6Z6BH
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "3"
@@ -281,7 +287,7 @@ targets:
           # is `com.orivio.tv.appletv.dev.topshelf`, which IS registered. See
           # the app target's Debug note for why that matters.
           # Must mirror the app's Debug id (see the app target's note).
-          PRODUCT_BUNDLE_IDENTIFIER: com.prestonhakanson.orivio.tv.topshelf
+          PRODUCT_BUNDLE_IDENTIFIER: com.orivio.tv.appletv.dev.topshelf
           CODE_SIGN_ENTITLEMENTS: OrivioTopShelf/OrivioTopShelf-Debug.entitlements
   # UI-test target: drives the tvOS remote (XCUIRemote) to verify focus/menu
   # behavior, which osascript keystroke automation can't do. Simulator only.

@@ -4,7 +4,7 @@
 <dict>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.innerapns.pubtest.CYCSPZ5MTR</string>
+		<string>group.com.orivio.tv.appletv</string>
 	</array>
 </dict>
 </plist>

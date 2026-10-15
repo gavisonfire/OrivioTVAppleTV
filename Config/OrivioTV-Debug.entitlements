@@ -3,14 +3,13 @@
 <plist version="1.0">
 <dict>
 	<!--
-	  The SAME group the Release entitlements use, because Debug now signs with
-	  the same registered ids (see project.yml). An App Group is a restricted
-	  entitlement: it has to appear in the provisioning profile, and the only
-	  group these profiles carry is this one.
+	  The SAME group the Release entitlements use, because Debug signs with the
+	  same registered ids (see project.yml). An App Group is a restricted
+	  entitlement: it has to appear in the provisioning profile.
 	-->
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.innerapns.pubtest.CYCSPZ5MTR</string>
+		<string>group.com.orivio.tv.appletv</string>
 	</array>
 </dict>
 </plist>

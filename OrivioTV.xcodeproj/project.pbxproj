@@ -687,11 +687,11 @@
 						TestTargetID = F3B80386B2196FBD0BA475AC;
 					};
 					8CFB23740ABA933CC89C5B66 = {
-						DevelopmentTeam = CYCSPZ5MTR;
+						DevelopmentTeam = 4YNDT6Z6BH;
 						ProvisioningStyle = Automatic;
 					};
 					F3B80386B2196FBD0BA475AC = {
-						DevelopmentTeam = CYCSPZ5MTR;
+						DevelopmentTeam = 4YNDT6Z6BH;
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -970,7 +970,7 @@
 				CODE_SIGN_ENTITLEMENTS = "OrivioTopShelf/OrivioTopShelf-Debug.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
+				DEVELOPMENT_TEAM = 4YNDT6Z6BH;
 				INFOPLIST_FILE = OrivioTopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -978,7 +978,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 0.12;
-				PRODUCT_BUNDLE_IDENTIFIER = com.prestonhakanson.orivio.tv.topshelf;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1128,7 +1128,7 @@
 				CODE_SIGN_ENTITLEMENTS = OrivioTopShelf/OrivioTopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
+				DEVELOPMENT_TEAM = 4YNDT6Z6BH;
 				INFOPLIST_FILE = OrivioTopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -1136,7 +1136,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 0.12;
-				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev.topshelf;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.topshelf;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1151,7 +1151,7 @@
 				CODE_SIGN_ENTITLEMENTS = Config/OrivioTV.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
+				DEVELOPMENT_TEAM = 4YNDT6Z6BH;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -1163,7 +1163,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.12;
-				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
@@ -1178,7 +1178,7 @@
 				CODE_SIGN_ENTITLEMENTS = "Config/OrivioTV-Debug.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = CYCSPZ5MTR;
+				DEVELOPMENT_TEAM = 4YNDT6Z6BH;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -1190,7 +1190,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.12;
-				PRODUCT_BUNDLE_IDENTIFIER = com.prestonhakanson.orivio.tv;
+				PRODUCT_BUNDLE_IDENTIFIER = com.orivio.tv.appletv.dev;
 				SDKROOT = appletvos;
 				SWIFT_VERSION = 5.9;
 				TARGETED_DEVICE_FAMILY = 3;
